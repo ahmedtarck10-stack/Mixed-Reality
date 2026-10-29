@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Mixed Reality</string>
+    <string name="camera_permission_required">Camera permission is required for Mixed Reality AR mode.</string>
+    <string name="grant_permission">Grant Camera Permission</string>
+    <string name="mode_3d">3D Studio</string>
+    <string name="mode_ar">Mixed Reality (AR)</string>
+</resources>

@@ -1,1 +1,0 @@
-This update keeps the app in step with the latest SceneView release. Nothing changes in how you use it.
