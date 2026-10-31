@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -94,6 +95,23 @@ fun MRMainScreen() {
 
     // Clear trigger counter for AR anchors
     var clearTrigger by remember { mutableIntStateOf(0) }
+
+    // Full Screen Mode (Triple-Tap toggles upper part & lower part)
+    var isFullScreen by remember { mutableStateOf(false) }
+
+    // Move Mode (Double-Tap toggles moving mode)
+    var isMoveMode by remember { mutableStateOf(false) }
+
+    // Temporary hint banner when entering full screen
+    var showFullScreenHint by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isFullScreen) {
+        if (isFullScreen) {
+            showFullScreenHint = true
+            delay(2800L)
+            showFullScreenHint = false
+        }
+    }
 
     // Camera permission launcher
     var hasCameraPermission by remember {
@@ -241,13 +259,24 @@ fun MRMainScreen() {
                     engine = engine,
                     modelLoader = modelLoader,
                     materialLoader = materialLoader,
-                    environmentLoader = environmentLoader
+                    environmentLoader = environmentLoader,
+                    surfaceMirrorer = surfaceMirrorer,
+                    isARCoreAvailable = isARCoreAvailable,
+                    clearTrigger = clearTrigger,
+                    isMoveMode = isMoveMode,
+                    onToggleMoveMode = { isMoveMode = !isMoveMode },
+                    isFullScreen = isFullScreen,
+                    onToggleFullScreen = { isFullScreen = !isFullScreen }
                 )
             }
         }
 
         // --- 2. TOP FLOATING SEGMENTED PILL (MR | AR | Object) ---
-        Box(
+        // Hidden in Full Screen mode (Triple-Tap toggles)
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !isFullScreen,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { -it }),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { -it }),
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
@@ -266,6 +295,26 @@ fun MRMainScreen() {
             )
         }
 
+        // Full Screen Hint Overlay (Fades out automatically after 2.8s)
+        if (isFullScreen && showFullScreenHint) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 18.dp)
+                    .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(20.dp))
+                    .border(1.dp, NeonCyan.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 7.dp)
+            ) {
+                Text(
+                    text = "وضع ملء الشاشة 🥽 • انقر 3 مرات لإظهار القوائم",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+
         // --- 3. ACTIVE RECORDING BADGE (Top-right indicator) ---
         if (isRecording) {
             RecordingStatusBadge(
@@ -277,9 +326,12 @@ fun MRMainScreen() {
             )
         }
 
-
         // --- 5. BOTTOM FLOATING CONTROL PILL (PHOTO | ● REC | Open | Clear) ---
-        Box(
+        // Hidden in Full Screen mode (Triple-Tap toggles)
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !isFullScreen,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { it }),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { it }),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()

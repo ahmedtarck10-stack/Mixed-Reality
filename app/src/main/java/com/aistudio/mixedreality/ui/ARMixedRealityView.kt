@@ -121,8 +121,9 @@ fun ARMixedRealityView(
                 engine = engine,
                 modelLoader = modelLoader,
                 materialLoader = materialLoader,
-                planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL,
-                instantPlacement = true,
+                planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
+                instantPlacement = false,
+                fadePlaneOnFirstPlacement = true,
                 showReticle = isModelVisible,
                 onPlaced = { anchor ->
                     if (!isModelVisible) return@PlacementScene
