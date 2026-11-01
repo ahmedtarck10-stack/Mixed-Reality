@@ -246,6 +246,7 @@ fun ARMixedRealityView(
                 config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
             },
             planeRenderer = (activeAnchor == null),
+            onGestureListener = null,
             onSessionUpdated = { session, frame ->
                 // Synchronous frame-accurate hit test without stale frame references
                 val tap = pendingTapRef.getAndSet(null)
@@ -276,9 +277,11 @@ fun ARMixedRealityView(
                             it.isPoseInPolygon(currentAnchor.pose)
                     }
                     if (parentPlane != null) {
-                        val newAnchor = parentPlane.createAnchor(currentAnchor.pose)
-                        runCatching { currentAnchor.detach() }
-                        activeAnchor = newAnchor
+                        val newAnchor = runCatching { parentPlane.createAnchor(currentAnchor.pose) }.getOrNull()
+                        if (newAnchor != null) {
+                            runCatching { currentAnchor.detach() }
+                            activeAnchor = newAnchor
+                        }
                     }
                 }
 
@@ -296,7 +299,13 @@ fun ARMixedRealityView(
                 AnchorNode(
                     anchor = anchor,
                     updateAnchorPose = true,
-                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED)
+                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
+                    apply = {
+                        isPositionEditable = false
+                        isEditable = false
+                        isRotationEditable = false
+                        isScaleEditable = false
+                    }
                 ) {
                     Node(
                         position = modelOffset,
