@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.ui.platform.LocalContext
 import com.google.ar.core.ArCoreApk
+import java.util.concurrent.atomic.AtomicReference
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -102,7 +103,7 @@ fun ARMixedRealityView(
     val haptic = LocalHapticFeedback.current
 
     var activeAnchor by remember { mutableStateOf<Anchor?>(null) }
-    var latestFrame by remember { mutableStateOf<Frame?>(null) }
+    val pendingTapRef = remember { AtomicReference<androidx.compose.ui.geometry.Offset?>(null) }
     var isPlaneDetected by remember { mutableStateOf(false) }
 
     var modelOffset by remember { mutableStateOf(Position(0f, 0f, 0f)) }
@@ -202,21 +203,7 @@ fun ARMixedRealityView(
                 isMoveMode = isMoveMode,
                 onSingleTap = { tapOffset ->
                     if (!isModelVisible) return@spatialMRGestures
-                    val frame = latestFrame ?: return@spatialMRGestures
-                    val hits = frame.hitTest(tapOffset.x, tapOffset.y)
-                    val floorHit = hits.firstOrNull { hit ->
-                        val t = hit.trackable
-                        t is Plane &&
-                            t.trackingState == TrackingState.TRACKING &&
-                            t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            t.isPoseInPolygon(hit.hitPose)
-                    }
-                    if (floorHit != null) {
-                        runCatching { activeAnchor?.detach() }
-                        activeAnchor = floorHit.createAnchor()
-                        modelOffset = Position(0f, 0f, 0f)
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    }
+                    pendingTapRef.set(tapOffset)
                 },
                 onDoubleTap = {
                     onToggleMoveMode()
@@ -255,10 +242,46 @@ fun ARMixedRealityView(
             sessionConfiguration = { _, config ->
                 config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                 config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                config.focusMode = Config.FocusMode.AUTO
+                config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
             },
             planeRenderer = (activeAnchor == null),
             onSessionUpdated = { session, frame ->
-                latestFrame = frame
+                // Synchronous frame-accurate hit test without stale frame references
+                val tap = pendingTapRef.getAndSet(null)
+                if (tap != null && isModelVisible) {
+                    val hits = frame.hitTest(tap.x, tap.y)
+                    val floorHit = hits.firstOrNull { hit ->
+                        val t = hit.trackable
+                        t is Plane &&
+                            t.trackingState == TrackingState.TRACKING &&
+                            t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                            t.isPoseInPolygon(hit.hitPose)
+                    }
+                    if (floorHit != null) {
+                        runCatching { activeAnchor?.detach() }
+                        activeAnchor = floorHit.createAnchor()
+                        modelOffset = Position(0f, 0f, 0f)
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    }
+                }
+
+                // Graceful anchor migration if host plane was subsumed
+                val currentAnchor = activeAnchor
+                if (currentAnchor != null && currentAnchor.trackingState == TrackingState.STOPPED) {
+                    val planes = session.getAllTrackables(Plane::class.java)
+                    val parentPlane = planes.firstOrNull {
+                        it.trackingState == TrackingState.TRACKING &&
+                            it.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                            it.isPoseInPolygon(currentAnchor.pose)
+                    }
+                    if (parentPlane != null) {
+                        val newAnchor = parentPlane.createAnchor(currentAnchor.pose)
+                        runCatching { currentAnchor.detach() }
+                        activeAnchor = newAnchor
+                    }
+                }
+
                 val planes = session.getAllTrackables(Plane::class.java)
                 val hasTrackedPlane = planes.any {
                     it.trackingState == TrackingState.TRACKING &&
@@ -270,7 +293,11 @@ fun ARMixedRealityView(
             }
         ) {
             activeAnchor?.let { anchor ->
-                AnchorNode(anchor = anchor) {
+                AnchorNode(
+                    anchor = anchor,
+                    updateAnchorPose = true,
+                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED)
+                ) {
                     Node(
                         position = modelOffset,
                         rotation = Rotation(x = 0f, y = rotationY, z = 0f),

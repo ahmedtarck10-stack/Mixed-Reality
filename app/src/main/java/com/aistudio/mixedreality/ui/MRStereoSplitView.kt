@@ -140,7 +140,7 @@ private fun MRStereoARCoreView(
     val scope = rememberCoroutineScope()
 
     var activeAnchor by remember { mutableStateOf<Anchor?>(null) }
-    var latestFrame by remember { mutableStateOf<Frame?>(null) }
+    val pendingTapRef = remember { AtomicReference<androidx.compose.ui.geometry.Offset?>(null) }
     var isPlaneDetected by remember { mutableStateOf(false) }
 
     var leftEyeWidthPx by remember { mutableFloatStateOf(540f) }
@@ -211,27 +211,9 @@ private fun MRStereoARCoreView(
                 scope = scope,
                 isMoveMode = isMoveMode,
                 onSingleTap = { tapOffset ->
-                    // 1 Tap: Anchor model at tap location on real floor
+                    // 1 Tap: Queue tap for synchronous frame-accurate hit test
                     if (!isModelVisible) return@spatialMRGestures
-                    val frame = latestFrame ?: return@spatialMRGestures
-                    val hitX = if (leftEyeWidthPx > 0f && tapOffset.x > leftEyeWidthPx) {
-                        tapOffset.x - leftEyeWidthPx
-                    } else {
-                        tapOffset.x
-                    }
-                    val hits = frame.hitTest(hitX, tapOffset.y)
-                    val floorHit = hits.firstOrNull { hit ->
-                        val t = hit.trackable
-                        t is Plane &&
-                            t.trackingState == TrackingState.TRACKING &&
-                            t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            t.isPoseInPolygon(hit.hitPose)
-                    }
-                    if (floorHit != null) {
-                        runCatching { activeAnchor?.detach() }
-                        activeAnchor = floorHit.createAnchor()
-                        modelOffset = Position(0f, 0f, 0f)
-                    }
+                    pendingTapRef.set(tapOffset)
                 },
                 onDoubleTap = {
                     // Double Tap: Switch to Moving mode
@@ -290,10 +272,49 @@ private fun MRStereoARCoreView(
                     sessionConfiguration = { _, config ->
                         config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                         config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+                        config.focusMode = Config.FocusMode.AUTO
+                        config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
                     },
                     planeRenderer = (activeAnchor == null),
                     onSessionUpdated = { session, frame ->
-                        latestFrame = frame
+                        val tap = pendingTapRef.getAndSet(null)
+                        if (tap != null && isModelVisible) {
+                            val hitX = if (leftEyeWidthPx > 0f && tap.x > leftEyeWidthPx) {
+                                tap.x - leftEyeWidthPx
+                            } else {
+                                tap.x
+                            }
+                            val hits = frame.hitTest(hitX, tap.y)
+                            val floorHit = hits.firstOrNull { hit ->
+                                val t = hit.trackable
+                                t is Plane &&
+                                    t.trackingState == TrackingState.TRACKING &&
+                                    t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                    t.isPoseInPolygon(hit.hitPose)
+                            }
+                            if (floorHit != null) {
+                                runCatching { activeAnchor?.detach() }
+                                activeAnchor = floorHit.createAnchor()
+                                modelOffset = Position(0f, 0f, 0f)
+                            }
+                        }
+
+                        // Graceful anchor migration if host plane was subsumed
+                        val currentAnchor = activeAnchor
+                        if (currentAnchor != null && currentAnchor.trackingState == TrackingState.STOPPED) {
+                            val planes = session.getAllTrackables(Plane::class.java)
+                            val parentPlane = planes.firstOrNull {
+                                it.trackingState == TrackingState.TRACKING &&
+                                    it.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                    it.isPoseInPolygon(currentAnchor.pose)
+                            }
+                            if (parentPlane != null) {
+                                val newAnchor = parentPlane.createAnchor(currentAnchor.pose)
+                                runCatching { currentAnchor.detach() }
+                                activeAnchor = newAnchor
+                            }
+                        }
+
                         val planes = session.getAllTrackables(Plane::class.java)
                         val hasTrackedPlane = planes.any {
                             it.trackingState == TrackingState.TRACKING &&
@@ -305,7 +326,11 @@ private fun MRStereoARCoreView(
                     }
                 ) {
                     activeAnchor?.let { anchor ->
-                        AnchorNode(anchor = anchor) {
+                        AnchorNode(
+                            anchor = anchor,
+                            updateAnchorPose = true,
+                            visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED)
+                        ) {
                             Node(
                                 position = modelOffset,
                                 rotation = Rotation(x = 0f, y = rotationY, z = 0f),
