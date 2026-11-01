@@ -140,7 +140,10 @@ private fun MRStereoARCoreView(
     val scope = rememberCoroutineScope()
 
     var activeAnchor by remember { mutableStateOf<Anchor?>(null) }
-    val pendingTapRef = remember { AtomicReference<androidx.compose.ui.geometry.Offset?>(null) }
+    var anchorTrackingState by remember { mutableStateOf<TrackingState?>(null) }
+    var lastMigrationAttemptTime by remember { mutableLongStateOf(0L) }
+    var migrationAttemptsCount by remember { mutableIntStateOf(0) }
+    val pendingPlacementRef = remember { AtomicReference<PendingPlacementTap?>(null) }
     var isPlaneDetected by remember { mutableStateOf(false) }
 
     var leftEyeWidthPx by remember { mutableFloatStateOf(540f) }
@@ -162,6 +165,8 @@ private fun MRStereoARCoreView(
         if (clearTrigger > 0) {
             runCatching { activeAnchor?.detach() }
             activeAnchor = null
+            anchorTrackingState = null
+            migrationAttemptsCount = 0
             modelOffset = Position(0f, 0f, 0f)
         }
     }
@@ -211,9 +216,9 @@ private fun MRStereoARCoreView(
                 scope = scope,
                 isMoveMode = isMoveMode,
                 onSingleTap = { tapOffset ->
-                    // 1 Tap: Queue tap for synchronous frame-accurate hit test
+                    // 1 Tap: Queue tap for frame-accurate hit test within 500ms window
                     if (!isModelVisible) return@spatialMRGestures
-                    pendingTapRef.set(tapOffset)
+                    pendingPlacementRef.set(PendingPlacementTap(tapOffset))
                 },
                 onDoubleTap = {
                     // Double Tap: Switch to Moving mode
@@ -278,42 +283,78 @@ private fun MRStereoARCoreView(
                     planeRenderer = (activeAnchor == null),
                     onGestureListener = null,
                     onSessionUpdated = { session, frame ->
-                        val tap = pendingTapRef.getAndSet(null)
-                        if (tap != null && isModelVisible) {
-                            val hitX = if (leftEyeWidthPx > 0f && tap.x > leftEyeWidthPx) {
-                                tap.x - leftEyeWidthPx
-                            } else {
-                                tap.x
-                            }
-                            val hits = frame.hitTest(hitX, tap.y)
-                            val floorHit = hits.firstOrNull { hit ->
-                                val t = hit.trackable
-                                t is Plane &&
-                                    t.trackingState == TrackingState.TRACKING &&
-                                    t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                                    t.isPoseInPolygon(hit.hitPose)
-                            }
-                            if (floorHit != null) {
-                                runCatching { activeAnchor?.detach() }
-                                activeAnchor = floorHit.createAnchor()
-                                modelOffset = Position(0f, 0f, 0f)
+                        // 1. Process pending placement tap with a 500ms validity window
+                        // Does NOT discard taps prematurely; does NOT create fake planes
+                        val pending = pendingPlacementRef.get()
+                        if (pending != null && isModelVisible) {
+                            val now = System.currentTimeMillis()
+                            if (now - pending.timestamp > 500L) {
+                                // Expired after 500ms without finding a real physical plane
+                                pendingPlacementRef.compareAndSet(pending, null)
+                            } else if (frame.camera.trackingState == TrackingState.TRACKING) {
+                                val hitX = if (leftEyeWidthPx > 0f && pending.offset.x > leftEyeWidthPx) {
+                                    pending.offset.x - leftEyeWidthPx
+                                } else {
+                                    pending.offset.x
+                                }
+                                val hits = runCatching { frame.hitTest(hitX, pending.offset.y) }.getOrNull() ?: emptyList()
+                                val floorHit = hits.firstOrNull { hit ->
+                                    val t = hit.trackable
+                                    t is Plane &&
+                                        t.trackingState == TrackingState.TRACKING &&
+                                        t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                        t.isPoseInPolygon(hit.hitPose)
+                                }
+                                if (floorHit != null) {
+                                    val newAnchor = runCatching { floorHit.createAnchor() }.getOrNull()
+                                    if (newAnchor != null) {
+                                        pendingPlacementRef.set(null)
+                                        val old = activeAnchor
+                                        activeAnchor = newAnchor
+                                        anchorTrackingState = newAnchor.trackingState
+                                        migrationAttemptsCount = 0
+                                        runCatching { old?.detach() }
+                                        modelOffset = Position(0f, 0f, 0f)
+                                    }
+                                }
                             }
                         }
 
-                        // Graceful anchor migration if host plane was subsumed
+                        // 2. Synchronize current active anchor tracking state
                         val currentAnchor = activeAnchor
-                        if (currentAnchor != null && currentAnchor.trackingState == TrackingState.STOPPED) {
-                            val planes = session.getAllTrackables(Plane::class.java)
-                            val parentPlane = planes.firstOrNull {
-                                it.trackingState == TrackingState.TRACKING &&
-                                    it.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                                    it.isPoseInPolygon(currentAnchor.pose)
+                        if (currentAnchor != null) {
+                            val currentTrackState = currentAnchor.trackingState
+                            if (anchorTrackingState != currentTrackState) {
+                                anchorTrackingState = currentTrackState
                             }
-                            if (parentPlane != null) {
-                                val newAnchor = runCatching { parentPlane.createAnchor(currentAnchor.pose) }.getOrNull()
-                                if (newAnchor != null) {
-                                    runCatching { currentAnchor.detach() }
-                                    activeAnchor = newAnchor
+
+                            // 3. Graceful anchor recovery ONLY if STOPPED (never on transient PAUSED)
+                            // Cooldown (1.5s) and max 3 attempts to prevent infinite recreation churn
+                            if (currentTrackState == TrackingState.STOPPED &&
+                                frame.camera.trackingState == TrackingState.TRACKING &&
+                                migrationAttemptsCount < 3
+                            ) {
+                                val now = System.currentTimeMillis()
+                                if (now - lastMigrationAttemptTime > 1500L) {
+                                    lastMigrationAttemptTime = now
+                                    migrationAttemptsCount++
+
+                                    val planes = session.getAllTrackables(Plane::class.java)
+                                    val targetPlane = planes.firstOrNull { plane ->
+                                        plane.trackingState == TrackingState.TRACKING &&
+                                            plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                            plane.subsumedBy == null &&
+                                            plane.isPoseInPolygon(currentAnchor.pose)
+                                    }
+                                    if (targetPlane != null) {
+                                        val migratedAnchor = runCatching { targetPlane.createAnchor(currentAnchor.pose) }.getOrNull()
+                                        if (migratedAnchor != null) {
+                                            runCatching { currentAnchor.detach() }
+                                            activeAnchor = migratedAnchor
+                                            anchorTrackingState = migratedAnchor.trackingState
+                                            migrationAttemptsCount = 0
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -332,7 +373,10 @@ private fun MRStereoARCoreView(
                         AnchorNode(
                             anchor = anchor,
                             updateAnchorPose = true,
-                            visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
+                            visibleTrackingStates = setOf(TrackingState.TRACKING),
+                            onTrackingStateChanged = { newState ->
+                                anchorTrackingState = newState
+                            },
                             apply = {
                                 isPositionEditable = false
                                 isEditable = false
@@ -497,7 +541,28 @@ private fun MRStereoARCoreView(
                     )
                 }
             }
-        } else if (activeAnchor == null && isModelVisible) {
+        } else if (isModelVisible) {
+            val (hudText, hudColor) = when {
+                activeAnchor != null && anchorTrackingState == TrackingState.TRACKING -> {
+                    "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير" to NeonGreen
+                }
+                activeAnchor != null && anchorTrackingState == TrackingState.PAUSED -> {
+                    "جاري استعادة تتبع السطح... حرّك الجهاز ببطء" to Color(0xFFFFB300)
+                }
+                activeAnchor != null && anchorTrackingState == TrackingState.STOPPED -> {
+                    "فُقد التتبع • انقر على الأرضية لإعادة التثبيت" to Color(0xFFFF5252)
+                }
+                activeAnchor != null -> {
+                    "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير" to NeonGreen
+                }
+                isPlaneDetected -> {
+                    "تم رصد الأرضية • انقر لتثبيت النموذج" to NeonGreen
+                }
+                else -> {
+                    "وجّه الكاميرا نحو الأرضية لرصد السطح" to NeonCyan
+                }
+            }
+
             // Real Floor Plane Scanning Guidance Badge
             Box(
                 modifier = Modifier
@@ -507,7 +572,7 @@ private fun MRStereoARCoreView(
                     .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(20.dp))
                     .border(
                         1.dp,
-                        if (isPlaneDetected) NeonGreen.copy(alpha = 0.7f) else NeonCyan.copy(alpha = 0.5f),
+                        hudColor.copy(alpha = 0.7f),
                         RoundedCornerShape(20.dp)
                     )
                     .padding(horizontal = 16.dp, vertical = 6.dp)
@@ -517,11 +582,11 @@ private fun MRStereoARCoreView(
                         modifier = Modifier
                             .size(8.dp)
                             .clip(CircleShape)
-                            .background(if (isPlaneDetected) NeonGreen else NeonCyan)
+                            .background(hudColor)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isPlaneDetected) "تم رصد الأرضية • انقر لتثبيت النموذج" else "وجّه الكاميرا نحو الأرضية لرصد السطح",
+                        text = hudText,
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium

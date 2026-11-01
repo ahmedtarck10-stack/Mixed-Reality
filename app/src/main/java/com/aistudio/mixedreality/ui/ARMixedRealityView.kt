@@ -67,6 +67,11 @@ fun isARCoreSupportedAndInstalled(context: Context): Boolean {
     }
 }
 
+internal data class PendingPlacementTap(
+    val offset: androidx.compose.ui.geometry.Offset,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
 /**
  * Live ARCore scene scanning real physical floors.
  * - One tap: Hit-tests real detected horizontal floor and anchors model.
@@ -103,7 +108,10 @@ fun ARMixedRealityView(
     val haptic = LocalHapticFeedback.current
 
     var activeAnchor by remember { mutableStateOf<Anchor?>(null) }
-    val pendingTapRef = remember { AtomicReference<androidx.compose.ui.geometry.Offset?>(null) }
+    var anchorTrackingState by remember { mutableStateOf<TrackingState?>(null) }
+    var lastMigrationAttemptTime by remember { mutableLongStateOf(0L) }
+    var migrationAttemptsCount by remember { mutableIntStateOf(0) }
+    val pendingPlacementRef = remember { AtomicReference<PendingPlacementTap?>(null) }
     var isPlaneDetected by remember { mutableStateOf(false) }
 
     var modelOffset by remember { mutableStateOf(Position(0f, 0f, 0f)) }
@@ -113,6 +121,8 @@ fun ARMixedRealityView(
         if (clearTrigger > 0) {
             runCatching { activeAnchor?.detach() }
             activeAnchor = null
+            anchorTrackingState = null
+            migrationAttemptsCount = 0
             modelOffset = Position(0f, 0f, 0f)
         }
     }
@@ -203,7 +213,7 @@ fun ARMixedRealityView(
                 isMoveMode = isMoveMode,
                 onSingleTap = { tapOffset ->
                     if (!isModelVisible) return@spatialMRGestures
-                    pendingTapRef.set(tapOffset)
+                    pendingPlacementRef.set(PendingPlacementTap(tapOffset))
                 },
                 onDoubleTap = {
                     onToggleMoveMode()
@@ -248,39 +258,74 @@ fun ARMixedRealityView(
             planeRenderer = (activeAnchor == null),
             onGestureListener = null,
             onSessionUpdated = { session, frame ->
-                // Synchronous frame-accurate hit test without stale frame references
-                val tap = pendingTapRef.getAndSet(null)
-                if (tap != null && isModelVisible) {
-                    val hits = frame.hitTest(tap.x, tap.y)
-                    val floorHit = hits.firstOrNull { hit ->
-                        val t = hit.trackable
-                        t is Plane &&
-                            t.trackingState == TrackingState.TRACKING &&
-                            t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            t.isPoseInPolygon(hit.hitPose)
-                    }
-                    if (floorHit != null) {
-                        runCatching { activeAnchor?.detach() }
-                        activeAnchor = floorHit.createAnchor()
-                        modelOffset = Position(0f, 0f, 0f)
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                // 1. Process pending placement tap with a 500ms validity window
+                // Does NOT discard taps prematurely; does NOT create fake planes
+                val pending = pendingPlacementRef.get()
+                if (pending != null && isModelVisible) {
+                    val now = System.currentTimeMillis()
+                    if (now - pending.timestamp > 500L) {
+                        // Expired after 500ms without finding a real physical plane
+                        pendingPlacementRef.compareAndSet(pending, null)
+                    } else if (frame.camera.trackingState == TrackingState.TRACKING) {
+                        val hits = runCatching { frame.hitTest(pending.offset.x, pending.offset.y) }.getOrNull() ?: emptyList()
+                        val floorHit = hits.firstOrNull { hit ->
+                            val t = hit.trackable
+                            t is Plane &&
+                                t.trackingState == TrackingState.TRACKING &&
+                                t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                t.isPoseInPolygon(hit.hitPose)
+                        }
+                        if (floorHit != null) {
+                            val newAnchor = runCatching { floorHit.createAnchor() }.getOrNull()
+                            if (newAnchor != null) {
+                                pendingPlacementRef.set(null)
+                                val old = activeAnchor
+                                activeAnchor = newAnchor
+                                anchorTrackingState = newAnchor.trackingState
+                                migrationAttemptsCount = 0
+                                runCatching { old?.detach() }
+                                modelOffset = Position(0f, 0f, 0f)
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            }
+                        }
                     }
                 }
 
-                // Graceful anchor migration if host plane was subsumed
+                // 2. Synchronize current active anchor tracking state
                 val currentAnchor = activeAnchor
-                if (currentAnchor != null && currentAnchor.trackingState == TrackingState.STOPPED) {
-                    val planes = session.getAllTrackables(Plane::class.java)
-                    val parentPlane = planes.firstOrNull {
-                        it.trackingState == TrackingState.TRACKING &&
-                            it.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            it.isPoseInPolygon(currentAnchor.pose)
+                if (currentAnchor != null) {
+                    val currentTrackState = currentAnchor.trackingState
+                    if (anchorTrackingState != currentTrackState) {
+                        anchorTrackingState = currentTrackState
                     }
-                    if (parentPlane != null) {
-                        val newAnchor = runCatching { parentPlane.createAnchor(currentAnchor.pose) }.getOrNull()
-                        if (newAnchor != null) {
-                            runCatching { currentAnchor.detach() }
-                            activeAnchor = newAnchor
+
+                    // 3. Graceful anchor recovery ONLY if STOPPED (never on transient PAUSED)
+                    // Cooldown (1.5s) and max 3 attempts to prevent infinite recreation churn
+                    if (currentTrackState == TrackingState.STOPPED &&
+                        frame.camera.trackingState == TrackingState.TRACKING &&
+                        migrationAttemptsCount < 3
+                    ) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastMigrationAttemptTime > 1500L) {
+                            lastMigrationAttemptTime = now
+                            migrationAttemptsCount++
+
+                            val planes = session.getAllTrackables(Plane::class.java)
+                            val targetPlane = planes.firstOrNull { plane ->
+                                plane.trackingState == TrackingState.TRACKING &&
+                                    plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                    plane.subsumedBy == null &&
+                                    plane.isPoseInPolygon(currentAnchor.pose)
+                            }
+                            if (targetPlane != null) {
+                                val migratedAnchor = runCatching { targetPlane.createAnchor(currentAnchor.pose) }.getOrNull()
+                                if (migratedAnchor != null) {
+                                    runCatching { currentAnchor.detach() }
+                                    activeAnchor = migratedAnchor
+                                    anchorTrackingState = migratedAnchor.trackingState
+                                    migrationAttemptsCount = 0
+                                }
+                            }
                         }
                     }
                 }
@@ -299,7 +344,10 @@ fun ARMixedRealityView(
                 AnchorNode(
                     anchor = anchor,
                     updateAnchorPose = true,
-                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
+                    visibleTrackingStates = setOf(TrackingState.TRACKING),
+                    onTrackingStateChanged = { newState ->
+                        anchorTrackingState = newState
+                    },
                     apply = {
                         isPositionEditable = false
                         isEditable = false
@@ -415,25 +463,36 @@ fun ARMixedRealityView(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    val (hudText, hudColor) = when {
+                        activeAnchor != null && anchorTrackingState == TrackingState.TRACKING -> {
+                            "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير" to NeonGreen
+                        }
+                        activeAnchor != null && anchorTrackingState == TrackingState.PAUSED -> {
+                            "جاري استعادة تتبع السطح... حرّك الجهاز ببطء" to Color(0xFFFFB300)
+                        }
+                        activeAnchor != null && anchorTrackingState == TrackingState.STOPPED -> {
+                            "فُقد التتبع • انقر على الأرضية لإعادة التثبيت" to Color(0xFFFF5252)
+                        }
+                        activeAnchor != null -> {
+                            "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير" to NeonGreen
+                        }
+                        isPlaneDetected -> {
+                            "تم رصد الأرضية • انقر لتثبيت النموذج" to NeonGreen
+                        }
+                        else -> {
+                            "وجّه الكاميرا نحو الأرضية لرصد السطح الحقيقي" to NeonCyan
+                        }
+                    }
+
                     Box(
                         modifier = Modifier
                             .size(8.dp)
                             .clip(CircleShape)
-                            .background(
-                                if (activeAnchor != null) NeonGreen
-                                else if (isPlaneDetected) NeonGreen
-                                else NeonCyan
-                            )
+                            .background(hudColor)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (activeAnchor != null) {
-                            "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير"
-                        } else if (isPlaneDetected) {
-                            "تم رصد الأرضية • انقر لتثبيت النموذج"
-                        } else {
-                            "وجّه الكاميرا نحو الأرضية لرصد السطح الحقيقي"
-                        },
+                        text = hudText,
                         style = MaterialTheme.typography.labelSmall,
                         color = Color.White
                     )
