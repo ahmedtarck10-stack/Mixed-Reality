@@ -78,7 +78,7 @@ fun MRMainScreen() {
     var metallic by remember { mutableFloatStateOf(0.25f) }
     var roughness by remember { mutableFloatStateOf(0.45f) }
     var scaleFactor by remember { mutableFloatStateOf(1.0f) }
-    var isAutoRotating by remember { mutableStateOf(true) }
+    var isAutoRotating by remember { mutableStateOf(false) }
     var rotationY by remember { mutableFloatStateOf(0f) }
 
     // Bottom sheet for model tuning / presets
@@ -197,7 +197,14 @@ fun MRMainScreen() {
                     metallic = metallic,
                     roughness = roughness,
                     scale = scaleFactor,
+                    onScaleChange = { scaleFactor = it },
                     rotationY = rotationY,
+                    onRotationYChange = { rotationY = it },
+                    isMoveMode = isMoveMode,
+                    onToggleMoveMode = { isMoveMode = !isMoveMode },
+                    isFullScreen = isFullScreen,
+                    onToggleFullScreen = { isFullScreen = !isFullScreen },
+                    onStopAutoRotate = { isAutoRotating = false },
                     onOpenClick = {
                         filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*"))
                     },
@@ -209,65 +216,69 @@ fun MRMainScreen() {
                 )
             }
             ViewportMode.AR -> {
-                if (isARCoreAvailable) {
-                    if (hasCameraPermission) {
-                        ARMixedRealityView(
-                            modelItem = selectedModel,
-                            customModelFile = customModelFile,
-                            isModelVisible = isModelVisible,
-                            color = modelColor,
-                            scale = scaleFactor,
-                            clearTrigger = clearTrigger,
-                            engine = engine,
-                            modelLoader = modelLoader,
-                            materialLoader = materialLoader
-                        )
-                    } else {
-                        PermissionRequestPlaceholder(onGrant = {
-                            permissionLauncher.launch(Manifest.permission.CAMERA)
-                        })
-                    }
-                } else {
-                    SpatialSimulationARView(
+                if (hasCameraPermission) {
+                    ARMixedRealityView(
                         modelItem = selectedModel,
                         customModelFile = customModelFile,
                         isModelVisible = isModelVisible,
                         color = modelColor,
+                        metallic = metallic,
+                        roughness = roughness,
                         scale = scaleFactor,
+                        onScaleChange = { scaleFactor = it },
+                        rotationY = rotationY,
+                        onRotationYChange = { rotationY = it },
                         clearTrigger = clearTrigger,
-                        isRecording = isRecording,
+                        isMoveMode = isMoveMode,
+                        onToggleMoveMode = { isMoveMode = !isMoveMode },
+                        isFullScreen = isFullScreen,
+                        onToggleFullScreen = { isFullScreen = !isFullScreen },
+                        onStopAutoRotate = { isAutoRotating = false },
                         engine = engine,
                         modelLoader = modelLoader,
                         materialLoader = materialLoader,
                         environmentLoader = environmentLoader
                     )
+                } else {
+                    PermissionRequestPlaceholder(onGrant = {
+                        permissionLauncher.launch(Manifest.permission.CAMERA)
+                    })
                 }
             }
             ViewportMode.MR -> {
-                // Dual stereoscopic viewports with synchronized gestures and live camera passthrough
-                MRStereoSplitView(
-                    modelItem = selectedModel,
-                    customModelFile = customModelFile,
-                    isModelVisible = isModelVisible,
-                    color = modelColor,
-                    metallic = metallic,
-                    roughness = roughness,
-                    scale = scaleFactor,
-                    isAutoRotating = isAutoRotating,
-                    rotationY = rotationY,
-                    isRecording = isRecording,
-                    engine = engine,
-                    modelLoader = modelLoader,
-                    materialLoader = materialLoader,
-                    environmentLoader = environmentLoader,
-                    surfaceMirrorer = surfaceMirrorer,
-                    isARCoreAvailable = isARCoreAvailable,
-                    clearTrigger = clearTrigger,
-                    isMoveMode = isMoveMode,
-                    onToggleMoveMode = { isMoveMode = !isMoveMode },
-                    isFullScreen = isFullScreen,
-                    onToggleFullScreen = { isFullScreen = !isFullScreen }
-                )
+                if (hasCameraPermission) {
+                    // Dual stereoscopic viewports with synchronized gestures and live camera passthrough
+                    MRStereoSplitView(
+                        modelItem = selectedModel,
+                        customModelFile = customModelFile,
+                        isModelVisible = isModelVisible,
+                        color = modelColor,
+                        metallic = metallic,
+                        roughness = roughness,
+                        scale = scaleFactor,
+                        onScaleChange = { scaleFactor = it },
+                        isAutoRotating = isAutoRotating,
+                        rotationY = rotationY,
+                        onRotationYChange = { rotationY = it },
+                        isRecording = isRecording,
+                        engine = engine,
+                        modelLoader = modelLoader,
+                        materialLoader = materialLoader,
+                        environmentLoader = environmentLoader,
+                        surfaceMirrorer = surfaceMirrorer,
+                        isARCoreAvailable = isARCoreAvailable,
+                        clearTrigger = clearTrigger,
+                        isMoveMode = isMoveMode,
+                        onToggleMoveMode = { isMoveMode = !isMoveMode },
+                        isFullScreen = isFullScreen,
+                        onToggleFullScreen = { isFullScreen = !isFullScreen },
+                        onStopAutoRotate = { isAutoRotating = false }
+                    )
+                } else {
+                    PermissionRequestPlaceholder(onGrant = {
+                        permissionLauncher.launch(Manifest.permission.CAMERA)
+                    })
+                }
             }
         }
 

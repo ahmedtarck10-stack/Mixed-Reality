@@ -2,11 +2,13 @@ package com.aistudio.mixedreality.ui
 
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.pointer.PointerEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -18,10 +20,11 @@ import kotlin.math.hypot
  * Spatial Gesture Modifier for MR / 3D / AR operations:
  * - One tap: Anchor / place model onto the real floor or scene.
  * - One finger drag: Smooth yaw rotation around the upright Y-axis.
- * - Two fingers: Zoom (scale multiplier: pinch to minify, spread to magnify).
- * - Double tap: Toggle Move Mode (moving model position across the ground).
+ * - Two fingers: Zoom (scale multiplier: pinch to minify, spread to magnify, 0.1x to 2500x).
+ * - Double tap: Toggle Move Mode (switching between moving model position across ground and scaling).
  * - Triple tap: Toggle Full Screen Mode (hiding/showing top and bottom navigation bars).
  */
+@Composable
 fun Modifier.spatialMRGestures(
     scope: CoroutineScope,
     isMoveMode: Boolean,
@@ -31,41 +34,67 @@ fun Modifier.spatialMRGestures(
     onOneFingerRotate: (dx: Float) -> Unit,
     onTwoFingerZoom: (zoomMultiplier: Float) -> Unit,
     onMove: (panX: Float, panY: Float) -> Unit
-): Modifier = pointerInput(isMoveMode) {
-    var tapCount = 0
-    var lastTapTime = 0L
-    var lastTapOffset = Offset.Zero
-    var tapTimeoutJob: Job? = null
+): Modifier {
+    val currentIsMoveMode by rememberUpdatedState(isMoveMode)
+    val currentOnSingleTap by rememberUpdatedState(onSingleTap)
+    val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
+    val currentOnTripleTap by rememberUpdatedState(onTripleTap)
+    val currentOnOneFingerRotate by rememberUpdatedState(onOneFingerRotate)
+    val currentOnTwoFingerZoom by rememberUpdatedState(onTwoFingerZoom)
+    val currentOnMove by rememberUpdatedState(onMove)
 
-    val touchSlop = viewConfiguration.touchSlop
+    return this.pointerInput(Unit) {
+        var tapCount = 0
+        var lastTapTime = 0L
+        var lastTapOffset = Offset.Zero
+        var tapTimeoutJob: Job? = null
 
-    awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false)
-        val downTime = System.currentTimeMillis()
-        val downOffset = down.position
+        val touchSlop = viewConfiguration.touchSlop
 
-        var isGestureDrag = false
-        var lastPointerPosition = downOffset
-        var prevCentroid = currentEvent.calculateCentroid()
-        var prevSpan = currentEvent.calculateSpan()
+        var maxPointersSeen = 1
+        var skipNextRotationDelta = false
 
-        while (true) {
-            val event = awaitPointerEvent()
-            val activeChanges = event.changes.filter { it.pressed }
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            val downTime = System.currentTimeMillis()
+            val downOffset = down.position
 
-            if (activeChanges.isEmpty()) {
-                // All fingers released: inspect if it's a tap gesture
-                val upTime = System.currentTimeMillis()
-                val totalDuration = upTime - downTime
+            var isGestureDrag = false
+            var lastPointerPosition = downOffset
+            var prevCentroid = downOffset
+            var prevSpan = 0f
+            var lastPointerCount = 1
+            maxPointersSeen = 1
+            skipNextRotationDelta = false
 
-                if (!isGestureDrag && totalDuration < 380L) {
-                    val distanceMoved = (downOffset - lastPointerPosition).getDistance()
-                    if (distanceMoved < touchSlop * 2.5f) {
+            while (true) {
+                val event = awaitPointerEvent(pass = PointerEventPass.Initial)
+                val pressedChanges = event.changes.filter { it.pressed }
+                val currentCount = pressedChanges.size
+
+                if (currentCount > maxPointersSeen) {
+                    maxPointersSeen = currentCount
+                }
+
+                // If multi-finger touch is active, immediately cancel any pending single-tap anchor placement
+                if (currentCount > 1) {
+                    tapTimeoutJob?.cancel()
+                    tapCount = 0
+                }
+
+                if (currentCount == 0) {
+                    // All fingers released: check if it qualifies strictly as a 1-finger tap
+                    val upTime = System.currentTimeMillis()
+                    val totalDuration = upTime - downTime
+                    val totalDistance = (lastPointerPosition - downOffset).getDistance()
+
+                    // Ensure NO multi-touch occurred during this touch sequence
+                    if (maxPointersSeen == 1 && !isGestureDrag && totalDuration < 400L && totalDistance < touchSlop * 2.0f) {
                         val tapTime = System.currentTimeMillis()
                         val diffTime = tapTime - lastTapTime
                         val diffDist = (downOffset - lastTapOffset).getDistance()
 
-                        if (diffTime < 340L && diffDist < 120f) {
+                        if (diffTime < 400L && diffDist < 120f) {
                             tapCount++
                         } else {
                             tapCount = 1
@@ -75,96 +104,108 @@ fun Modifier.spatialMRGestures(
 
                         tapTimeoutJob?.cancel()
 
-                        if (tapCount == 3) {
+                        if (tapCount >= 3) {
                             tapCount = 0
-                            onTripleTap()
-                        } else {
+                            currentOnTripleTap()
+                        } else if (tapCount == 2) {
+                            // Double tap: toggle Move mode immediately, cancel any anchor placement
+                            currentOnDoubleTap()
+                            tapCount = 0
+                        } else if (tapCount == 1) {
+                            // Single tap: delay to verify not a double tap before placing anchor
                             tapTimeoutJob = scope.launch {
-                                val currentCount = tapCount
-                                delay(320L)
-                                if (currentCount == tapCount) {
-                                    if (tapCount == 1) {
-                                        onSingleTap(lastTapOffset)
-                                    } else if (tapCount == 2) {
-                                        onDoubleTap()
-                                    }
+                                delay(260L)
+                                if (tapCount == 1) {
+                                    currentOnSingleTap(lastTapOffset)
                                     tapCount = 0
                                 }
                             }
                         }
                     }
+                    break
                 }
-                break
-            }
 
-            lastPointerPosition = activeChanges[0].position
+                // If number of fingers changed (e.g. 1 -> 2, or 2 -> 1)
+                if (currentCount != lastPointerCount) {
+                    lastPointerCount = currentCount
+                    skipNextRotationDelta = true // Ignore sudden frame delta on transition
+                    if (currentCount == 1) {
+                        lastPointerPosition = pressedChanges[0].position
+                    } else if (currentCount == 2) {
+                        prevCentroid = Offset(
+                            (pressedChanges[0].position.x + pressedChanges[1].position.x) / 2f,
+                            (pressedChanges[0].position.y + pressedChanges[1].position.y) / 2f
+                        )
+                        prevSpan = hypot(
+                            pressedChanges[0].position.x - pressedChanges[1].position.x,
+                            pressedChanges[0].position.y - pressedChanges[1].position.y
+                        )
+                    }
+                    continue
+                }
 
-            if (activeChanges.size == 1) {
-                val change = activeChanges[0]
-                val panChange = change.positionChange()
-                val distanceMoved = (change.position - downOffset).getDistance()
+                if (currentCount == 1) {
+                    val currentPos = pressedChanges[0].position
+                    val distFromDown = (currentPos - downOffset).getDistance()
 
-                if (distanceMoved > touchSlop) {
+                    if (skipNextRotationDelta) {
+                        skipNextRotationDelta = false
+                        lastPointerPosition = currentPos
+                        continue
+                    }
+
+                    if (isGestureDrag || distFromDown > touchSlop) {
+                        isGestureDrag = true
+                        tapTimeoutJob?.cancel()
+                        tapCount = 0
+
+                        val dx = currentPos.x - lastPointerPosition.x
+                        if (abs(dx) > 0.05f) {
+                            currentOnOneFingerRotate(dx)
+                        }
+                        pressedChanges[0].consume()
+                    }
+                    lastPointerPosition = currentPos
+                } else if (currentCount == 2) {
                     isGestureDrag = true
                     tapTimeoutJob?.cancel()
                     tapCount = 0
 
-                    if (isMoveMode) {
-                        onMove(panChange.x, panChange.y)
+                    val p1 = pressedChanges[0].position
+                    val p2 = pressedChanges[1].position
+                    val currentCentroid = Offset((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
+                    val currentSpan = hypot(p1.x - p2.x, p1.y - p2.y)
+
+                    if (currentIsMoveMode) {
+                        // Two fingers move the model across space in Move Mode
+                        val panX = currentCentroid.x - prevCentroid.x
+                        val panY = currentCentroid.y - prevCentroid.y
+                        if (abs(panX) > 0.5f || abs(panY) > 0.5f) {
+                            currentOnMove(panX, panY)
+                        }
                     } else {
-                        onOneFingerRotate(panChange.x)
+                        // Two fingers scale the model in Scale Mode (pinch / spread: 0.1x to 2500x)
+                        if (prevSpan > 15f && currentSpan > 15f) {
+                            val zoomFactor = currentSpan / prevSpan
+                            if (zoomFactor in 0.5f..2.0f && abs(zoomFactor - 1f) > 0.001f) {
+                                currentOnTwoFingerZoom(zoomFactor)
+                            }
+                        }
                     }
-                    change.consume()
+
+                    prevCentroid = currentCentroid
+                    prevSpan = currentSpan
+                    pressedChanges.forEach { it.consume() }
+                } else if (currentCount >= 3) {
+                    // Triple finger touch detected: toggle full screen
+                    isGestureDrag = true
+                    tapTimeoutJob?.cancel()
+                    tapCount = 0
+                    currentOnTripleTap()
+                    pressedChanges.forEach { it.consume() }
+                    break
                 }
-            } else if (activeChanges.size >= 2) {
-                isGestureDrag = true
-                tapTimeoutJob?.cancel()
-                tapCount = 0
-
-                val currentCentroid = event.calculateCentroid()
-                val currentSpan = event.calculateSpan()
-
-                if (prevSpan > 0f && currentSpan > 0f) {
-                    val zoomFactor = currentSpan / prevSpan
-                    if (abs(zoomFactor - 1f) > 0.002f) {
-                        onTwoFingerZoom(zoomFactor)
-                    }
-                }
-
-                val panX = currentCentroid.x - prevCentroid.x
-                val panY = currentCentroid.y - prevCentroid.y
-
-                if (isMoveMode || abs(panX) > 1.2f || abs(panY) > 1.2f) {
-                    onMove(panX, panY)
-                }
-
-                prevCentroid = currentCentroid
-                prevSpan = currentSpan
-
-                activeChanges.forEach { it.consume() }
             }
         }
     }
-}
-
-private fun PointerEvent.calculateCentroid(): Offset {
-    var totalX = 0f
-    var totalY = 0f
-    var count = 0
-    for (change in changes) {
-        if (change.pressed) {
-            totalX += change.position.x
-            totalY += change.position.y
-            count++
-        }
-    }
-    return if (count > 0) Offset(totalX / count, totalY / count) else Offset.Zero
-}
-
-private fun PointerEvent.calculateSpan(): Float {
-    val pressedChanges = changes.filter { it.pressed }
-    if (pressedChanges.size < 2) return 0f
-    val p1 = pressedChanges[0].position
-    val p2 = pressedChanges[1].position
-    return hypot(p1.x - p2.x, p1.y - p2.y)
 }

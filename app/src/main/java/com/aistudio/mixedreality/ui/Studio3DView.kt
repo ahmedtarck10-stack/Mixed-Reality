@@ -39,9 +39,20 @@ import io.github.sceneview.loaders.ModelLoader
 import io.github.sceneview.createEnvironment
 import io.github.sceneview.rememberEnvironment
 
+import androidx.compose.ui.layout.onSizeChanged
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.animation.*
+
 /**
  * Single-viewport 3D inspection studio (Object Mode).
- * Supports orbit camera manipulator, custom imported models, and empty scene state when cleared.
+ * Supports custom gestures:
+ * - 1 Tap: Place model at tapped screen location
+ * - 1 Finger Drag: 360-degree rotation
+ * - 2 Fingers Drag/Pinch: Scale (0.1x to 2500x) or Move depending on mode
+ * - Double Tap: Toggle between Move Mode and Scale Mode (no scaling)
+ * - Triple Tap: Toggle Full Screen (hide/show upper and down bars)
  */
 @Composable
 fun Studio3DView(
@@ -52,7 +63,14 @@ fun Studio3DView(
     metallic: Float,
     roughness: Float,
     scale: Float,
+    onScaleChange: (Float) -> Unit = {},
     rotationY: Float,
+    onRotationYChange: (Float) -> Unit = {},
+    isMoveMode: Boolean = false,
+    onToggleMoveMode: () -> Unit = {},
+    isFullScreen: Boolean = false,
+    onToggleFullScreen: () -> Unit = {},
+    onStopAutoRotate: () -> Unit = {},
     onOpenClick: () -> Unit,
     engine: Engine,
     modelLoader: ModelLoader,
@@ -62,6 +80,20 @@ fun Studio3DView(
     modifier: Modifier = Modifier
 ) {
     val windowManager = rememberViewNodeManager()
+    val scope = rememberCoroutineScope()
+    var modelPosition by remember { mutableStateOf(Position(0f, 0f, 0f)) }
+    var showModeBadge by remember { mutableStateOf(false) }
+
+    var isFirstLaunch by remember { mutableStateOf(true) }
+    LaunchedEffect(isMoveMode) {
+        if (isFirstLaunch) {
+            isFirstLaunch = false
+        } else {
+            showModeBadge = true
+            delay(2200L)
+            showModeBadge = false
+        }
+    }
 
     val pbrMaterial = remember(materialLoader, color, metallic, roughness) {
         materialLoader.createColorInstance(
@@ -73,9 +105,9 @@ fun Studio3DView(
 
     val visorGlassMaterial = remember(materialLoader) {
         materialLoader.createColorInstance(
-            color = Color(0xFF141923),
-            metallic = 0.85f,
-            roughness = 0.15f
+            color = Color(0xFF161A22),
+            metallic = 0.35f,
+            roughness = 0.45f
         )
     }
 
@@ -96,7 +128,65 @@ fun Studio3DView(
         createEnvironment(environmentLoader)
     }
 
-    Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+    var viewWidthPx by remember { mutableFloatStateOf(1080f) }
+    var viewHeightPx by remember { mutableFloatStateOf(1920f) }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .onSizeChanged { size ->
+                if (size.width > 0) viewWidthPx = size.width.toFloat()
+                if (size.height > 0) viewHeightPx = size.height.toFloat()
+            }
+            .spatialMRGestures(
+                scope = scope,
+                isMoveMode = isMoveMode,
+                onSingleTap = { tapOffset ->
+                    if (!isModelVisible) return@spatialMRGestures
+                    onStopAutoRotate()
+                    if (viewWidthPx > 0f && viewHeightPx > 0f) {
+                        val normX = (tapOffset.x / viewWidthPx) * 2f - 1f
+                        val normY = -((tapOffset.y / viewHeightPx) * 2f - 1f)
+                        val halfWidthAtZ = 1.35f
+                        val halfHeightAtZ = halfWidthAtZ * (viewHeightPx / viewWidthPx)
+                        modelPosition = Position(
+                            x = normX * halfWidthAtZ,
+                            y = 0.3f + (normY * halfHeightAtZ),
+                            z = 0f
+                        )
+                    }
+                },
+                onDoubleTap = {
+                    onToggleMoveMode()
+                },
+                onTripleTap = {
+                    onToggleFullScreen()
+                },
+                onOneFingerRotate = { dx ->
+                    onStopAutoRotate()
+                    val newRot = (rotationY + dx * 0.30f) % 360f
+                    onRotationYChange(if (newRot < 0f) newRot + 360f else newRot)
+                },
+                onTwoFingerZoom = { zoomMultiplier ->
+                    val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
+                    onScaleChange(newScale)
+                },
+                onMove = { panX, panY ->
+                    if (viewWidthPx > 0f && viewHeightPx > 0f) {
+                        val halfWidthAtZ = 1.35f
+                        val halfHeightAtZ = halfWidthAtZ * (viewHeightPx / viewWidthPx)
+                        val deltaX = (panX / viewWidthPx) * (2f * halfWidthAtZ)
+                        val deltaY = -(panY / viewHeightPx) * (2f * halfHeightAtZ)
+                        modelPosition = Position(
+                            x = modelPosition.x + deltaX,
+                            y = modelPosition.y + deltaY,
+                            z = modelPosition.z
+                        )
+                    }
+                }
+            )
+    ) {
         SceneView(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
@@ -105,7 +195,8 @@ fun Studio3DView(
             environmentLoader = environmentLoader,
             environment = environment,
             viewNodeWindowManager = windowManager,
-            cameraManipulator = rememberCameraManipulator(),
+            cameraManipulator = null,
+            autoCenterContent = false,
             cameraNode = rememberCameraNode(engine) {
                 position = Position(0f, 0.3f, 3.4f)
             },
@@ -124,8 +215,40 @@ fun Studio3DView(
                     windowManager = windowManager,
                     scale = scale,
                     rotationY = rotationY,
-                    position = Position(0f, 0f, 0f)
+                    position = modelPosition
                 )
+            }
+        }
+
+        // Mode switch feedback pill (Double-Tap)
+        androidx.compose.animation.AnimatedVisibility(
+            visible = showModeBadge,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut(),
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(bottom = 160.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(22.dp),
+                color = Color(0xDD121620),
+                border = BorderStroke(
+                    1.5.dp,
+                    if (isMoveMode) NeonCyan else Color(0xFFFFD54F)
+                ),
+                shadowElevation = 8.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (isMoveMode) "🖐️ وضع التحريك: استخدم إصبعين للتحريك" else "🔍 وضع التكبير والتصغير (0.1x – 2500x)",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
         }
 

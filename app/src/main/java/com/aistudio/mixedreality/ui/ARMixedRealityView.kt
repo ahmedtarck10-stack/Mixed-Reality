@@ -1,7 +1,11 @@
 package com.aistudio.mixedreality.ui
 
+import android.app.Activity
 import android.content.Context
-import android.view.MotionEvent
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.ui.platform.LocalContext
+import com.google.ar.core.ArCoreApk
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -16,7 +20,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -24,56 +27,52 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aistudio.mixedreality.ui.theme.*
-import com.google.ar.core.Config
-import io.github.sceneview.SceneView
-import io.github.sceneview.SurfaceType
-import io.github.sceneview.ar.PlacementScene
-import io.github.sceneview.ar.node.AnchorNode
-import com.google.android.filament.LightManager
-import io.github.sceneview.math.Direction
-import io.github.sceneview.math.Position
-import io.github.sceneview.math.Rotation
-import io.github.sceneview.math.Size
-import io.github.sceneview.node.CubeNode
-import io.github.sceneview.node.CylinderNode
-import io.github.sceneview.node.LightNode
-import io.github.sceneview.node.ModelNode
-import io.github.sceneview.node.Node
-import io.github.sceneview.node.SphereNode
-import io.github.sceneview.rememberCameraManipulator
-import io.github.sceneview.rememberCameraNode
-import io.github.sceneview.rememberEngine
-import io.github.sceneview.rememberEnvironmentLoader
-import io.github.sceneview.rememberFillLightNode
-import io.github.sceneview.rememberMainLightNode
-import io.github.sceneview.rememberMaterialLoader
-import io.github.sceneview.rememberModelInstance
-import io.github.sceneview.rememberModelLoader
-import io.github.sceneview.rememberOnGestureListener
-import io.github.sceneview.rememberViewNodeManager
-import java.io.File
-
 import com.google.android.filament.Engine
+import com.google.ar.core.Anchor
+import com.google.ar.core.Config
+import com.google.ar.core.Frame
+import com.google.ar.core.Plane
+import com.google.ar.core.TrackingState
+import io.github.sceneview.ar.ARSceneView
+import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.loaders.EnvironmentLoader
 import io.github.sceneview.loaders.MaterialLoader
 import io.github.sceneview.loaders.ModelLoader
-import io.github.sceneview.rememberEnvironment
+import io.github.sceneview.math.Position
+import io.github.sceneview.math.Rotation
+import io.github.sceneview.math.Scale
+import io.github.sceneview.math.Size
+import io.github.sceneview.node.CubeNode
+import io.github.sceneview.node.CylinderNode
+import io.github.sceneview.node.ModelNode
+import io.github.sceneview.node.Node
+import io.github.sceneview.node.SphereNode
+import io.github.sceneview.rememberModelInstance
+import java.io.File
 
 /**
- * Checks whether Google Play Services for AR is installed without triggering Play Store install IPC.
+ * Checks whether Google Play Services for AR is supported on this device.
  */
 fun isARCoreSupportedAndInstalled(context: Context): Boolean {
     return try {
-        context.packageManager.getPackageInfo("com.google.ar.core", 0)
         val availability = com.google.ar.core.ArCoreApk.getInstance().checkAvailability(context)
-        availability == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED
+        if (availability.isTransient) {
+            true
+        } else {
+            availability.isSupported
+        }
     } catch (_: Throwable) {
-        false
+        true
     }
 }
 
 /**
- * Live ARCore scene with surface plane finding, instant placement, and anchor tracking.
+ * Live ARCore scene scanning real physical floors.
+ * - One tap: Hit-tests real detected horizontal floor and anchors model.
+ * - One finger: Smooth 360° yaw rotation.
+ * - Two fingers: Zoom (scale 0.1x to 2500x).
+ * - Double tap: Toggle Move Mode (move along floor surface).
+ * - Triple tap: Toggle Full Screen (hide/show navigation bars).
  */
 @Composable
 fun ARMixedRealityView(
@@ -81,179 +80,53 @@ fun ARMixedRealityView(
     customModelFile: File?,
     isModelVisible: Boolean,
     color: Color,
+    metallic: Float = 0.25f,
+    roughness: Float = 0.45f,
     scale: Float,
-    clearTrigger: Int,
-    engine: Engine,
-    modelLoader: ModelLoader,
-    materialLoader: MaterialLoader,
-    modifier: Modifier = Modifier
-) {
-    val customModelInstance = key(customModelFile?.absolutePath) {
-        customModelFile?.let { file ->
-            rememberModelInstance(
-                modelLoader = modelLoader,
-                fileLocation = "file://${file.absolutePath}"
-            )
-        }
-    }
-
-    // Key on clearTrigger to detach all anchors when Clear is clicked
-    key(clearTrigger) {
-        val material = remember(materialLoader, color) {
-            materialLoader.createColorInstance(
-                color = color,
-                metallic = 0.2f,
-                roughness = 0.5f
-            )
-        }
-
-        val visorMaterial = remember(materialLoader) {
-            materialLoader.createColorInstance(
-                color = Color(0xFF141923),
-                metallic = 0.85f,
-                roughness = 0.15f
-            )
-        }
-
-        Box(modifier = modifier.fillMaxSize()) {
-            PlacementScene(
-                modifier = Modifier.fillMaxSize(),
-                engine = engine,
-                modelLoader = modelLoader,
-                materialLoader = materialLoader,
-                planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
-                instantPlacement = false,
-                fadePlaneOnFirstPlacement = true,
-                showReticle = isModelVisible,
-                onPlaced = { anchor ->
-                    if (!isModelVisible) return@PlacementScene
-                    AnchorNode(anchor = anchor) {
-                        if (customModelFile != null) {
-                            if (customModelInstance != null) {
-                                ModelNode(
-                                    modelInstance = customModelInstance,
-                                    scaleToUnits = 0.35f * scale,
-                                    centerOrigin = Position(0f, 0f, 0f),
-                                    position = Position(0f, 0f, 0f),
-                                    autoAnimate = true
-                                )
-                            }
-                            // Do not show cube while model is loading or parsing
-                        } else {
-                            when (modelItem) {
-                                ModelItem.VISION_HEADSET -> {
-                                    Node {
-                                        SphereNode(
-                                            radius = 0.14f * scale,
-                                            materialInstance = visorMaterial,
-                                            position = Position(0f, 0f, 0.02f * scale)
-                                        )
-                                        CubeNode(
-                                            size = Size(0.32f * scale, 0.16f * scale, 0.03f * scale),
-                                            materialInstance = material,
-                                            position = Position(0f, 0f, -0.02f * scale)
-                                        )
-                                    }
-                                }
-                                ModelItem.HOLO_CUBE -> {
-                                    CubeNode(
-                                        size = Size(0.22f * scale, 0.22f * scale, 0.22f * scale),
-                                        materialInstance = material
-                                    )
-                                }
-                                ModelItem.QUANTUM_ORB -> {
-                                    SphereNode(
-                                        radius = 0.14f * scale,
-                                        materialInstance = material
-                                    )
-                                }
-                                ModelItem.TOY_CAR, ModelItem.SPATIAL_CARD -> {
-                                    CubeNode(
-                                        size = Size(0.2f * scale, 0.2f * scale, 0.2f * scale),
-                                        materialInstance = material
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            )
-
-            // AR Placement Guidance HUD
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = 68.dp)
-                    .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
-                    .border(1.dp, NeonGreen.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(NeonGreen)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = if (isModelVisible) "Scan surfaces • Tap to place 3D model" else "Scene Cleared • Tap Open to load model",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color.White
-                    )
-                }
-            }
-        }
-    }
-}
-
-data class SimSpatialAnchor(
-    val id: Long,
-    val position: Position,
-    val modelItem: ModelItem,
-    val customModelFile: File?,
-    val color: Color,
-    val scale: Float
-)
-
-/**
- * Spatial AR simulation view using SceneView and virtual ground tracking.
- * Used on emulators or systems where Google Play Services for AR is not available.
- */
-@Composable
-fun SpatialSimulationARView(
-    modelItem: ModelItem,
-    customModelFile: File?,
-    isModelVisible: Boolean,
-    color: Color,
-    scale: Float,
-    clearTrigger: Int,
-    isRecording: Boolean,
+    onScaleChange: (Float) -> Unit = {},
+    rotationY: Float = 0f,
+    onRotationYChange: (Float) -> Unit = {},
+    clearTrigger: Int = 0,
+    isMoveMode: Boolean = false,
+    onToggleMoveMode: () -> Unit = {},
+    isFullScreen: Boolean = false,
+    onToggleFullScreen: () -> Unit = {},
+    onStopAutoRotate: () -> Unit = {},
     engine: Engine,
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
     environmentLoader: EnvironmentLoader,
     modifier: Modifier = Modifier
 ) {
+    val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
-    val placedNodes = remember { mutableStateListOf<SimSpatialAnchor>() }
 
-    var viewportWidth by remember { mutableIntStateOf(1080) }
-    var viewportHeight by remember { mutableIntStateOf(1920) }
+    var activeAnchor by remember { mutableStateOf<Anchor?>(null) }
+    var latestFrame by remember { mutableStateOf<Frame?>(null) }
+    var isPlaneDetected by remember { mutableStateOf(false) }
 
+    var modelOffset by remember { mutableStateOf(Position(0f, 0f, 0f)) }
+
+    // Clear anchor on clear trigger
     LaunchedEffect(clearTrigger) {
-        placedNodes.clear()
+        if (clearTrigger > 0) {
+            runCatching { activeAnchor?.detach() }
+            activeAnchor = null
+            modelOffset = Position(0f, 0f, 0f)
+        }
     }
 
-    val windowManager = rememberViewNodeManager()
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { activeAnchor?.detach() }
+        }
+    }
 
-    val pbrMaterial = remember(materialLoader, color) {
+    val pbrMaterial = remember(materialLoader, color, metallic, roughness) {
         materialLoader.createColorInstance(
             color = color,
-            metallic = 0.2f,
-            roughness = 0.5f
+            metallic = metallic.coerceIn(0.0f, 0.5f),
+            roughness = roughness.coerceIn(0.2f, 0.85f)
         )
     }
 
@@ -262,14 +135,6 @@ fun SpatialSimulationARView(
             color = Color(0xFF141923),
             metallic = 0.85f,
             roughness = 0.15f
-        )
-    }
-
-    val floorGridMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
-            color = Color(0x3300E5FF),
-            metallic = 0.4f,
-            roughness = 0.6f
         )
     }
 
@@ -287,125 +152,186 @@ fun SpatialSimulationARView(
         }
     }
 
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var arCoreAvailability by remember { mutableStateOf<ArCoreApk.Availability?>(null) }
+    var userRequestedInstall by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        try {
+            arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+        } catch (_: Throwable) {
+            arCoreAvailability = ArCoreApk.Availability.UNKNOWN_ERROR
+        }
+    }
+
+    if (arCoreAvailability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
+        arCoreAvailability == ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD
+    ) {
+        ARCoreInstallCard(
+            onInstall = {
+                if (activity != null) {
+                    try {
+                        val installStatus = ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)
+                        if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
+                            userRequestedInstall = false
+                        }
+                    } catch (_: Throwable) {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    }
+                } else {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                }
+            }
+        )
+        return
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
-            .onSizeChanged {
-                viewportWidth = it.width
-                viewportHeight = it.height
-            }
+            .background(Color.Black)
+            .spatialMRGestures(
+                scope = scope,
+                isMoveMode = isMoveMode,
+                onSingleTap = { tapOffset ->
+                    if (!isModelVisible) return@spatialMRGestures
+                    val frame = latestFrame ?: return@spatialMRGestures
+                    val hits = frame.hitTest(tapOffset.x, tapOffset.y)
+                    val floorHit = hits.firstOrNull { hit ->
+                        val t = hit.trackable
+                        t is Plane &&
+                            t.trackingState == TrackingState.TRACKING &&
+                            t.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                            t.isPoseInPolygon(hit.hitPose)
+                    }
+                    if (floorHit != null) {
+                        runCatching { activeAnchor?.detach() }
+                        activeAnchor = floorHit.createAnchor()
+                        modelOffset = Position(0f, 0f, 0f)
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    }
+                },
+                onDoubleTap = {
+                    onToggleMoveMode()
+                },
+                onTripleTap = {
+                    onToggleFullScreen()
+                },
+                onOneFingerRotate = { dx ->
+                    onStopAutoRotate()
+                    val newRot = (rotationY + dx * 0.45f) % 360f
+                    onRotationYChange(if (newRot < 0f) newRot + 360f else newRot)
+                },
+                onTwoFingerZoom = { zoomMultiplier ->
+                    val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
+                    onScaleChange(newScale)
+                },
+                onMove = { panX, panY ->
+                    modelOffset = Position(
+                        x = modelOffset.x + (panX * 0.0025f),
+                        y = modelOffset.y,
+                        z = modelOffset.z + (panY * 0.0025f)
+                    )
+                }
+            )
     ) {
-        // Camera passthrough background for spatial AR simulation
-        CameraPassthroughBackground(modifier = Modifier.fillMaxSize())
-
-        SceneView(
-            modifier = Modifier.fillMaxSize(),
-            surfaceType = SurfaceType.TextureSurface,
-            isOpaque = false,
+        // Real ARCore View with Horizontal Floor Detection
+        ARSceneView(
+            modifier = Modifier.fillMaxSize().testTag("ar_scene_view"),
             engine = engine,
             modelLoader = modelLoader,
             materialLoader = materialLoader,
             environmentLoader = environmentLoader,
-            viewNodeWindowManager = windowManager,
-            cameraManipulator = rememberCameraManipulator(),
-            cameraNode = rememberCameraNode(engine) {
-                // Stepped 1 step back for spatial AR viewing
-                position = Position(0f, 0.4f, 3.6f)
+            planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
+            updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
+            instantPlacementMode = Config.InstantPlacementMode.DISABLED,
+            sessionConfiguration = { _, config ->
+                config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
+                config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
             },
-            mainLightNode = rememberMainLightNode(engine),
-            fillLightNode = rememberFillLightNode(engine),
-            onGestureListener = rememberOnGestureListener(
-                onSingleTapConfirmed = { event: MotionEvent, node: Node? ->
-                    if (node != null || !isModelVisible) return@rememberOnGestureListener
-                    val normX = (event.x / viewportWidth.coerceAtLeast(1)) * 2f - 1f
-                    val normY = (event.y / viewportHeight.coerceAtLeast(1)) * 2f - 1f
-                    val posX = normX * 1.4f
-                    val posY = -0.3f - (normY * 0.25f)
-                    val posZ = -1.5f - ((1f - normY) * 1.5f)
-                    placedNodes.add(
-                        SimSpatialAnchor(
-                            id = System.currentTimeMillis() + placedNodes.size,
-                            position = Position(posX, posY, posZ),
-                            modelItem = modelItem,
-                            customModelFile = customModelFile,
-                            color = color,
-                            scale = scale
-                        )
-                    )
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            planeRenderer = (activeAnchor == null),
+            onSessionUpdated = { session, frame ->
+                latestFrame = frame
+                val planes = session.getAllTrackables(Plane::class.java)
+                val hasTrackedPlane = planes.any {
+                    it.trackingState == TrackingState.TRACKING &&
+                        it.type == Plane.Type.HORIZONTAL_UPWARD_FACING
                 }
-            )
+                if (hasTrackedPlane != isPlaneDetected) {
+                    isPlaneDetected = hasTrackedPlane
+                }
+            }
         ) {
-            // Virtual Ground Tracking Surface
-            CubeNode(
-                size = Size(6f, 0.005f, 6f),
-                position = Position(0f, -0.6f, -1.2f),
-                materialInstance = floorGridMaterial
-            )
-
-            // Placed Anchors
-            if (isModelVisible) {
-                placedNodes.forEach { anchor ->
-                    if (anchor.customModelFile != null) {
-                        if (customModelInstance != null) {
-                            ModelNode(
-                                modelInstance = customModelInstance,
-                                scaleToUnits = 0.5f * anchor.scale,
-                                centerOrigin = Position(0f, 0f, 0f),
-                                autoAnimate = true,
-                                position = anchor.position
-                            )
-                        }
-                        // Do not render cube when custom model is loaded or loading
-                    } else {
-                        when (anchor.modelItem) {
-                            ModelItem.VISION_HEADSET -> {
-                                SphereNode(
-                                    radius = 0.25f * anchor.scale,
-                                    materialInstance = visorGlassMaterial,
-                                    position = anchor.position
-                                ) {
-                                    CylinderNode(
-                                        radius = 0.27f * anchor.scale,
-                                        height = 0.08f * anchor.scale,
-                                        materialInstance = pbrMaterial,
-                                        position = Position(0f, 0f, -0.05f)
-                                    )
-                                }
-                            }
-                            ModelItem.TOY_CAR -> {
-                                toyCarModel?.let { instance ->
+            activeAnchor?.let { anchor ->
+                AnchorNode(anchor = anchor) {
+                    Node(
+                        position = modelOffset,
+                        rotation = Rotation(x = 0f, y = rotationY, z = 0f),
+                        scale = Scale(scale)
+                    ) {
+                        if (isModelVisible) {
+                            if (customModelFile != null) {
+                                customModelInstance?.let { instance ->
                                     ModelNode(
                                         modelInstance = instance,
-                                        scaleToUnits = 0.6f * anchor.scale,
-                                        position = anchor.position
+                                        scaleToUnits = 0.35f,
+                                        centerOrigin = Position(0f, 0f, 0f),
+                                        autoAnimate = true
                                     )
-                                } ?: CubeNode(
-                                    size = Size(0.35f * anchor.scale, 0.35f * anchor.scale, 0.35f * anchor.scale),
-                                    materialInstance = pbrMaterial,
-                                    position = anchor.position
-                                )
-                            }
-                            ModelItem.HOLO_CUBE -> {
-                                CubeNode(
-                                    size = Size(0.4f * anchor.scale, 0.4f * anchor.scale, 0.4f * anchor.scale),
-                                    materialInstance = pbrMaterial,
-                                    position = anchor.position
-                                )
-                            }
-                            ModelItem.QUANTUM_ORB -> {
-                                SphereNode(
-                                    radius = 0.25f * anchor.scale,
-                                    materialInstance = pbrMaterial,
-                                    position = anchor.position
-                                )
-                            }
-                            ModelItem.SPATIAL_CARD -> {
-                                CubeNode(
-                                    size = Size(0.45f * anchor.scale, 0.3f * anchor.scale, 0.05f * anchor.scale),
-                                    materialInstance = pbrMaterial,
-                                    position = anchor.position
-                                )
+                                }
+                            } else {
+                                when (modelItem) {
+                                    ModelItem.VISION_HEADSET -> {
+                                        SphereNode(
+                                            radius = 0.16f,
+                                            materialInstance = visorGlassMaterial,
+                                            position = Position(0f, 0.04f, 0.08f)
+                                        )
+                                        CylinderNode(
+                                            radius = 0.18f,
+                                            height = 0.06f,
+                                            materialInstance = pbrMaterial,
+                                            position = Position(0f, 0.04f, -0.04f)
+                                        )
+                                    }
+                                    ModelItem.TOY_CAR -> {
+                                        toyCarModel?.let { instance ->
+                                            ModelNode(
+                                                modelInstance = instance,
+                                                scaleToUnits = 0.40f,
+                                                centerOrigin = Position(0f, 0f, 0f)
+                                            )
+                                        } ?: CubeNode(
+                                            size = Size(0.25f, 0.25f, 0.25f),
+                                            materialInstance = pbrMaterial
+                                        )
+                                    }
+                                    ModelItem.HOLO_CUBE -> {
+                                        CubeNode(
+                                            size = Size(0.24f, 0.24f, 0.24f),
+                                            materialInstance = pbrMaterial
+                                        )
+                                    }
+                                    ModelItem.QUANTUM_ORB -> {
+                                        SphereNode(
+                                            radius = 0.18f,
+                                            materialInstance = pbrMaterial
+                                        )
+                                    }
+                                    ModelItem.SPATIAL_CARD -> {
+                                        CubeNode(
+                                            size = Size(0.35f, 0.22f, 0.03f),
+                                            materialInstance = pbrMaterial
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -413,30 +339,69 @@ fun SpatialSimulationARView(
             }
         }
 
-        // Top Guidance Pill
-        Column(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .statusBarsPadding()
-                .padding(top = 68.dp)
-                .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(20.dp))
-                .border(1.dp, NeonCyan.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
-                .padding(horizontal = 14.dp, vertical = 6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(NeonCyan)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = if (isModelVisible) "Spatial AR Simulation • Tap ground to place" else "Scene Cleared • Tap Open to load 3D model",
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = Color.White
-                )
+        // Move Mode Active Indicator
+        if (isMoveMode) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 70.dp)
+                    .background(Color(0xFF00E5FF).copy(alpha = 0.9f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(text = "✋", fontSize = 13.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "وضع التحريك مفعّل • انقر نقراً مزدوجاً للعودة للتدوير",
+                        color = Color.Black,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        } else {
+            // Real Floor Plane Scanning Guidance HUD
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 68.dp)
+                    .background(Color.Black.copy(alpha = 0.70f), RoundedCornerShape(20.dp))
+                    .border(
+                        1.dp,
+                        if (activeAnchor != null) NeonGreen.copy(alpha = 0.7f)
+                        else if (isPlaneDetected) NeonGreen.copy(alpha = 0.7f)
+                        else NeonCyan.copy(alpha = 0.5f),
+                        RoundedCornerShape(20.dp)
+                    )
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (activeAnchor != null) NeonGreen
+                                else if (isPlaneDetected) NeonGreen
+                                else NeonCyan
+                            )
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (activeAnchor != null) {
+                            "النموذج مثبت على الأرضية • اسحب للتدوير أو التكبير"
+                        } else if (isPlaneDetected) {
+                            "تم رصد الأرضية • انقر لتثبيت النموذج"
+                        } else {
+                            "وجّه الكاميرا نحو الأرضية لرصد السطح الحقيقي"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White
+                    )
+                }
             }
         }
     }
@@ -450,56 +415,118 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .background(Color.Black),
         contentAlignment = Alignment.Center
     ) {
         Card(
-            colors = CardDefaults.cardColors(containerColor = CardNavy),
+            modifier = Modifier
+                .padding(24.dp)
+                .fillMaxWidth(0.85f),
             shape = RoundedCornerShape(24.dp),
-            modifier = Modifier.fillMaxWidth(0.9f)
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF141923)
+            ),
+            border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.4f))
         ) {
             Column(
                 modifier = Modifier.padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Surface(
-                    modifier = Modifier.size(64.dp),
-                    shape = CircleShape,
-                    color = NeonGreen.copy(alpha = 0.15f),
-                    border = androidx.compose.foundation.BorderStroke(1.5.dp, NeonGreen)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CameraAlt,
-                        contentDescription = null,
-                        tint = NeonGreen,
-                        modifier = Modifier
-                            .padding(14.dp)
-                            .fillMaxSize()
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.CameraAlt,
+                    contentDescription = "Camera Permission",
+                    tint = NeonCyan,
+                    modifier = Modifier.size(48.dp)
+                )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Camera Access Required",
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                    color = TextPrimary
+                    text = "مطلوب إذن الكاميرا",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Mixed Reality AR mode requires camera permissions to detect surfaces and track spatial objects.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                    textAlign = TextAlign.Center
+                    text = "يحتاج وضع الواقع المعزز (AR) إلى إذن استخدام الكاميرا لرصد الأرضية والسطح الحقيقي وعرض النموذج ثلاثي الأبعاد.",
+                    fontSize = 13.sp,
+                    color = Color.White.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center,
+                    lineHeight = 18.sp
                 )
                 Spacer(modifier = Modifier.height(20.dp))
                 Button(
                     onClick = onGrant,
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonGreen),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NeonCyan,
+                        contentColor = Color.Black
+                    ),
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("grant_camera_permission_button")
+                    modifier = Modifier.testTag("grant_camera_button")
                 ) {
-                    Text("Grant Permission", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Text("منح الإذن الآن", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * ARCore installation request card when Google Play Services for AR is missing or outdated.
+ */
+@Composable
+fun ARCoreInstallCard(onInstall: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .padding(24.dp)
+                .fillMaxWidth(0.88f),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF141923)
+            ),
+            border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.5f))
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "🌐",
+                    fontSize = 42.sp
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Text(
+                    text = "تثبيت Google Play Services for AR",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "يتطلب تتبع الأسطح الحقيقية والأرضيات الفيزيائية تثبيت أو تحديث حزمة Google ARCore الرسمية لتشغيل الكاميرا ثلاثية الأبعاد بدقة.",
+                    fontSize = 13.sp,
+                    color = Color.White.copy(alpha = 0.75f),
+                    textAlign = TextAlign.Center,
+                    lineHeight = 19.sp
+                )
+                Spacer(modifier = Modifier.height(22.dp))
+                Button(
+                    onClick = onInstall,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NeonCyan,
+                        contentColor = Color.Black
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.testTag("install_arcore_button")
+                ) {
+                    Text("تثبيت / تحديث ARCore الآن", fontWeight = FontWeight.Bold)
                 }
             }
         }

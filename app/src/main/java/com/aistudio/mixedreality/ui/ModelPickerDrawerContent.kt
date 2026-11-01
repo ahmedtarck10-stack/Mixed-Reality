@@ -253,7 +253,7 @@ fun ModelPickerDrawerContent(
                 modifier = Modifier.width(70.dp)
             )
             Slider(
-                value = scale,
+                value = scale.coerceIn(0.4f, 2.5f),
                 onValueChange = onScaleChange,
                 valueRange = 0.4f..2.5f,
                 modifier = Modifier.weight(1f),

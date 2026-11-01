@@ -11,10 +11,14 @@
 
     <uses-feature
         android:name="android.hardware.camera.ar"
-        android:required="false" />
+        android:required="true" />
     <uses-feature
         android:name="android.hardware.camera"
-        android:required="false" />
+        android:required="true" />
+
+    <queries>
+        <package android:name="com.google.ar.core" />
+    </queries>
 
     <application
         android:allowBackup="true"
@@ -26,7 +30,8 @@
 
         <meta-data
             android:name="com.google.ar.core"
-            android:value="optional" />
+            android:value="required"
+            tools:replace="android:value" />
 
         <activity
             android:name=".MainActivity"

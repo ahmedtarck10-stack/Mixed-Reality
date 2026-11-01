@@ -91,28 +91,40 @@ fun SceneScope.Render3DModel(
     // Otherwise render selected preset model
     when (modelItem) {
         ModelItem.VISION_HEADSET -> {
-            // High-fidelity Vision Pro Spatial Visor (non-intersecting geometry to eliminate Z-fighting)
+            // High-fidelity Vision Pro Spatial Visor (strictly non-overlapping geometry to eliminate Z-fighting & flicker)
             Node(
                 position = position,
                 rotation = Rotation(x = 10f, y = rotationY, z = 0f)
             ) {
-                // Front curved laminated dark glass visor
-                SphereNode(
-                    radius = 0.90f * scale,
-                    materialInstance = visorGlassMaterial,
-                    position = Position(0f, 0f, 0.15f * scale)
-                )
-                // Aerospace aluminum chassis frame positioned cleanly behind glass
+                // Front dark laminated glass visor (strictly in front: Z in [0.06, 0.14])
                 CubeNode(
-                    size = Size(2.0f * scale, 1.0f * scale, 0.20f * scale),
+                    size = Size(1.90f * scale, 0.82f * scale, 0.08f * scale),
+                    materialInstance = visorGlassMaterial,
+                    position = Position(0f, 0f, 0.10f * scale)
+                )
+                // Aerospace aluminum chassis frame positioned cleanly behind glass (Z in [-0.09, 0.05])
+                CubeNode(
+                    size = Size(2.00f * scale, 0.90f * scale, 0.14f * scale),
                     materialInstance = pbrMaterial,
-                    position = Position(0f, 0f, -0.15f * scale)
+                    position = Position(0f, 0f, -0.02f * scale)
                 )
-                // Spatial headband lower curve positioned below chassis
+                // Left headband side arm
                 CubeNode(
-                    size = Size(1.65f * scale, 0.18f * scale, 0.18f * scale),
+                    size = Size(0.12f * scale, 0.35f * scale, 0.70f * scale),
                     materialInstance = visorGlassMaterial,
-                    position = Position(0f, -0.75f * scale, -0.05f * scale)
+                    position = Position(-0.95f * scale, 0f, -0.42f * scale)
+                )
+                // Right headband side arm
+                CubeNode(
+                    size = Size(0.12f * scale, 0.35f * scale, 0.70f * scale),
+                    materialInstance = visorGlassMaterial,
+                    position = Position(0.95f * scale, 0f, -0.42f * scale)
+                )
+                // Rear headband fit strap
+                CubeNode(
+                    size = Size(1.85f * scale, 0.28f * scale, 0.10f * scale),
+                    materialInstance = visorGlassMaterial,
+                    position = Position(0f, 0f, -0.78f * scale)
                 )
             }
         }
