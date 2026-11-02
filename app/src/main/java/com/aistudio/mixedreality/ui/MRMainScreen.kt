@@ -80,6 +80,7 @@ fun MRMainScreen() {
     var scaleFactor by remember { mutableFloatStateOf(1.0f) }
     var isAutoRotating by remember { mutableStateOf(false) }
     var rotationY by remember { mutableFloatStateOf(0f) }
+    var rotationX by remember { mutableFloatStateOf(0f) }
 
     // Bottom sheet for model tuning / presets
     var showTuneDrawer by remember { mutableStateOf(false) }
@@ -200,6 +201,8 @@ fun MRMainScreen() {
                     onScaleChange = { scaleFactor = it },
                     rotationY = rotationY,
                     onRotationYChange = { rotationY = it },
+                    rotationX = rotationX,
+                    onRotationXChange = { rotationX = it },
                     isMoveMode = isMoveMode,
                     onToggleMoveMode = { isMoveMode = !isMoveMode },
                     isFullScreen = isFullScreen,

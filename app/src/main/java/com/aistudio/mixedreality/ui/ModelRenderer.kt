@@ -21,11 +21,13 @@ import com.google.android.filament.MaterialInstance
 import io.github.sceneview.SceneScope
 import io.github.sceneview.math.Position
 import io.github.sceneview.math.Rotation
+import io.github.sceneview.math.Scale
 import io.github.sceneview.math.Size
 import io.github.sceneview.model.ModelInstance
 import io.github.sceneview.node.CubeNode
 import io.github.sceneview.node.CylinderNode
 import io.github.sceneview.node.ModelNode
+import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
 import io.github.sceneview.node.ViewNode
 import java.io.File
@@ -70,140 +72,135 @@ fun SceneScope.Render3DModel(
     windowManager: ViewNode.WindowManager?,
     scale: Float,
     rotationY: Float,
+    rotationX: Float = 0f,
     position: Position = Position(0f, 0f, 0f)
 ) {
-    // If user loaded a custom file and instance is ready, render it
-    if (customModelFile != null) {
-        if (customModelInstance != null) {
-            ModelNode(
-                modelInstance = customModelInstance,
-                scaleToUnits = 1.0f * scale,
-                centerOrigin = Position(0f, 0f, 0f),
-                autoAnimate = true,
-                position = position,
-                rotation = Rotation(x = 0f, y = rotationY, z = 0f)
-            )
-        }
-        // Do not render a cube while loading or parsing custom 3D models
-        return
-    }
-
-    // Otherwise render selected preset model
-    when (modelItem) {
-        ModelItem.VISION_HEADSET -> {
-            // High-fidelity Vision Pro Spatial Visor (strictly non-overlapping geometry to eliminate Z-fighting & flicker)
-            Node(
-                position = position,
-                rotation = Rotation(x = 10f, y = rotationY, z = 0f)
-            ) {
-                // Front dark laminated glass visor (strictly in front: Z in [0.06, 0.14])
-                CubeNode(
-                    size = Size(1.90f * scale, 0.82f * scale, 0.08f * scale),
-                    materialInstance = visorGlassMaterial,
-                    position = Position(0f, 0f, 0.10f * scale)
-                )
-                // Aerospace aluminum chassis frame positioned cleanly behind glass (Z in [-0.09, 0.05])
-                CubeNode(
-                    size = Size(2.00f * scale, 0.90f * scale, 0.14f * scale),
-                    materialInstance = pbrMaterial,
-                    position = Position(0f, 0f, -0.02f * scale)
-                )
-                // Left headband side arm
-                CubeNode(
-                    size = Size(0.12f * scale, 0.35f * scale, 0.70f * scale),
-                    materialInstance = visorGlassMaterial,
-                    position = Position(-0.95f * scale, 0f, -0.42f * scale)
-                )
-                // Right headband side arm
-                CubeNode(
-                    size = Size(0.12f * scale, 0.35f * scale, 0.70f * scale),
-                    materialInstance = visorGlassMaterial,
-                    position = Position(0.95f * scale, 0f, -0.42f * scale)
-                )
-                // Rear headband fit strap
-                CubeNode(
-                    size = Size(1.85f * scale, 0.28f * scale, 0.10f * scale),
-                    materialInstance = visorGlassMaterial,
-                    position = Position(0f, 0f, -0.78f * scale)
+    // Parent Node receives position, 2D rotation (rotationX pitch clamped -90..90, rotationY yaw 0..360), and real-time scale
+    Node(
+        position = position,
+        rotation = Rotation(x = rotationX, y = rotationY, z = 0f),
+        scale = Scale(scale.coerceIn(0.1f, 2500.0f))
+    ) {
+        // If user loaded a custom file and instance is ready, render it
+        if (customModelFile != null) {
+            if (customModelInstance != null) {
+                ModelNode(
+                    modelInstance = customModelInstance,
+                    scaleToUnits = 1.0f,
+                    centerOrigin = Position(0f, 0f, 0f),
+                    autoAnimate = true
                 )
             }
+            // Do not render preset shapes while custom 3D model is active
+            return@Node
         }
-        ModelItem.TOY_CAR -> {
-            toyCarModel?.let { instance ->
-                ModelNode(
-                    modelInstance = instance,
-                    scaleToUnits = 1.2f * scale,
-                    autoAnimate = true,
-                    position = position,
-                    rotation = Rotation(x = 0f, y = rotationY, z = 0f)
-                )
-            } ?: CubeNode(
-                size = Size(0.7f * scale, 0.7f * scale, 0.7f * scale),
-                materialInstance = pbrMaterial,
-                position = position,
-                rotation = Rotation(x = 15f, y = rotationY, z = 0f)
-            )
-        }
-        ModelItem.HOLO_CUBE -> {
-            CubeNode(
-                size = Size(0.85f * scale, 0.85f * scale, 0.85f * scale),
-                materialInstance = pbrMaterial,
-                position = position,
-                rotation = Rotation(x = 20f, y = rotationY, z = 0f)
-            )
-        }
-        ModelItem.QUANTUM_ORB -> {
-            SphereNode(
-                radius = 0.55f * scale,
-                materialInstance = pbrMaterial,
-                position = position,
-                rotation = Rotation(x = 0f, y = rotationY, z = 0f)
-            )
-        }
-        ModelItem.SPATIAL_CARD -> {
-            if (windowManager != null) {
-                ViewNode(
-                    windowManager = windowManager,
-                    unlit = true,
-                    position = position,
-                    rotation = Rotation(x = 0f, y = rotationY, z = 0f)
+
+        // Otherwise render selected preset model with canonical dimensions
+        when (modelItem) {
+            ModelItem.VISION_HEADSET -> {
+                // High-fidelity Vision Pro Spatial Visor (strictly non-overlapping geometry to eliminate Z-fighting & flicker)
+                Node(
+                    rotation = Rotation(x = 10f, y = 0f, z = 0f)
                 ) {
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = CardNavy),
-                        border = androidx.compose.foundation.BorderStroke(2.dp, NeonCyan),
-                        shape = RoundedCornerShape(18.dp),
-                        modifier = Modifier
-                            .width(260.dp)
-                            .padding(8.dp)
+                    // Front dark laminated glass visor (strictly in front: Z in [0.06, 0.14])
+                    CubeNode(
+                        size = Size(1.90f, 0.82f, 0.08f),
+                        materialInstance = visorGlassMaterial,
+                        position = Position(0f, 0f, 0.10f)
+                    )
+                    // Aerospace aluminum chassis frame positioned cleanly behind glass (Z in [-0.09, 0.05])
+                    CubeNode(
+                        size = Size(2.00f, 0.90f, 0.14f),
+                        materialInstance = pbrMaterial,
+                        position = Position(0f, 0f, -0.02f)
+                    )
+                    // Left headband side arm
+                    CubeNode(
+                        size = Size(0.12f, 0.35f, 0.70f),
+                        materialInstance = visorGlassMaterial,
+                        position = Position(-0.95f, 0f, -0.42f)
+                    )
+                    // Right headband side arm
+                    CubeNode(
+                        size = Size(0.12f, 0.35f, 0.70f),
+                        materialInstance = visorGlassMaterial,
+                        position = Position(0.95f, 0f, -0.42f)
+                    )
+                    // Rear headband fit strap
+                    CubeNode(
+                        size = Size(1.85f, 0.28f, 0.10f),
+                        materialInstance = visorGlassMaterial,
+                        position = Position(0f, 0f, -0.78f)
+                    )
+                }
+            }
+            ModelItem.TOY_CAR -> {
+                toyCarModel?.let { instance ->
+                    ModelNode(
+                        modelInstance = instance,
+                        scaleToUnits = 1.2f,
+                        autoAnimate = true
+                    )
+                } ?: CubeNode(
+                    size = Size(0.7f, 0.7f, 0.7f),
+                    materialInstance = pbrMaterial,
+                    rotation = Rotation(x = 15f, y = 0f, z = 0f)
+                )
+            }
+            ModelItem.HOLO_CUBE -> {
+                CubeNode(
+                    size = Size(0.85f, 0.85f, 0.85f),
+                    materialInstance = pbrMaterial,
+                    rotation = Rotation(x = 20f, y = 0f, z = 0f)
+                )
+            }
+            ModelItem.QUANTUM_ORB -> {
+                SphereNode(
+                    radius = 0.55f,
+                    materialInstance = pbrMaterial
+                )
+            }
+            ModelItem.SPATIAL_CARD -> {
+                if (windowManager != null) {
+                    ViewNode(
+                        windowManager = windowManager,
+                        unlit = true
                     ) {
-                        Column(
-                            modifier = Modifier.padding(18.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = CardNavy),
+                            border = androidx.compose.foundation.BorderStroke(2.dp, NeonCyan),
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier
+                                .width(260.dp)
+                                .padding(8.dp)
                         ) {
-                            Text(text = "🥽", fontSize = 36.sp)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Mixed Reality",
-                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                color = TextPrimary
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Spatial 3D Model Interface",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary,
-                                textAlign = TextAlign.Center
-                            )
+                            Column(
+                                modifier = Modifier.padding(18.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(text = "🥽", fontSize = 36.sp)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Mixed Reality",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = TextPrimary
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Spatial 3D Model Interface",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     }
+                } else {
+                    CubeNode(
+                        size = Size(0.8f, 0.5f, 0.08f),
+                        materialInstance = pbrMaterial
+                    )
                 }
-            } else {
-                CubeNode(
-                    size = Size(0.8f * scale, 0.5f * scale, 0.08f * scale),
-                    materialInstance = pbrMaterial,
-                    position = position,
-                    rotation = Rotation(x = 0f, y = rotationY, z = 0f)
-                )
             }
         }
     }

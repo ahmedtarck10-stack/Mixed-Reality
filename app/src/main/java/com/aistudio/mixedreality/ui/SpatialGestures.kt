@@ -31,7 +31,7 @@ fun Modifier.spatialMRGestures(
     onSingleTap: (Offset) -> Unit,
     onDoubleTap: () -> Unit,
     onTripleTap: () -> Unit,
-    onOneFingerRotate: (dx: Float) -> Unit,
+    onOneFingerRotate: (dx: Float, dy: Float) -> Unit,
     onTwoFingerZoom: (zoomMultiplier: Float) -> Unit,
     onMove: (panX: Float, panY: Float) -> Unit
 ): Modifier {
@@ -160,8 +160,9 @@ fun Modifier.spatialMRGestures(
                         tapCount = 0
 
                         val dx = currentPos.x - lastPointerPosition.x
-                        if (abs(dx) > 0.05f) {
-                            currentOnOneFingerRotate(dx)
+                        val dy = currentPos.y - lastPointerPosition.y
+                        if (abs(dx) > 0.05f || abs(dy) > 0.05f) {
+                            currentOnOneFingerRotate(dx, dy)
                         }
                         pressedChanges[0].consume()
                     }
@@ -187,7 +188,7 @@ fun Modifier.spatialMRGestures(
                         // Two fingers scale the model in Scale Mode (pinch / spread: 0.1x to 2500x)
                         if (prevSpan > 15f && currentSpan > 15f) {
                             val zoomFactor = currentSpan / prevSpan
-                            if (zoomFactor in 0.5f..2.0f && abs(zoomFactor - 1f) > 0.001f) {
+                            if (zoomFactor.isFinite() && zoomFactor in 0.5f..2.0f && abs(zoomFactor - 1f) > 0.0001f) {
                                 currentOnTwoFingerZoom(zoomFactor)
                             }
                         }

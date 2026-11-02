@@ -225,7 +225,7 @@ private fun MRStereoARCoreView(
                     // Triple Tap: Toggle Full Screen mode
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx ->
+                onOneFingerRotate = { dx, _ ->
                     // 1 Finger: Yaw Rotation
                     onStopAutoRotate()
                     val newRot = (rotationY + dx * 0.45f) % 360f

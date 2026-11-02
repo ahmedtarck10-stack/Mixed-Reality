@@ -211,7 +211,7 @@ fun ARMixedRealityView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx ->
+                onOneFingerRotate = { dx, _ ->
                     onStopAutoRotate()
                     val newRot = (rotationY + dx * 0.45f) % 360f
                     onRotationYChange(if (newRot < 0f) newRot + 360f else newRot)
