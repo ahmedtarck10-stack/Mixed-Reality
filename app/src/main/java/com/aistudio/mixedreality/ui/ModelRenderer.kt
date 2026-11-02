@@ -75,11 +75,15 @@ fun SceneScope.Render3DModel(
     rotationX: Float = 0f,
     position: Position = Position(0f, 0f, 0f)
 ) {
+    val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
+    val safeRotX = if (rotationX.isFinite()) rotationX.coerceIn(-90f, 90f) else 0f
+    val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
+
     // Parent Node receives position, 2D rotation (rotationX pitch clamped -90..90, rotationY yaw 0..360), and real-time scale
     Node(
         position = position,
-        rotation = Rotation(x = rotationX, y = rotationY, z = 0f),
-        scale = Scale(scale.coerceIn(0.1f, 2500.0f))
+        rotation = Rotation(x = safeRotX, y = safeRotY, z = 0f),
+        scale = Scale(safeScale)
     ) {
         // If user loaded a custom file and instance is ready, render it
         if (customModelFile != null) {

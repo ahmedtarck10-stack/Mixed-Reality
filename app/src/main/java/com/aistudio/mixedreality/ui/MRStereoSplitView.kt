@@ -1,6 +1,9 @@
 package com.aistudio.mixedreality.ui
 
+import android.app.Activity
+import android.content.Intent
 import android.graphics.SurfaceTexture
+import android.net.Uri
 import android.view.Surface
 import android.view.TextureView
 import androidx.compose.foundation.background
@@ -16,6 +19,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -25,6 +29,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.aistudio.mixedreality.ui.theme.*
 import com.google.android.filament.Engine
 import com.google.ar.core.Anchor
+import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
@@ -82,6 +87,7 @@ fun MRStereoSplitView(
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
     onStopAutoRotate: () -> Unit = {},
+    onFallbackToObject: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     MRStereoARCoreView(
@@ -96,6 +102,7 @@ fun MRStereoSplitView(
         rotationY = rotationY,
         onRotationYChange = onRotationYChange,
         onStopAutoRotate = onStopAutoRotate,
+        onFallbackToObject = onFallbackToObject,
         engine = engine,
         modelLoader = modelLoader,
         materialLoader = materialLoader,
@@ -127,6 +134,7 @@ private fun MRStereoARCoreView(
     rotationY: Float,
     onRotationYChange: (Float) -> Unit,
     onStopAutoRotate: () -> Unit,
+    onFallbackToObject: () -> Unit = {},
     engine: Engine,
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
@@ -139,6 +147,57 @@ private fun MRStereoARCoreView(
     onToggleFullScreen: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    var arCoreAvailability by remember { mutableStateOf<ArCoreApk.Availability?>(null) }
+    var userRequestedInstall by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        try {
+            arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+        } catch (_: Throwable) {
+            arCoreAvailability = ArCoreApk.Availability.UNKNOWN_ERROR
+        }
+    }
+
+    if (arCoreAvailability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
+        arCoreAvailability == ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD
+    ) {
+        ARCoreInstallCard(
+            onInstall = {
+                if (activity != null) {
+                    try {
+                        val installStatus = ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)
+                        if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
+                            userRequestedInstall = false
+                        }
+                    } catch (_: Throwable) {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    }
+                } else {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                }
+            }
+        )
+        return
+    }
+
+    if (arCoreAvailability == ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE ||
+        arCoreAvailability == ArCoreApk.Availability.UNKNOWN_ERROR ||
+        arCoreAvailability == ArCoreApk.Availability.UNKNOWN_TIMED_OUT
+    ) {
+        ARCoreUnsupportedCard(
+            onBackToObject = onFallbackToObject,
+            isError = (arCoreAvailability != ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE)
+        )
+        return
+    }
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
@@ -306,10 +365,11 @@ private fun MRStereoARCoreView(
                                 isScaleEditable = false
                             }
                         ) {
+                            val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
                             Node(
                                 position = modelOffset,
                                 rotation = Rotation(x = 0f, y = rotationY, z = 0f),
-                                scale = Scale(scale)
+                                scale = Scale(safeScale)
                             ) {
                                 if (isModelVisible) {
                                     if (customModelFile != null) {

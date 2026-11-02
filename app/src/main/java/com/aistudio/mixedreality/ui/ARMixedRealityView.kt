@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.compose.ui.platform.LocalContext
 import com.google.ar.core.ArCoreApk
 import java.util.concurrent.atomic.AtomicReference
@@ -52,18 +53,18 @@ import io.github.sceneview.rememberModelInstance
 import java.io.File
 
 /**
- * Checks whether Google Play Services for AR is supported on this device.
+ * Checks whether Google Play Services for AR is supported and installed on this device.
+ * Never returns true on exceptions, and safely distinguishes between installed,
+ * uninstalled, unsupported, and transient checking states.
  */
 fun isARCoreSupportedAndInstalled(context: Context): Boolean {
     return try {
         val availability = com.google.ar.core.ArCoreApk.getInstance().checkAvailability(context)
-        if (availability.isTransient) {
-            true
-        } else {
-            availability.isSupported
-        }
-    } catch (_: Throwable) {
-        true
+        Log.d("ARCoreAvailability", "ARCore availability checked: $availability")
+        availability == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED
+    } catch (e: Throwable) {
+        Log.w("ARCoreAvailability", "ARCore checkAvailability threw exception: ${e.message}", e)
+        false
     }
 }
 
@@ -93,6 +94,7 @@ fun ARMixedRealityView(
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
     onStopAutoRotate: () -> Unit = {},
+    onFallbackToObject: () -> Unit = {},
     engine: Engine,
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
@@ -195,6 +197,17 @@ fun ARMixedRealityView(
         return
     }
 
+    if (arCoreAvailability == ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE ||
+        arCoreAvailability == ArCoreApk.Availability.UNKNOWN_ERROR ||
+        arCoreAvailability == ArCoreApk.Availability.UNKNOWN_TIMED_OUT
+    ) {
+        ARCoreUnsupportedCard(
+            onBackToObject = onFallbackToObject,
+            isError = (arCoreAvailability != ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE)
+        )
+        return
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -273,10 +286,11 @@ fun ARMixedRealityView(
                         isScaleEditable = false
                     }
                 ) {
+                    val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
                     Node(
                         position = modelOffset,
                         rotation = Rotation(x = 0f, y = rotationY, z = 0f),
-                        scale = Scale(scale)
+                        scale = Scale(safeScale)
                     ) {
                         if (isModelVisible) {
                             if (customModelFile != null) {
@@ -521,6 +535,74 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
                     modifier = Modifier.testTag("install_arcore_button")
                 ) {
                     Text("تثبيت / تحديث ARCore الآن", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Clean fallback card displayed when the device hardware or emulator does not support ARCore.
+ */
+@Composable
+fun ARCoreUnsupportedCard(
+    onBackToObject: () -> Unit,
+    isError: Boolean = false
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .padding(24.dp)
+                .fillMaxWidth(0.88f),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF141923)
+            ),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.5f))
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = if (isError) "⚠️" else "📱",
+                    fontSize = 42.sp
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Text(
+                    text = if (isError) "تعذر الاتصال بخدمات ARCore" else "الجهاز غير متوافق مع ARCore",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = if (isError)
+                        "حدث خطأ أثناء فحص خدمات الواقع المعزز. يمكنك مواصلة استخدام وعرض المجسم في وضع Object."
+                    else
+                        "هذا الجهاز أو بيئة المحاكي لا تدعم Google ARCore لتتبع الأسطح الفيزيائية الحقيقية. يمكنك استعراض المجسم والتفاعل مع كافة إيماءات التدوير والتكبير في وضع المجسم (Object Mode).",
+                    fontSize = 13.sp,
+                    color = Color.White.copy(alpha = 0.75f),
+                    textAlign = TextAlign.Center,
+                    lineHeight = 19.sp
+                )
+                Spacer(modifier = Modifier.height(22.dp))
+                Button(
+                    onClick = onBackToObject,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NeonCyan,
+                        contentColor = Color.Black
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.testTag("back_to_object_button")
+                ) {
+                    Text("العودة إلى وضع المجسم (Object)", fontWeight = FontWeight.Bold)
                 }
             }
         }

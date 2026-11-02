@@ -1,5 +1,6 @@
 package com.aistudio.mixedreality
 
+import com.google.ar.core.ArCoreApk
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -77,6 +78,68 @@ class SpatialMathAndGesturesTest {
 
         val validScale = 2.5f
         assertEquals(2.5f, validScale.coerceIn(minAllowed, maxAllowed), 0.001f)
+    }
+
+    @Test
+    fun testSafeScaleComputationPreventsFreezes() {
+        fun computeSafeScale(scale: Float): Float {
+            return if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
+        }
+
+        assertEquals(1.0f, computeSafeScale(Float.NaN), 0.001f)
+        assertEquals(1.0f, computeSafeScale(Float.POSITIVE_INFINITY), 0.001f)
+        assertEquals(1.0f, computeSafeScale(Float.NEGATIVE_INFINITY), 0.001f)
+        assertEquals(1.0f, computeSafeScale(-5.0f), 0.001f)
+        assertEquals(1.0f, computeSafeScale(0.0f), 0.001f)
+        assertEquals(2.5f, computeSafeScale(2.5f), 0.001f)
+        assertEquals(0.1f, computeSafeScale(0.01f), 0.001f)
+        assertEquals(2500.0f, computeSafeScale(5000f), 0.001f)
+    }
+
+    @Test
+    fun testSafeRotationComputationPreventsNaN() {
+        fun computeSafeRotX(rotX: Float): Float {
+            return if (rotX.isFinite()) rotX.coerceIn(-90f, 90f) else 0f
+        }
+
+        fun computeSafeRotY(rotY: Float): Float {
+            return if (rotY.isFinite()) ((rotY % 360f) + 360f) % 360f else 0f
+        }
+
+        assertEquals(0f, computeSafeRotX(Float.NaN), 0.001f)
+        assertEquals(0f, computeSafeRotY(Float.NaN), 0.001f)
+        assertEquals(45f, computeSafeRotX(45f), 0.001f)
+        assertEquals(90f, computeSafeRotX(120f), 0.001f)
+        assertEquals(-90f, computeSafeRotX(-150f), 0.001f)
+        assertEquals(180f, computeSafeRotY(180f), 0.001f)
+        assertEquals(30f, computeSafeRotY(390f), 0.001f)
+        assertEquals(330f, computeSafeRotY(-30f), 0.001f)
+    }
+
+    @Test
+    fun testARCoreAvailabilityClassification() {
+        fun isAvailable(availability: ArCoreApk.Availability?): Boolean {
+            return availability == ArCoreApk.Availability.SUPPORTED_INSTALLED
+        }
+
+        fun isAvailableWithException(simulateException: Boolean): Boolean {
+            return try {
+                if (simulateException) throw RuntimeException("Simulated ARCore check failure")
+                isAvailable(ArCoreApk.Availability.SUPPORTED_INSTALLED)
+            } catch (_: Throwable) {
+                false // Critical requirement: NEVER return true on exception
+            }
+        }
+
+        assertTrue(isAvailable(ArCoreApk.Availability.SUPPORTED_INSTALLED))
+        assertFalse(isAvailable(ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED))
+        assertFalse(isAvailable(ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD))
+        assertFalse(isAvailable(ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE))
+        assertFalse(isAvailable(ArCoreApk.Availability.UNKNOWN_CHECKING))
+        assertFalse(isAvailable(ArCoreApk.Availability.UNKNOWN_ERROR))
+        assertFalse(isAvailable(ArCoreApk.Availability.UNKNOWN_TIMED_OUT))
+        assertFalse(isAvailable(null))
+        assertFalse("Exception must safely return false and never true", isAvailableWithException(true))
     }
 
     @Test

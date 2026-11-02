@@ -237,6 +237,7 @@ fun MRMainScreen() {
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
                         onStopAutoRotate = { isAutoRotating = false },
+                        onFallbackToObject = { selectedMode = ViewportMode.OBJECT },
                         engine = engine,
                         modelLoader = modelLoader,
                         materialLoader = materialLoader,
@@ -275,7 +276,8 @@ fun MRMainScreen() {
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
-                        onStopAutoRotate = { isAutoRotating = false }
+                        onStopAutoRotate = { isAutoRotating = false },
+                        onFallbackToObject = { selectedMode = ViewportMode.OBJECT }
                     )
                 } else {
                     PermissionRequestPlaceholder(onGrant = {
