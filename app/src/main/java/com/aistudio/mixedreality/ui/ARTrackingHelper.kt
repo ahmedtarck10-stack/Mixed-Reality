@@ -3,7 +3,6 @@ package com.aistudio.mixedreality.ui
 import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -19,9 +18,8 @@ import com.google.ar.core.TrackingState
 import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "ARTracking"
-private const val PLACEMENT_TIMEOUT_MS = 2_500L
 
-/** A screen-space tap waiting for the next trackable camera frame. */
+/** A screen-space tap waiting for a valid current camera frame. */
 data class PendingPlacementTap(
     val offset: Offset,
     val creationTime: Long = System.currentTimeMillis()
@@ -42,9 +40,9 @@ class ARTrackingManager(
         private set
 
     private val pendingPlacementRef = AtomicReference<PendingPlacementTap?>(null)
+    private val recoveryGate = AnchorRecoveryGate<Anchor>()
     private var lastCameraTrackingState: TrackingState? = null
 
-    /** A deliberate tap places or repositions the model on the next tracked frame. */
     fun onSingleTap(tapOffset: Offset, isModelVisible: Boolean) {
         if (!isModelVisible) {
             Log.d(TAG, "[$modeName] Tap ignored: model is not visible")
@@ -76,24 +74,29 @@ class ARTrackingManager(
 
         val pending = pendingPlacementRef.get()
         if (pending != null) {
-            val elapsedMs = System.currentTimeMillis() - pending.creationTime
-            when {
-                !isModelVisible -> pendingPlacementRef.compareAndSet(pending, null)
-                elapsedMs > PLACEMENT_TIMEOUT_MS -> {
+            val decision = placementTapDecision(
+                isModelVisible = isModelVisible,
+                cameraIsTracking = cameraState == TrackingState.TRACKING,
+                elapsedMs = (System.currentTimeMillis() - pending.creationTime).coerceAtLeast(0L)
+            )
+            when (decision) {
+                PlacementTapDecision.DISCARD -> {
                     pendingPlacementRef.compareAndSet(pending, null)
-                    Log.w(TAG, "[$modeName] Placement tap expired; scan the floor and tap again")
+                    Log.d(TAG, "[$modeName] Discarded expired, hidden-model, or stale placement tap")
                 }
-                cameraState == TrackingState.TRACKING -> {
-                    // Consume the tap on this frame. Retrying its old screen coordinates on later
-                    // frames makes a moving camera cast a different ray and silently moves the
-                    // requested placement point while the user is waiting for plane detection.
+                PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME -> {
+                    // Consume exactly once. A failed hit or a later tracking recovery must never
+                    // replay screen coordinates captured against a different camera pose.
                     if (pendingPlacementRef.compareAndSet(pending, null)) {
                         val hitX = if (splitWidthPx > 0f && pending.offset.x > splitWidthPx) {
                             pending.offset.x - splitWidthPx
                         } else {
                             pending.offset.x
                         }
-                        val hits = runCatching { frame.hitTest(hitX, pending.offset.y) }.getOrNull().orEmpty()
+                        val hits = runCatching { frame.hitTest(hitX, pending.offset.y) }
+                            .onFailure { Log.w(TAG, "[$modeName] Hit test failed", it) }
+                            .getOrNull()
+                            .orEmpty()
                         val floorHit = hits.firstOrNull { hit ->
                             val plane = hit.trackable as? Plane
                             plane != null &&
@@ -102,37 +105,66 @@ class ARTrackingManager(
                                 plane.subsumedBy == null &&
                                 plane.isPoseInPolygon(hit.hitPose)
                         }
-
                         val newAnchor = floorHit?.let { hit ->
                             runCatching { hit.createAnchor() }
                                 .onFailure { Log.w(TAG, "[$modeName] Could not create anchor", it) }
                                 .getOrNull()
                         }
-
                         if (newAnchor != null) {
-                            // Keep the existing anchor until the replacement was created
-                            // successfully, so a failed relocation never makes the model vanish.
                             val oldAnchor = activeAnchor
                             activeAnchor = newAnchor
                             anchorTrackingState = newAnchor.trackingState
+                            recoveryGate.reset()
                             runCatching { oldAnchor?.detach() }
                             Log.i(TAG, "[$modeName] Model anchored to a tracked upward-facing plane")
                             onHapticFeedback()
                             onPlaced()
                         } else {
-                            Log.w(TAG, "[$modeName] No tracked floor plane under tap; scan the floor and tap again")
+                            Log.w(TAG, "[$modeName] No tracked floor plane under tap; scan and tap again")
                         }
                     }
                 }
-                else -> Unit // Wait briefly for camera tracking, but never re-hit-test stale taps.
             }
         }
 
-        activeAnchor?.let { anchor ->
+        val anchor = activeAnchor
+        if (anchor != null) {
             val state = runCatching { anchor.trackingState }.getOrNull()
             if (state != null && anchorTrackingState != state) {
-                Log.i(TAG, "[$modeName] Active anchor tracking state: $anchorTrackingState -> $state")
                 anchorTrackingState = state
+                Log.i(TAG, "[$modeName] Active anchor tracking state: $state")
+            }
+
+            // Recover at most once until a replacement is confirmed TRACKING. Recreate only
+            // at the original world pose and only on a tracked plane containing that pose.
+            if (state == TrackingState.STOPPED && cameraState == TrackingState.TRACKING &&
+                recoveryGate.shouldAttempt(anchor)
+            ) {
+                val originalPose = runCatching { anchor.pose }.getOrNull()
+                val targetPlane = if (originalPose == null) null else runCatching {
+                    session.getAllTrackables(Plane::class.java).firstOrNull { plane ->
+                        plane.trackingState == TrackingState.TRACKING &&
+                            plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                            plane.subsumedBy == null &&
+                            plane.isPoseInPolygon(originalPose)
+                    }
+                }.getOrNull()
+                val recoveredAnchor = if (targetPlane != null && originalPose != null) {
+                    runCatching { targetPlane.createAnchor(originalPose) }
+                        .onFailure { Log.w(TAG, "[$modeName] Stopped-anchor recovery failed", it) }
+                        .getOrNull()
+                } else null
+
+                if (recoveredAnchor != null) {
+                    activeAnchor = recoveredAnchor
+                    anchorTrackingState = recoveredAnchor.trackingState
+                    runCatching { anchor.detach() }
+                    Log.i(TAG, "[$modeName] Recovered stopped anchor at its original pose")
+                } else {
+                    Log.w(TAG, "[$modeName] No tracked plane contains stopped anchor pose; tap to relocate")
+                }
+            } else if (state == TrackingState.TRACKING) {
+                recoveryGate.reset()
             }
         }
 
@@ -144,8 +176,8 @@ class ARTrackingManager(
             }
         }.getOrDefault(false)
         if (hasTrackedFloor != isPlaneDetected) {
-            Log.d(TAG, "[$modeName] Tracked upward-facing floor plane detected: $hasTrackedFloor")
             isPlaneDetected = hasTrackedFloor
+            Log.d(TAG, "[$modeName] Tracked upward-facing floor plane detected: $hasTrackedFloor")
         }
     }
 
@@ -155,13 +187,14 @@ class ARTrackingManager(
         activeAnchor = null
         anchorTrackingState = null
         pendingPlacementRef.set(null)
+        recoveryGate.reset()
     }
 
     fun dispose() = clear()
 
     fun getHudStatus(): Pair<String, Color> = when {
         activeAnchor != null && anchorTrackingState == TrackingState.TRACKING ->
-            "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
+            "ال��موذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
         activeAnchor != null && anchorTrackingState == TrackingState.PAUSED ->
             "التتبع متوقف مؤقتاً • حرّك الجهاز ببطء" to Color(0xFFFFB300)
         activeAnchor != null && anchorTrackingState == TrackingState.STOPPED ->

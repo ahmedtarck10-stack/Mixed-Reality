@@ -9,12 +9,13 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- Object Mode works without AR hardware; AR/MR validate ARCore at runtime. -->
     <uses-feature
         android:name="android.hardware.camera.ar"
-        android:required="true" />
+        android:required="false" />
     <uses-feature
         android:name="android.hardware.camera"
-        android:required="true" />
+        android:required="false" />
 
     <queries>
         <package android:name="com.google.ar.core" />
@@ -28,9 +29,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MixedReality">
 
+        <!-- AR is optional at install time; the AR/MR screens gate their sessions at runtime. -->
         <meta-data
             android:name="com.google.ar.core"
-            android:value="required"
+            android:value="optional"
             tools:replace="android:value" />
 
         <activity

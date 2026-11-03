@@ -72,30 +72,23 @@ class SpatialMathAndGesturesTest {
 
     @Test
     fun placementTapUsesActual2500MsTimeoutAndNeverReplaysAfterTrackingLoss() {
-        assertEquals(
-            PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME,
-            placementTapDecision(true, true, 2499L)
-        )
+        assertEquals(PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME, placementTapDecision(true, true, 2499L))
         assertEquals(PlacementTapDecision.DISCARD, placementTapDecision(true, true, 2500L))
         assertEquals(PlacementTapDecision.DISCARD, placementTapDecision(false, true, 0L))
-        assertEquals(
-            "A tap captured while tracking is lost must be discarded, not replayed after recovery",
-            PlacementTapDecision.DISCARD,
-            placementTapDecision(true, false, 1L)
-        )
+        assertEquals(PlacementTapDecision.DISCARD, placementTapDecision(true, false, 1L))
     }
 
     @Test
-    fun stoppedAnchorCanOnlyBeRecoveredOncePerAnchorInstance() {
+    fun anchorRecoveryGatePreventsRepeatedRecoveryUntilTrackingIsRestored() {
         val gate = AnchorRecoveryGate<Any>()
         val stoppedAnchor = Any()
         val replacementAnchor = Any()
 
         assertTrue(gate.shouldAttempt(stoppedAnchor))
         assertFalse("Do not recreate anchors every frame", gate.shouldAttempt(stoppedAnchor))
-        assertTrue("A replacement anchor has an independent lifecycle", gate.shouldAttempt(replacementAnchor))
+        assertFalse("Do not chain recoveries while replacement is not tracking", gate.shouldAttempt(replacementAnchor))
         gate.reset()
-        assertTrue(gate.shouldAttempt(replacementAnchor))
+        assertTrue("A new recovery cycle can begin after tracking returns", gate.shouldAttempt(replacementAnchor))
     }
 
     @Test

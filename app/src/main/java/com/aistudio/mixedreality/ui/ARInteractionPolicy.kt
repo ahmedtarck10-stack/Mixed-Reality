@@ -4,7 +4,6 @@ package com.aistudio.mixedreality.ui
 internal const val PLACEMENT_TIMEOUT_MS = 2_500L
 
 internal enum class PlacementTapDecision {
-    WAIT_FOR_TRACKING,
     HIT_TEST_ON_CURRENT_FRAME,
     DISCARD
 }
@@ -15,23 +14,23 @@ internal fun placementTapDecision(
     cameraIsTracking: Boolean,
     elapsedMs: Long
 ): PlacementTapDecision = when {
-    !isModelVisible || elapsedMs > PLACEMENT_TIMEOUT_MS -> PlacementTapDecision.DISCARD
-    cameraIsTracking -> PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME
-    else -> PlacementTapDecision.DISCARD
+    !isModelVisible || elapsedMs >= PLACEMENT_TIMEOUT_MS -> PlacementTapDecision.DISCARD
+    !cameraIsTracking -> PlacementTapDecision.DISCARD
+    else -> PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME
 }
 
-/** Limits recovery attempts to once per stopped anchor instance. */
+/** Allows one recovery attempt until an anchor has successfully returned to tracking. */
 internal class AnchorRecoveryGate<T : Any> {
-    private var attemptedAnchor: T? = null
+    private var recoveryInProgress = false
 
     fun shouldAttempt(anchor: T): Boolean {
-        if (attemptedAnchor === anchor) return false
-        attemptedAnchor = anchor
+        if (recoveryInProgress) return false
+        recoveryInProgress = true
         return true
     }
 
     fun reset() {
-        attemptedAnchor = null
+        recoveryInProgress = false
     }
 }
 
