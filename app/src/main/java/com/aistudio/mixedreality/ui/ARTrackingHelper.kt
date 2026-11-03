@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "ARTracking"
 private const val RECOVERY_GRACE_NANOS = 1_000_000_000L
+private const val PLANE_SCAN_INTERVAL_NANOS = 250_000_000L
 
 /** A screen-space tap waiting for a valid current camera frame. */
 data class PendingPlacementTap(
@@ -44,6 +45,8 @@ class ARTrackingManager(
     private val pendingPlacementRef = AtomicReference<PendingPlacementTap?>(null)
     private val recoveryGate = AnchorRecoveryGate()
     private var lastCameraTrackingState: TrackingState? = null
+    private var lastPlaneScanNanos: Long = 0L
+    private var cachedHasTrackedHorizontalSurface = false
 
     // Only an anchor pose read while both anchor and camera track can become this baseline.
     private var lastVerifiedWorldPose: Pose? = null
@@ -124,8 +127,6 @@ class ARTrackingManager(
                                 promotePlacementAnchor(candidate, pose, onPlaced)
                                 onHapticFeedback()
                             } else {
-                                // Retain one genuine hit anchor while ARCore's asynchronous pose
-                                // update is PAUSED. Keep the existing active placement untouched.
                                 runCatching { pendingPlacementAnchor?.detach() }
                                 pendingPlacementAnchor = candidate
                                 Log.i(TAG, "[$modeName] Valid floor-hit anchor is PAUSED; awaiting tracking")
@@ -163,7 +164,6 @@ class ARTrackingManager(
             if (verifiedPose != null) {
                 lastVerifiedWorldPose = verifiedPose
                 trackingLostSinceNanos = null
-                // Natural relocalization wins; discard any unused replacement.
                 runCatching { recoveryCandidate?.detach() }
                 recoveryCandidate = null
                 recoveryGate.reset()
@@ -180,9 +180,7 @@ class ARTrackingManager(
                     val candidatePose = verifiedAnchorPose(candidate, cameraState)
                     when {
                         isRecoveryCandidateAcceptable(cameraState, candidateState, originalPose, candidatePose) -> {
-                            val safeCandidatePose = candidatePose ?: return@let
-                            // Acceptance is based on the saved verified pose, not a fresh/stale
-                            // replacement pose. Preserve that exact baseline across recovery.
+                            val safeCandidatePose = candidatePose ?: return
                             if (isRecoveryTranslationContinuous(
                                     originalPose?.tx() ?: Float.NaN,
                                     originalPose?.ty() ?: Float.NaN,
@@ -209,11 +207,8 @@ class ARTrackingManager(
                         candidateState == TrackingState.STOPPED || candidateState == null -> {
                             runCatching { candidate.detach() }
                             recoveryCandidate = null
-                            // Keep the gate timestamp: a failed candidate cannot trigger per-frame
-                            // anchor creation, but may be retried after the bounded backoff.
                             Log.w(TAG, "[$modeName] Recovery candidate stopped; bounded retry remains enabled")
                         }
-                        // A PAUSED candidate is kept and polled; no duplicate is created.
                     }
                 } else if (originalPose != null) {
                     val targetPlane = runCatching {
@@ -226,7 +221,6 @@ class ARTrackingManager(
                         Log.w(TAG, "[$modeName] Could not inspect tracked planes for recovery", it)
                     }.getOrNull()
 
-                    // Never consume an attempt without the exact saved pose inside a real plane.
                     if (targetPlane != null && recoveryGate.shouldAttempt()) {
                         recoveryCandidate = runCatching { targetPlane.createAnchor(originalPose) }
                             .onFailure { Log.w(TAG, "[$modeName] Recovery anchor creation failed", it) }
@@ -239,22 +233,43 @@ class ARTrackingManager(
                     Log.w(TAG, "[$modeName] No verified world pose; refusing arbitrary recovery")
                 }
             } else if (cameraState != TrackingState.TRACKING) {
-                // Tracking interruptions reset the grace timer, not the verified pose.
                 trackingLostSinceNanos = null
             }
         }
 
-        val hasTrackedHorizontalSurface = cameraState == TrackingState.TRACKING && runCatching {
-            session.getAllTrackables(Plane::class.java).any { plane ->
-                plane.trackingState == TrackingState.TRACKING &&
-                    plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING && plane.subsumedBy == null
+        val hasTrackedHorizontalSurface = shouldRefreshPlaneDetection(cameraState, System.nanoTime())
+            .let { shouldRefresh ->
+                if (shouldRefresh) {
+                    detectTrackedHorizontalSurface(session).also {
+                        cachedHasTrackedHorizontalSurface = it
+                        lastPlaneScanNanos = System.nanoTime()
+                    }
+                } else {
+                    cachedHasTrackedHorizontalSurface
+                }
             }
-        }.getOrDefault(false)
         if (hasTrackedHorizontalSurface != isPlaneDetected) {
             isPlaneDetected = hasTrackedHorizontalSurface
             Log.d(TAG, "[$modeName] Tracked upward-facing ARCore horizontal surface detected: $hasTrackedHorizontalSurface")
         }
     }
+
+    private fun shouldRefreshPlaneDetection(cameraState: TrackingState?, nowNanos: Long): Boolean {
+        if (cameraState != TrackingState.TRACKING) return true
+        return when {
+            activeAnchor == null -> true
+            anchorTrackingState != TrackingState.TRACKING -> true
+            else -> nowNanos - lastPlaneScanNanos >= PLANE_SCAN_INTERVAL_NANOS
+        }
+    }
+
+    private fun detectTrackedHorizontalSurface(session: Session): Boolean = runCatching {
+        session.getAllTrackables(Plane::class.java).any { plane ->
+            plane.trackingState == TrackingState.TRACKING &&
+                plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                plane.subsumedBy == null
+        }
+    }.getOrDefault(false)
 
     private fun trackingLossDurationNanos(cameraState: TrackingState?): Long {
         if (cameraState != TrackingState.TRACKING) {
@@ -304,6 +319,9 @@ class ARTrackingManager(
         trackingLostSinceNanos = null
         pendingPlacementRef.set(null)
         recoveryGate.reset()
+        lastPlaneScanNanos = 0L
+        cachedHasTrackedHorizontalSurface = false
+        isPlaneDetected = false
     }
 
     fun dispose() = clear()
@@ -328,3 +346,5 @@ fun rememberARTrackingManager(
 ): ARTrackingManager = remember(modeName) {
     ARTrackingManager(modeName = modeName, onHapticFeedback = onHapticFeedback)
 }
+
+private const val RECOVERY_GRACE_NANOS = 1_000_000_000L
