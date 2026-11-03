@@ -44,9 +44,15 @@ class ARTrackingManager(
     private val recoveryGate = AnchorRecoveryGate()
     private var lastCameraTrackingState: TrackingState? = null
 
-    // Snapshot in ARCore world coordinates captured only from a tracking anchor + tracking camera.
-    // Never use a stopped/paused anchor's subsequently changing pose as the recovery destination.
-    private var lastTrackedAnchorPose: Pose? = null
+    // Recovery may use only a pose read from an anchor while both anchor and camera track.
+    private var lastVerifiedWorldPose: Pose? = null
+
+    // A real hit can initially create a PAUSED anchor. Keep it separate from the active anchor
+    // until ARCore tracks it; this avoids replacing a working placement with an unverified pose.
+    private var pendingPlacementAnchor: Anchor? = null
+
+    // At most one replacement recovery anchor exists at a time. PAUSED candidates are polled;
+    // STOPPED/failed candidates are detached before the rate-limited retry is allowed.
     private var recoveryCandidate: Anchor? = null
     private var pendingPlacementConfirmation = false
 
@@ -96,51 +102,60 @@ class ARTrackingManager(
                     } else {
                         pending.offset.x
                     }
-                    val hits = runCatching { frame.hitTest(hitX, pending.offset.y) }
+                    val floorHit = runCatching { frame.hitTest(hitX, pending.offset.y) }
                         .onFailure { Log.w(TAG, "[$modeName] Hit test failed", it) }
                         .getOrNull()
                         .orEmpty()
-                    val floorHit = hits.firstOrNull { hit ->
-                        val plane = hit.trackable as? Plane
-                        plane != null && plane.trackingState == TrackingState.TRACKING &&
-                            plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            plane.subsumedBy == null && plane.isPoseInPolygon(hit.hitPose)
-                    }
+                        .firstOrNull { hit ->
+                            val plane = hit.trackable as? Plane
+                            plane != null && plane.trackingState == TrackingState.TRACKING &&
+                                plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                plane.subsumedBy == null && plane.isPoseInPolygon(hit.hitPose)
+                        }
                     val candidate = floorHit?.let { hit ->
                         runCatching { hit.createAnchor() }
                             .onFailure { Log.w(TAG, "[$modeName] Could not create anchor from real floor hit", it) }
                             .getOrNull()
                     }
-                    val candidateState = candidate?.let { runCatching { it.trackingState }.getOrNull() }
                     when {
                         candidate == null -> Log.w(TAG, "[$modeName] No tracked horizontal plane hit inside its polygon")
-                        candidateState == TrackingState.STOPPED -> {
+                        runCatching { candidate.trackingState }.getOrNull() == TrackingState.STOPPED -> {
                             runCatching { candidate.detach() }
                             Log.w(TAG, "[$modeName] Placement rejected: new anchor is STOPPED")
                         }
+                        runCatching { candidate.trackingState }.getOrNull() == TrackingState.TRACKING &&
+                            cameraState == TrackingState.TRACKING -> {
+                            promotePlacementAnchor(candidate, onPlaced)
+                            onHapticFeedback()
+                        }
                         else -> {
-                            // ARCore can report a newly-created, valid plane anchor as PAUSED while
-                            // its pose update is pending. Keep this one real hit anchor and wait for
-                            // TRACKING instead of rejecting it or creating duplicates on later frames.
-                            val oldAnchor = activeAnchor
-                            activeAnchor = candidate
-                            anchorTrackingState = candidateState
-                            lastTrackedAnchorPose = floorHit.hitPose
-                            recoveryCandidate?.let { runCatching { it.detach() } }
-                            recoveryCandidate = null
-                            recoveryGate.reset()
-                            runCatching { oldAnchor?.detach() }
-                            if (candidateState == TrackingState.TRACKING && cameraState == TrackingState.TRACKING) {
-                                lastTrackedAnchorPose = runCatching { candidate.pose }.getOrNull() ?: floorHit.hitPose
-                                Log.i(TAG, "[$modeName] Placed on a tracking ARCore horizontal-plane hit")
-                                onHapticFeedback()
-                                onPlaced()
-                            } else {
-                                pendingPlacementConfirmation = true
-                                Log.i(TAG, "[$modeName] Valid floor-hit anchor is PAUSED; waiting for ARCore tracking")
-                            }
+                            // A hit pose is not a verified recovery pose. Hold this single anchor
+                            // separately and await a later frame where its own pose is tracked.
+                            runCatching { pendingPlacementAnchor?.detach() }
+                            pendingPlacementAnchor = candidate
+                            pendingPlacementConfirmation = true
+                            Log.i(TAG, "[$modeName] Real floor-hit anchor is PAUSED; retaining existing placement until tracked")
                         }
                     }
+                }
+            }
+        }
+
+        // Promote a delayed placement only after ARCore reports that both the candidate anchor
+        // and camera are TRACKING. Save its actual anchor pose, never HitResult.hitPose, as the
+        // recovery baseline. A stopped candidate is discarded; there is no guessed fallback.
+        pendingPlacementAnchor?.let { candidate ->
+            val candidateState = runCatching { candidate.trackingState }.getOrNull()
+            when {
+                candidateState == TrackingState.TRACKING && cameraState == TrackingState.TRACKING -> {
+                    promotePlacementAnchor(candidate, onPlaced)
+                    onHapticFeedback()
+                }
+                candidateState == TrackingState.STOPPED || candidateState == null -> {
+                    runCatching { candidate.detach() }
+                    pendingPlacementAnchor = null
+                    pendingPlacementConfirmation = false
+                    Log.w(TAG, "[$modeName] Delayed placement anchor stopped before tracking; discarded")
                 }
             }
         }
@@ -154,17 +169,17 @@ class ARTrackingManager(
             }
 
             if (state == TrackingState.TRACKING && cameraState == TrackingState.TRACKING) {
-                lastTrackedAnchorPose = runCatching { anchor.pose }
+                // Only this confirmed world-space anchor pose is eligible as a recovery target.
+                lastVerifiedWorldPose = runCatching { anchor.pose }
                     .onFailure { Log.w(TAG, "[$modeName] Could not read tracking anchor pose", it) }
-                    .getOrNull() ?: lastTrackedAnchorPose
+                    .getOrNull() ?: lastVerifiedWorldPose
                 recoveryGate.reset()
                 if (pendingPlacementConfirmation) {
                     pendingPlacementConfirmation = false
-                    onHapticFeedback()
                     onPlaced()
                 }
             } else if (state == TrackingState.STOPPED && cameraState == TrackingState.TRACKING) {
-                val originalPose = lastTrackedAnchorPose
+                val originalPose = lastVerifiedWorldPose
                 val candidate = recoveryCandidate
                 if (candidate != null) {
                     when (runCatching { candidate.trackingState }.getOrNull()) {
@@ -172,18 +187,18 @@ class ARTrackingManager(
                             val previousAnchor = activeAnchor
                             activeAnchor = candidate
                             anchorTrackingState = TrackingState.TRACKING
-                            lastTrackedAnchorPose = runCatching { candidate.pose }.getOrNull() ?: originalPose
+                            lastVerifiedWorldPose = runCatching { candidate.pose }.getOrNull() ?: originalPose
                             recoveryCandidate = null
                             recoveryGate.reset()
                             runCatching { previousAnchor?.detach() }
-                            Log.i(TAG, "[$modeName] Recovered anchor at its saved world pose")
+                            Log.i(TAG, "[$modeName] Recovered anchor at its verified world pose")
                         }
                         TrackingState.STOPPED, null -> {
                             runCatching { candidate.detach() }
                             recoveryCandidate = null
                             Log.w(TAG, "[$modeName] Recovery candidate stopped; bounded retry remains enabled")
                         }
-                        TrackingState.PAUSED -> Unit // Wait for ARCore's asynchronous pose update.
+                        TrackingState.PAUSED -> Unit // Hold the single candidate for ARCore's update.
                     }
                 } else if (originalPose != null) {
                     val targetPlane = runCatching {
@@ -196,9 +211,9 @@ class ARTrackingManager(
                         Log.w(TAG, "[$modeName] Could not inspect tracked planes for anchor recovery", it)
                     }.getOrNull()
 
-                    // Don't spend a retry while there is no plane containing the exact saved pose.
-                    // A matching plane arms one attempt; a PAUSED replacement is retained and
-                    // polled, so subsequent frames cannot create a chain of duplicate anchors.
+                    // Absence of the exact containing plane does not consume an attempt. A matching
+                    // plane may create one candidate; no further anchor is made until it tracks or
+                    // is discarded, preventing duplicate recovery anchors and world-space jumps.
                     if (targetPlane != null && recoveryGate.shouldAttempt()) {
                         recoveryCandidate = runCatching { targetPlane.createAnchor(originalPose) }
                             .onFailure { Log.w(TAG, "[$modeName] Anchor recovery creation failed", it) }
@@ -208,11 +223,10 @@ class ARTrackingManager(
                         }
                     }
                 } else {
-                    Log.w(TAG, "[$modeName] No saved tracked world pose; refusing arbitrary recovery")
+                    Log.w(TAG, "[$modeName] No verified world pose; refusing arbitrary recovery")
                 }
             }
-            // PAUSED anchors are retained and allowed to resume naturally. Recreating them while
-            // ARCore is temporarily updating tracking would risk duplicates and a world-space jump.
+            // PAUSED anchors resume naturally. Never replace them with guessed or unrelated poses.
         }
 
         val hasTrackedFloor = cameraState == TrackingState.TRACKING && runCatching {
@@ -223,18 +237,43 @@ class ARTrackingManager(
         }.getOrDefault(false)
         if (hasTrackedFloor != isPlaneDetected) {
             isPlaneDetected = hasTrackedFloor
-            Log.d(TAG, "[$modeName] Tracked upward-facing ARCore floor plane detected: $hasTrackedFloor")
+            Log.d(TAG, "[$modeName] Tracked upward-facing ARCore horizontal surface detected: $hasTrackedFloor")
         }
+    }
+
+    private fun promotePlacementAnchor(candidate: Anchor, onPlaced: () -> Unit) {
+        val verifiedPose = runCatching { candidate.pose }.getOrNull()
+        if (verifiedPose == null) {
+            runCatching { candidate.detach() }
+            pendingPlacementAnchor = null
+            pendingPlacementConfirmation = false
+            Log.w(TAG, "[$modeName] Tracking anchor pose unavailable; placement not committed")
+            return
+        }
+        val previousAnchor = activeAnchor
+        activeAnchor = candidate
+        anchorTrackingState = TrackingState.TRACKING
+        lastVerifiedWorldPose = verifiedPose
+        pendingPlacementAnchor = null
+        pendingPlacementConfirmation = false
+        runCatching { recoveryCandidate?.detach() }
+        recoveryCandidate = null
+        recoveryGate.reset()
+        runCatching { previousAnchor?.takeIf { it !== candidate }?.detach() }
+        Log.i(TAG, "[$modeName] Committed placement from a tracking ARCore anchor pose")
+        onPlaced()
     }
 
     fun clear() {
         Log.d(TAG, "[$modeName] Clearing anchor and tracking state")
         runCatching { activeAnchor?.detach() }
+        runCatching { pendingPlacementAnchor?.detach() }
         runCatching { recoveryCandidate?.detach() }
         activeAnchor = null
+        pendingPlacementAnchor = null
         recoveryCandidate = null
         anchorTrackingState = null
-        lastTrackedAnchorPose = null
+        lastVerifiedWorldPose = null
         pendingPlacementConfirmation = false
         pendingPlacementRef.set(null)
         recoveryGate.reset()
@@ -250,7 +289,7 @@ class ARTrackingManager(
         activeAnchor != null && anchorTrackingState == TrackingState.STOPPED ->
             "فُقد التتبع • امسح الأرضية ثم انقر لإعادة التثبيت" to Color(0xFFFF5252)
         activeAnchor != null -> "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
-        isPlaneDetected -> "تم رصد الأرضية • انقر لتثبيت النموذج" to NeonGreen
+        isPlaneDetected -> "تم رصد سطح أفقي متتبّع • انقر لتثبيت النموذج" to NeonGreen
         else -> "وجّه الكاميرا نحو الأرضية وحرّكها ببطء" to NeonCyan
     }
 }
