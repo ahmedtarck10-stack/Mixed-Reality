@@ -19,18 +19,23 @@ internal fun placementTapDecision(
     else -> PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME
 }
 
-/** Allows a single recovery attempt until the replacement anchor resumes tracking. */
-internal class AnchorRecoveryGate {
-    private var recoveryInProgress = false
+/** Retries failed anchor recovery with a bounded rate until tracking resumes. */
+internal class AnchorRecoveryGate(
+    private val retryIntervalNanos: Long = 750_000_000L,
+    private val clockNanos: () -> Long = System::nanoTime
+) {
+    private var lastAttemptNanos: Long? = null
 
     fun shouldAttempt(): Boolean {
-        if (recoveryInProgress) return false
-        recoveryInProgress = true
+        val now = clockNanos()
+        val previous = lastAttemptNanos
+        if (previous != null && now - previous < retryIntervalNanos) return false
+        lastAttemptNanos = now
         return true
     }
 
     fun reset() {
-        recoveryInProgress = false
+        lastAttemptNanos = null
     }
 }
 

@@ -13,6 +13,7 @@ import com.aistudio.mixedreality.ui.theme.NeonGreen
 import com.google.ar.core.Anchor
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
+import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import java.util.concurrent.atomic.AtomicReference
@@ -42,6 +43,10 @@ class ARTrackingManager(
     private val pendingPlacementRef = AtomicReference<PendingPlacementTap?>(null)
     private val recoveryGate = AnchorRecoveryGate()
     private var lastCameraTrackingState: TrackingState? = null
+
+    // Keep the last pose observed while both the camera and anchor were tracking. A STOPPED
+    // anchor's current pose is not a reliable recovery target after relocalization.
+    private var lastTrackedAnchorPose: Pose? = null
 
     fun onSingleTap(tapOffset: Offset, isModelVisible: Boolean) {
         if (!isModelVisible) {
@@ -112,6 +117,10 @@ class ARTrackingManager(
                             val oldAnchor = activeAnchor
                             activeAnchor = newAnchor
                             anchorTrackingState = newAnchor.trackingState
+                            lastTrackedAnchorPose = if (
+                                cameraState == TrackingState.TRACKING &&
+                                newAnchor.trackingState == TrackingState.TRACKING
+                            ) runCatching { newAnchor.pose }.getOrNull() else null
                             recoveryGate.reset()
                             runCatching { oldAnchor?.detach() }
                             Log.i(TAG, "[$modeName] Model anchored to a tracked upward-facing plane")
@@ -133,37 +142,45 @@ class ARTrackingManager(
                 Log.i(TAG, "[$modeName] Active anchor tracking state: $state")
             }
 
-            // Recover at most once while an anchor remains stopped. Recreate it only at its
-            // original world pose on a tracked plane containing that pose; never migrate it
-            // to an unrelated plane or create a recovery anchor on every frame.
-            if (state == TrackingState.STOPPED && cameraState == TrackingState.TRACKING &&
-                recoveryGate.shouldAttempt()
-            ) {
-                val originalPose = runCatching { anchor.pose }.getOrNull()
+            if (state == TrackingState.TRACKING && cameraState == TrackingState.TRACKING) {
+                // Refresh the recovery target only from a fully tracked frame.
+                lastTrackedAnchorPose = runCatching { anchor.pose }
+                    .onFailure { Log.w(TAG, "[$modeName] Could not read tracked anchor pose", it) }
+                    .getOrNull() ?: lastTrackedAnchorPose
+                recoveryGate.reset()
+            } else if (state == TrackingState.STOPPED && cameraState == TrackingState.TRACKING) {
+                // Reattach only at the saved world pose, and only after ARCore reports a genuine,
+                // currently tracked, non-subsumed horizontal-upward plane containing that pose.
+                // No plane means no attempt is consumed; a failed anchor creation is retried after
+                // a short backoff instead of permanently closing the recovery gate.
+                val originalPose = lastTrackedAnchorPose
                 val targetPlane = if (originalPose == null) null else runCatching {
                     session.getAllTrackables(Plane::class.java).firstOrNull { plane ->
                         plane.trackingState == TrackingState.TRACKING &&
                             plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
                             plane.subsumedBy == null && plane.isPoseInPolygon(originalPose)
                     }
+                }.onFailure {
+                    Log.w(TAG, "[$modeName] Could not inspect tracked planes for recovery", it)
                 }.getOrNull()
-                val recoveredAnchor = if (targetPlane != null && originalPose != null) {
-                    runCatching { targetPlane.createAnchor(originalPose) }
+
+                if (targetPlane != null && originalPose != null && recoveryGate.shouldAttempt()) {
+                    val recoveredAnchor = runCatching { targetPlane.createAnchor(originalPose) }
                         .onFailure { Log.w(TAG, "[$modeName] Stopped-anchor recovery failed", it) }
                         .getOrNull()
-                } else null
-
-                if (recoveredAnchor != null) {
-                    activeAnchor = recoveredAnchor
-                    anchorTrackingState = recoveredAnchor.trackingState
-                    runCatching { anchor.detach() }
-                    if (recoveredAnchor.trackingState == TrackingState.TRACKING) recoveryGate.reset()
-                    Log.i(TAG, "[$modeName] Recovered stopped anchor at its original pose")
-                } else {
-                    Log.w(TAG, "[$modeName] No tracked plane contains stopped anchor pose; tap to relocate")
+                    if (recoveredAnchor?.trackingState == TrackingState.TRACKING) {
+                        activeAnchor = recoveredAnchor
+                        anchorTrackingState = recoveredAnchor.trackingState
+                        lastTrackedAnchorPose = runCatching { recoveredAnchor.pose }.getOrNull() ?: originalPose
+                        runCatching { anchor.detach() }
+                        recoveryGate.reset()
+                        Log.i(TAG, "[$modeName] Recovered stopped anchor at its last tracked world pose")
+                    } else {
+                        // Do not discard the old anchor or adopt a non-tracking replacement.
+                        runCatching { recoveredAnchor?.detach() }
+                        Log.w(TAG, "[$modeName] Recovery anchor is not tracking; will retry safely")
+                    }
                 }
-            } else if (state == TrackingState.TRACKING) {
-                recoveryGate.reset()
             }
         }
 
@@ -184,6 +201,7 @@ class ARTrackingManager(
         runCatching { activeAnchor?.detach() }
         activeAnchor = null
         anchorTrackingState = null
+        lastTrackedAnchorPose = null
         pendingPlacementRef.set(null)
         recoveryGate.reset()
     }
