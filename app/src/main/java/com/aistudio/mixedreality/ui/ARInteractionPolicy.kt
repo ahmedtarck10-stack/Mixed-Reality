@@ -8,7 +8,7 @@ internal enum class PlacementTapDecision {
     DISCARD
 }
 
-/** A tap coordinate is valid only for a continuously tracked camera within its timeout. */
+/** A screen-space tap cannot be replayed after tracking loss or after the 2500ms window. */
 internal fun placementTapDecision(
     isModelVisible: Boolean,
     cameraIsTracking: Boolean,
@@ -19,11 +19,11 @@ internal fun placementTapDecision(
     else -> PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME
 }
 
-/** Allows one recovery attempt until an anchor has successfully returned to tracking. */
-internal class AnchorRecoveryGate<T : Any> {
+/** Allows a single recovery attempt until the replacement anchor resumes tracking. */
+internal class AnchorRecoveryGate {
     private var recoveryInProgress = false
 
-    fun shouldAttempt(anchor: T): Boolean {
+    fun shouldAttempt(): Boolean {
         if (recoveryInProgress) return false
         recoveryInProgress = true
         return true
@@ -34,7 +34,7 @@ internal class AnchorRecoveryGate<T : Any> {
     }
 }
 
-/** Coalesces rapid pinch events into a single bounded update per rendered frame. */
+/** Coalesces rapid pinch events into one bounded multiplier per rendered frame. */
 internal class ZoomGestureAccumulator {
     private var pendingFactor = 1.0
 
@@ -50,7 +50,7 @@ internal class ZoomGestureAccumulator {
     }
 }
 
-/** Shared safe zoom bounds/math so gesture and node scales cannot diverge. */
+/** Shared zoom scale policy used by AR, MR and Object renderers. */
 internal object ZoomScalePolicy {
     const val MIN_SCALE = 0.1f
     const val MAX_SCALE = 2500f
