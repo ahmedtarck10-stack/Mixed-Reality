@@ -179,15 +179,32 @@ class ARTrackingManager(
                     val candidateState = runCatching { candidate.trackingState }.getOrNull()
                     val candidatePose = verifiedAnchorPose(candidate, cameraState)
                     when {
-                        candidatePose != null -> {
-                            activeAnchor = candidate
-                            anchorTrackingState = TrackingState.TRACKING
-                            lastVerifiedWorldPose = candidatePose
-                            recoveryCandidate = null
-                            trackingLostSinceNanos = null
-                            recoveryGate.reset()
-                            runCatching { anchor.detach() }
-                            Log.i(TAG, "[$modeName] Recovered at the last verified world pose")
+                        isRecoveryCandidateAcceptable(cameraState, candidateState, originalPose, candidatePose) -> {
+                            val safeCandidatePose = candidatePose ?: return@let
+                            // Acceptance is based on the saved verified pose, not a fresh/stale
+                            // replacement pose. Preserve that exact baseline across recovery.
+                            if (isRecoveryTranslationContinuous(
+                                    originalPose?.tx() ?: Float.NaN,
+                                    originalPose?.ty() ?: Float.NaN,
+                                    originalPose?.tz() ?: Float.NaN,
+                                    safeCandidatePose.tx(),
+                                    safeCandidatePose.ty(),
+                                    safeCandidatePose.tz()
+                                )
+                            ) {
+                                activeAnchor = candidate
+                                anchorTrackingState = TrackingState.TRACKING
+                                lastVerifiedWorldPose = originalPose
+                                recoveryCandidate = null
+                                trackingLostSinceNanos = null
+                                recoveryGate.reset()
+                                runCatching { anchor.detach() }
+                                Log.i(TAG, "[$modeName] Recovered continuously at the verified world position")
+                            } else {
+                                runCatching { candidate.detach() }
+                                recoveryCandidate = null
+                                Log.w(TAG, "[$modeName] Recovery candidate would jump >5 cm; kept active anchor and saved pose")
+                            }
                         }
                         candidateState == TrackingState.STOPPED || candidateState == null -> {
                             runCatching { candidate.detach() }
