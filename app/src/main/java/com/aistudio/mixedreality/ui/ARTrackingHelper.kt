@@ -40,7 +40,7 @@ class ARTrackingManager(
         private set
 
     private val pendingPlacementRef = AtomicReference<PendingPlacementTap?>(null)
-    private val recoveryGate = AnchorRecoveryGate<Anchor>()
+    private val recoveryGate = AnchorRecoveryGate()
     private var lastCameraTrackingState: TrackingState? = null
 
     fun onSingleTap(tapOffset: Offset, isModelVisible: Boolean) {
@@ -85,7 +85,7 @@ class ARTrackingManager(
                     Log.d(TAG, "[$modeName] Discarded expired, hidden-model, or stale placement tap")
                 }
                 PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME -> {
-                    // Consume exactly once. A failed hit or a later tracking recovery must never
+                    // Consume exactly once. A failed hit or later tracking recovery must never
                     // replay screen coordinates captured against a different camera pose.
                     if (pendingPlacementRef.compareAndSet(pending, null)) {
                         val hitX = if (splitWidthPx > 0f && pending.offset.x > splitWidthPx) {
@@ -99,11 +99,9 @@ class ARTrackingManager(
                             .orEmpty()
                         val floorHit = hits.firstOrNull { hit ->
                             val plane = hit.trackable as? Plane
-                            plane != null &&
-                                plane.trackingState == TrackingState.TRACKING &&
+                            plane != null && plane.trackingState == TrackingState.TRACKING &&
                                 plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                                plane.subsumedBy == null &&
-                                plane.isPoseInPolygon(hit.hitPose)
+                                plane.subsumedBy == null && plane.isPoseInPolygon(hit.hitPose)
                         }
                         val newAnchor = floorHit?.let { hit ->
                             runCatching { hit.createAnchor() }
@@ -135,18 +133,18 @@ class ARTrackingManager(
                 Log.i(TAG, "[$modeName] Active anchor tracking state: $state")
             }
 
-            // Recover at most once until a replacement is confirmed TRACKING. Recreate only
-            // at the original world pose and only on a tracked plane containing that pose.
+            // Recover at most once while an anchor remains stopped. Recreate it only at its
+            // original world pose on a tracked plane containing that pose; never migrate it
+            // to an unrelated plane or create a recovery anchor on every frame.
             if (state == TrackingState.STOPPED && cameraState == TrackingState.TRACKING &&
-                recoveryGate.shouldAttempt(anchor)
+                recoveryGate.shouldAttempt()
             ) {
                 val originalPose = runCatching { anchor.pose }.getOrNull()
                 val targetPlane = if (originalPose == null) null else runCatching {
                     session.getAllTrackables(Plane::class.java).firstOrNull { plane ->
                         plane.trackingState == TrackingState.TRACKING &&
                             plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                            plane.subsumedBy == null &&
-                            plane.isPoseInPolygon(originalPose)
+                            plane.subsumedBy == null && plane.isPoseInPolygon(originalPose)
                     }
                 }.getOrNull()
                 val recoveredAnchor = if (targetPlane != null && originalPose != null) {
@@ -159,6 +157,7 @@ class ARTrackingManager(
                     activeAnchor = recoveredAnchor
                     anchorTrackingState = recoveredAnchor.trackingState
                     runCatching { anchor.detach() }
+                    if (recoveredAnchor.trackingState == TrackingState.TRACKING) recoveryGate.reset()
                     Log.i(TAG, "[$modeName] Recovered stopped anchor at its original pose")
                 } else {
                     Log.w(TAG, "[$modeName] No tracked plane contains stopped anchor pose; tap to relocate")
@@ -171,8 +170,7 @@ class ARTrackingManager(
         val hasTrackedFloor = runCatching {
             session.getAllTrackables(Plane::class.java).any { plane ->
                 plane.trackingState == TrackingState.TRACKING &&
-                    plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                    plane.subsumedBy == null
+                    plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING && plane.subsumedBy == null
             }
         }.getOrDefault(false)
         if (hasTrackedFloor != isPlaneDetected) {
@@ -194,17 +192,14 @@ class ARTrackingManager(
 
     fun getHudStatus(): Pair<String, Color> = when {
         activeAnchor != null && anchorTrackingState == TrackingState.TRACKING ->
-            "ال��موذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
+            "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
         activeAnchor != null && anchorTrackingState == TrackingState.PAUSED ->
             "التتبع متوقف مؤقتاً • حرّك الجهاز ببطء" to Color(0xFFFFB300)
         activeAnchor != null && anchorTrackingState == TrackingState.STOPPED ->
             "فُقد التتبع • امسح الأرضية ثم انقر لإعادة التثبيت" to Color(0xFFFF5252)
-        activeAnchor != null ->
-            "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
-        isPlaneDetected ->
-            "تم رصد الأرضية • انقر لتثبيت النموذج" to NeonGreen
-        else ->
-            "وجّه الكاميرا نحو الأرضية وحرّكها ببطء" to NeonCyan
+        activeAnchor != null -> "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
+        isPlaneDetected -> "تم رصد الأرضية • انقر لتثبيت النموذج" to NeonGreen
+        else -> "وجّه الكاميرا نحو الأرضية وحرّكها ببطء" to NeonCyan
     }
 }
 
