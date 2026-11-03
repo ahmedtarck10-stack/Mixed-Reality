@@ -1,9 +1,11 @@
 package com.aistudio.mixedreality.ui
 
+import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 
 /** Shared placement request lifetime used by runtime logic and tests. */
 internal const val PLACEMENT_TIMEOUT_MS = 2_500L
+internal const val MAX_RECOVERY_TRANSLATION_METERS = 0.05f
 
 internal enum class PlacementTapDecision {
     HIT_TEST_ON_CURRENT_FRAME,
@@ -37,6 +39,28 @@ internal fun shouldAttemptAnchorRecovery(
     (anchorState == TrackingState.PAUSED || anchorState == TrackingState.STOPPED) &&
     lostDurationNanos >= gracePeriodNanos
 
+/** Accept a replacement only when it tracks and remains within the saved world-position tolerance. */
+internal fun isRecoveryCandidateAcceptable(
+    cameraState: TrackingState?,
+    candidateState: TrackingState?,
+    savedPose: Pose?,
+    candidatePose: Pose?,
+    maxDistanceMeters: Float = MAX_RECOVERY_TRANSLATION_METERS
+): Boolean {
+    if (!isVerifiedTrackingPose(cameraState, candidateState) || savedPose == null || candidatePose == null) {
+        return false
+    }
+    return isRecoveryTranslationContinuous(
+        savedX = savedPose.tx(),
+        savedY = savedPose.ty(),
+        savedZ = savedPose.tz(),
+        candidateX = candidatePose.tx(),
+        candidateY = candidatePose.ty(),
+        candidateZ = candidatePose.tz(),
+        maxDistanceMeters = maxDistanceMeters
+    )
+}
+
 /** Reject recovery replacements whose world translation would jump away from the verified pose. */
 internal fun isRecoveryTranslationContinuous(
     savedX: Float,
@@ -45,7 +69,7 @@ internal fun isRecoveryTranslationContinuous(
     candidateX: Float,
     candidateY: Float,
     candidateZ: Float,
-    maxDistanceMeters: Float = 0.05f
+    maxDistanceMeters: Float = MAX_RECOVERY_TRANSLATION_METERS
 ): Boolean {
     if (!savedX.isFinite() || !savedY.isFinite() || !savedZ.isFinite() ||
         !candidateX.isFinite() || !candidateY.isFinite() || !candidateZ.isFinite() ||

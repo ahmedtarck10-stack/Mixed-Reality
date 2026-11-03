@@ -4,11 +4,13 @@ import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
+import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
 import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
 import com.google.ar.core.ArCoreApk
+import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -92,9 +94,43 @@ class SpatialMathAndGesturesTest {
     }
 
     @Test
-    fun recoveryCandidateMustStayNearSavedWorldPosition() {
-        assertTrue(isRecoveryTranslationContinuous(1f, 2f, 3f, 1.01f, 2f, 3f))
-        assertFalse(isRecoveryTranslationContinuous(1f, 2f, 3f, 1.1f, 2f, 3f))
+    fun recoveryCandidateAcceptanceRequiresTrackingAndPositionContinuity() {
+        val savedPose = Pose.makeTranslation(1f, 2f, 3f)
+        val nearCandidate = Pose.makeTranslation(1.01f, 2f, 3f)
+        val farCandidate = Pose.makeTranslation(1.10f, 2f, 3f)
+
+        assertTrue(
+            isRecoveryCandidateAcceptable(
+                TrackingState.TRACKING,
+                TrackingState.TRACKING,
+                savedPose,
+                nearCandidate
+            )
+        )
+        assertFalse(
+            "A candidate that jumps beyond 5 cm must be rejected before active-anchor replacement",
+            isRecoveryCandidateAcceptable(
+                TrackingState.TRACKING,
+                TrackingState.TRACKING,
+                savedPose,
+                farCandidate
+            )
+        )
+        assertFalse(
+            "An untracked recovery candidate is never acceptable",
+            isRecoveryCandidateAcceptable(
+                TrackingState.TRACKING,
+                TrackingState.PAUSED,
+                savedPose,
+                nearCandidate
+            )
+        )
+    }
+
+    @Test
+    fun recoveryTranslationRejectsInvalidCoordinatesAndEnforcesFiveCentimeterLimit() {
+        assertTrue(isRecoveryTranslationContinuous(0f, 0f, 0f, 0.05f, 0f, 0f))
+        assertFalse(isRecoveryTranslationContinuous(0f, 0f, 0f, 0.0501f, 0f, 0f))
         assertFalse(isRecoveryTranslationContinuous(Float.NaN, 0f, 0f, 0f, 0f, 0f))
     }
 
