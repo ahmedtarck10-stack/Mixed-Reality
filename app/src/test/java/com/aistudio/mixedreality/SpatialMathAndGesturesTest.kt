@@ -14,32 +14,25 @@ import kotlin.math.abs
 
 /** Unit tests for production interaction policies used by AR placement and zoom gestures. */
 class SpatialMathAndGesturesTest {
-
     @Test
-    fun testVerticalRotationClampingPreventsFlipping() {
-        val initialRotX = 0f
-        val touchSensitivity = 0.35f
-        val pitchDown = (initialRotX + 100f * touchSensitivity).coerceIn(-90f, 90f)
-        assertEquals(35f, pitchDown, 0.001f)
-        assertEquals(90f, (initialRotX + 1000f * touchSensitivity).coerceIn(-90f, 90f), 0.001f)
-        assertEquals(-90f, (initialRotX - 1000f * touchSensitivity).coerceIn(-90f, 90f), 0.001f)
+    fun verticalRotationClampingPreventsFlipping() {
+        val sensitivity = 0.35f
+        assertEquals(35f, (100f * sensitivity).coerceIn(-90f, 90f), 0.001f)
+        assertEquals(90f, (1000f * sensitivity).coerceIn(-90f, 90f), 0.001f)
+        assertEquals(-90f, (-1000f * sensitivity).coerceIn(-90f, 90f), 0.001f)
     }
 
     @Test
-    fun testHorizontalRotationWraps360Degrees() {
-        val touchSensitivity = 0.35f
-        val positive = ((350f + 50f * touchSensitivity) % 360f + 360f) % 360f
-        val negative = ((10f - 50f * touchSensitivity) % 360f + 360f) % 360f
-        assertEquals(7.5f, positive, 0.001f)
-        assertEquals(352.5f, negative, 0.001f)
+    fun horizontalRotationWraps360Degrees() {
+        val sensitivity = 0.35f
+        assertEquals(7.5f, ((350f + 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
+        assertEquals(352.5f, ((10f - 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
     }
 
     @Test
-    fun testSimultaneousDiagonalRotation() {
-        val rotY = ((40f * 0.35f) % 360f + 360f) % 360f
-        val rotX = (30f * 0.35f).coerceIn(-90f, 90f)
-        assertEquals(14f, rotY, 0.001f)
-        assertEquals(10.5f, rotX, 0.001f)
+    fun diagonalRotationAppliesBothAxes() {
+        assertEquals(14f, (40f * 0.35f) % 360f, 0.001f)
+        assertEquals(10.5f, (30f * 0.35f).coerceIn(-90f, 90f), 0.001f)
     }
 
     @Test
@@ -59,11 +52,9 @@ class SpatialMathAndGesturesTest {
         accumulator.add(1.1f)
         assertEquals(1.21f, accumulator.consume(), 0.001f)
         assertEquals(1f, accumulator.consume(), 0.001f)
-
         accumulator.add(2f)
         accumulator.add(2f)
         assertEquals(2f, accumulator.consume(), 0.001f)
-
         accumulator.add(Float.NaN)
         accumulator.add(Float.POSITIVE_INFINITY)
         accumulator.add(-1f)
@@ -71,7 +62,7 @@ class SpatialMathAndGesturesTest {
     }
 
     @Test
-    fun placementTapUsesActual2500MsTimeoutAndNeverReplaysAfterTrackingLoss() {
+    fun placementPolicyUses2500MsTimeoutAndDiscardsLostTrackingTaps() {
         assertEquals(PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME, placementTapDecision(true, true, 2499L))
         assertEquals(PlacementTapDecision.DISCARD, placementTapDecision(true, true, 2500L))
         assertEquals(PlacementTapDecision.DISCARD, placementTapDecision(false, true, 0L))
@@ -79,23 +70,18 @@ class SpatialMathAndGesturesTest {
     }
 
     @Test
-    fun anchorRecoveryGatePreventsRepeatedRecoveryUntilTrackingIsRestored() {
-        val gate = AnchorRecoveryGate<Any>()
-        val stoppedAnchor = Any()
-        val replacementAnchor = Any()
-
-        assertTrue(gate.shouldAttempt(stoppedAnchor))
-        assertFalse("Do not recreate anchors every frame", gate.shouldAttempt(stoppedAnchor))
-        assertFalse("Do not chain recoveries while replacement is not tracking", gate.shouldAttempt(replacementAnchor))
+    fun recoveryGateBlocksRepeatedAttemptsUntilReset() {
+        val gate = AnchorRecoveryGate()
+        assertTrue(gate.shouldAttempt())
+        assertFalse("Repeated frames must not create anchors repeatedly", gate.shouldAttempt())
+        assertFalse("A replacement anchor must not start a recovery chain", gate.shouldAttempt())
         gate.reset()
-        assertTrue("A new recovery cycle can begin after tracking returns", gate.shouldAttempt(replacementAnchor))
+        assertTrue("Tracking restoration allows a later recovery cycle", gate.shouldAttempt())
     }
 
     @Test
-    fun testARCoreAvailabilityClassification() {
-        fun isAvailable(availability: ArCoreApk.Availability?): Boolean =
-            availability == ArCoreApk.Availability.SUPPORTED_INSTALLED
-
+    fun arCoreAvailabilityClassification() {
+        fun isAvailable(value: ArCoreApk.Availability?) = value == ArCoreApk.Availability.SUPPORTED_INSTALLED
         assertTrue(isAvailable(ArCoreApk.Availability.SUPPORTED_INSTALLED))
         assertFalse(isAvailable(ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED))
         assertFalse(isAvailable(ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD))
@@ -107,7 +93,7 @@ class SpatialMathAndGesturesTest {
     }
 
     @Test
-    fun testZoomFactorDeadbandAndFiniteFilter() {
+    fun zoomDeadbandRejectsTinyChangesAndNonFiniteFactors() {
         assertTrue(abs(1.0005f - 1f) > 0.0001f)
         assertFalse(abs(1.00002f - 1f) > 0.0001f)
         assertFalse(Float.NaN.isFinite())
