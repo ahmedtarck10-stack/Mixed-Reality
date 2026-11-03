@@ -60,6 +60,10 @@ class ARTrackingManager(
             Log.d(TAG, "[$modeName] Tap ignored: model is not visible")
             return
         }
+        if (activeAnchor != null) {
+            Log.d(TAG, "[$modeName] Tap ignored: anchor already exists; model is already placed")
+            return
+        }
         val tap = PendingPlacementTap(offset = tapOffset)
         pendingPlacementRef.set(tap)
         Log.d(TAG, "[$modeName] Placement tap queued at ($tapOffset)")
@@ -85,9 +89,18 @@ class ARTrackingManager(
             lastCameraTrackingState = cameraState
         }
 
-        // 1. Bounded retry strategy for pending placement tap
+        val currentAnchor = activeAnchor
+
+        // Prevent repeated placement while a real anchor already exists. This is the main
+        // cause of "jumping / flickering / fake floor" behavior when the app keeps creating
+        // a new anchor for the same model from a new hit-test each frame.
         val pending = pendingPlacementRef.get()
-        if (pending != null && isModelVisible) {
+        if (pending != null && currentAnchor != null) {
+            pendingPlacementRef.set(null)
+        }
+
+        // 1. Bounded retry strategy for pending placement tap
+        if (pending != null && isModelVisible && currentAnchor == null) {
             val now = System.currentTimeMillis()
             val elapsedMs = now - pending.creationTime
             val maxWaitMs = 3500L
@@ -152,7 +165,6 @@ class ARTrackingManager(
         }
 
         // 2. Continuous anchor tracking state synchronization
-        val currentAnchor = activeAnchor
         if (currentAnchor != null) {
             val currentTrackState = currentAnchor.trackingState
             if (anchorTrackingState != currentTrackState) {
@@ -160,9 +172,9 @@ class ARTrackingManager(
                 anchorTrackingState = currentTrackState
             }
 
-            // 3. Safe, non-abandoning anchor recovery strategy
-            // Does NOT abandon tracking after 3 attempts; uses progressive backoff (1.5s -> 2.0s -> 3.0s -> 4.0s)
-            // Does NOT thrash every frame.
+            // 3. Safe, non-abandoning anchor recovery strategy.
+            // Keep the same anchor alive during brief PAUSED/STOPPED periods instead of creating
+            // a new anchor every time the pose jitter changes.
             if (currentTrackState == TrackingState.STOPPED && cameraState == TrackingState.TRACKING) {
                 val cooldownMs = when (recoveryAttemptsCount) {
                     0 -> 1500L
