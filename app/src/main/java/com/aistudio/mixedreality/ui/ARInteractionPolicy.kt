@@ -27,6 +27,16 @@ internal fun isVerifiedTrackingPose(
     anchorState: TrackingState?
 ): Boolean = cameraState == TrackingState.TRACKING && anchorState == TrackingState.TRACKING
 
+/** Whether a paused/stopped anchor has waited long enough for recovery to be considered. */
+internal fun shouldAttemptAnchorRecovery(
+    cameraState: TrackingState?,
+    anchorState: TrackingState?,
+    lostDurationNanos: Long,
+    gracePeriodNanos: Long = 1_000_000_000L
+): Boolean = cameraState == TrackingState.TRACKING &&
+    (anchorState == TrackingState.PAUSED || anchorState == TrackingState.STOPPED) &&
+    lostDurationNanos >= gracePeriodNanos
+
 /** Retries failed anchor recovery with a bounded rate until tracking resumes. */
 internal class AnchorRecoveryGate(
     private val retryIntervalNanos: Long = 750_000_000L,
