@@ -59,7 +59,8 @@ internal object ZoomScalePolicy {
         if (scale.isFinite() && scale > 0f) scale.coerceIn(MIN_SCALE, MAX_SCALE) else 1f
 
     fun apply(currentScale: Float, factor: Float): Float {
-        val current = normalize(currentScale)
+        if (!currentScale.isFinite() || currentScale <= 0f) return 1f
+        val current = currentScale.coerceIn(MIN_SCALE, MAX_SCALE)
         if (!factor.isFinite() || factor <= 0f) return current
         return (current.toDouble() * factor.toDouble())
             .coerceIn(MIN_SCALE.toDouble(), MAX_SCALE.toDouble())
