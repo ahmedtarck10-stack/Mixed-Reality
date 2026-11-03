@@ -39,6 +39,16 @@ internal fun shouldAttemptAnchorRecovery(
     (anchorState == TrackingState.PAUSED || anchorState == TrackingState.STOPPED) &&
     lostDurationNanos >= gracePeriodNanos
 
+/** All physical-plane constraints needed before a plane may be used for floor recovery. */
+internal fun isEligibleRecoveryPlane(
+    cameraIsTracking: Boolean,
+    planeIsTracking: Boolean,
+    isUpwardHorizontalPlane: Boolean,
+    isSubsumed: Boolean,
+    savedPoseInsidePolygon: Boolean
+): Boolean = cameraIsTracking && planeIsTracking && isUpwardHorizontalPlane &&
+    !isSubsumed && savedPoseInsidePolygon
+
 /** Accept a replacement only when it tracks and remains within the saved world-position tolerance. */
 internal fun isRecoveryCandidateAcceptable(
     cameraState: TrackingState?,
