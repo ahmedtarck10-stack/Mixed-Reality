@@ -123,8 +123,10 @@ class ARTrackingManager(
                             runCatching { candidate.detach() }
                             Log.w(TAG, "[$modeName] Placement rejected: new anchor is STOPPED")
                         }
-                        runCatching { candidate.trackingState }.getOrNull() == TrackingState.TRACKING &&
-                            cameraState == TrackingState.TRACKING -> {
+                        isVerifiedTrackingPose(
+                            cameraState,
+                            runCatching { candidate.trackingState }.getOrNull()
+                        ) -> {
                             promotePlacementAnchor(candidate, onPlaced)
                             onHapticFeedback()
                         }
@@ -147,7 +149,7 @@ class ARTrackingManager(
         pendingPlacementAnchor?.let { candidate ->
             val candidateState = runCatching { candidate.trackingState }.getOrNull()
             when {
-                candidateState == TrackingState.TRACKING && cameraState == TrackingState.TRACKING -> {
+                isVerifiedTrackingPose(cameraState, candidateState) -> {
                     promotePlacementAnchor(candidate, onPlaced)
                     onHapticFeedback()
                 }
@@ -168,7 +170,7 @@ class ARTrackingManager(
                 Log.i(TAG, "[$modeName] Active anchor tracking state: $state")
             }
 
-            if (state == TrackingState.TRACKING && cameraState == TrackingState.TRACKING) {
+            if (isVerifiedTrackingPose(cameraState, state)) {
                 // Only this confirmed world-space anchor pose is eligible as a recovery target.
                 lastVerifiedWorldPose = runCatching { anchor.pose }
                     .onFailure { Log.w(TAG, "[$modeName] Could not read tracking anchor pose", it) }

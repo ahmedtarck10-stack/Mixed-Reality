@@ -4,8 +4,10 @@ import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
+import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.google.ar.core.ArCoreApk
+import com.google.ar.core.TrackingState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -70,13 +72,26 @@ class SpatialMathAndGesturesTest {
     }
 
     @Test
-    fun recoveryGateBlocksRepeatedAttemptsUntilReset() {
-        val gate = AnchorRecoveryGate()
+    fun verifiedWorldPoseRequiresBothCameraAndAnchorTracking() {
+        assertTrue(isVerifiedTrackingPose(TrackingState.TRACKING, TrackingState.TRACKING))
+        assertFalse(isVerifiedTrackingPose(TrackingState.PAUSED, TrackingState.TRACKING))
+        assertFalse(isVerifiedTrackingPose(TrackingState.TRACKING, TrackingState.PAUSED))
+        assertFalse(isVerifiedTrackingPose(TrackingState.TRACKING, TrackingState.STOPPED))
+        assertFalse(isVerifiedTrackingPose(null, TrackingState.TRACKING))
+    }
+
+    @Test
+    fun recoveryGateBlocksRepeatedAttemptsUntilRetryIntervalOrReset() {
+        var now = 0L
+        val gate = AnchorRecoveryGate(retryIntervalNanos = 750L, clockNanos = { now })
         assertTrue(gate.shouldAttempt())
         assertFalse("Repeated frames must not create anchors repeatedly", gate.shouldAttempt())
-        assertFalse("A replacement anchor must not start a recovery chain", gate.shouldAttempt())
+        now = 749L
+        assertFalse("Retry remains rate-limited", gate.shouldAttempt())
+        now = 750L
+        assertTrue("A failed recovery may retry after bounded backoff", gate.shouldAttempt())
         gate.reset()
-        assertTrue("Tracking restoration allows a later recovery cycle", gate.shouldAttempt())
+        assertTrue("Tracking restoration resets recovery backoff", gate.shouldAttempt())
     }
 
     @Test

@@ -1,5 +1,7 @@
 package com.aistudio.mixedreality.ui
 
+import com.google.ar.core.TrackingState
+
 /** Shared placement request lifetime used by runtime logic and tests. */
 internal const val PLACEMENT_TIMEOUT_MS = 2_500L
 
@@ -18,6 +20,12 @@ internal fun placementTapDecision(
     !cameraIsTracking -> PlacementTapDecision.DISCARD
     else -> PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME
 }
+
+/** A world pose is suitable for the recovery baseline only while both ARCore objects track. */
+internal fun isVerifiedTrackingPose(
+    cameraState: TrackingState?,
+    anchorState: TrackingState?
+): Boolean = cameraState == TrackingState.TRACKING && anchorState == TrackingState.TRACKING
 
 /** Retries failed anchor recovery with a bounded rate until tracking resumes. */
 internal class AnchorRecoveryGate(
