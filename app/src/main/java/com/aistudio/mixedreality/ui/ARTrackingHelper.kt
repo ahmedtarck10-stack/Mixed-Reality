@@ -45,11 +45,13 @@ class ARTrackingManager(
     private val recoveryGate = AnchorRecoveryGate()
     private var lastCameraTrackingState: TrackingState? = null
     private var lastPlaneScanNanos = 0L
+    private var lastRecoveryPlaneScanNanos = 0L
     private var cachedHasTrackedHorizontalSurface = false
 
     // Only an anchor pose read while both anchor and camera track can become this baseline.
     private var lastVerifiedWorldPose: Pose? = null
     private var pendingPlacementAnchor: Anchor? = null
+    private var pendingPlacementPlane: Plane? = null
     private var recoveryCandidate: Anchor? = null
     private var recoveryPlane: Plane? = null
     private var trackingLostSinceNanos: Long? = null
@@ -125,15 +127,15 @@ class ARTrackingManager(
                         }
                         else -> {
                             val pose = verifiedAnchorPose(candidate, cameraState)
-                            if (pose != null) {
+                            val plane = floorHit?.trackable as? Plane
+                            if (pose != null && plane != null && isEligiblePhysicalFloorPlane(plane, cameraState == TrackingState.TRACKING, pose)) {
                                 promotePlacementAnchor(candidate, pose, onPlaced)
                                 onHapticFeedback()
                             } else {
-                                // Retain one genuine hit anchor while ARCore's asynchronous pose
-                                // update is PAUSED. Keep the existing active placement untouched.
                                 runCatching { pendingPlacementAnchor?.detach() }
                                 pendingPlacementAnchor = candidate
-                                Log.i(TAG, "[$modeName] Physical floor-hit anchor is PAUSED; awaiting tracking")
+                                pendingPlacementPlane = plane
+                                Log.i(TAG, "[$modeName] Physical floor-hit anchor is awaiting valid tracking")
                             }
                         }
                     }
@@ -143,15 +145,22 @@ class ARTrackingManager(
 
         pendingPlacementAnchor?.let { candidate ->
             val pose = verifiedAnchorPose(candidate, cameraState)
+            val plane = pendingPlacementPlane
             when {
-                pose != null -> {
+                pose != null && plane != null && isEligiblePhysicalFloorPlane(
+                    plane = plane,
+                    cameraIsTracking = cameraState == TrackingState.TRACKING,
+                    hitPose = pose
+                ) -> {
                     promotePlacementAnchor(candidate, pose, onPlaced)
                     onHapticFeedback()
                 }
-                runCatching { candidate.trackingState }.getOrNull() == TrackingState.STOPPED -> {
+                runCatching { candidate.trackingState }.getOrNull() == TrackingState.STOPPED ||
+                    plane == null || (pose != null && !isEligiblePhysicalFloorPlane(plane, cameraState == TrackingState.TRACKING, pose)) -> {
                     runCatching { candidate.detach() }
                     pendingPlacementAnchor = null
-                    Log.w(TAG, "[$modeName] Delayed physical-plane placement anchor stopped before tracking; discarded")
+                    pendingPlacementPlane = null
+                    Log.w(TAG, "[$modeName] Pending placement rejected: its physical floor plane is no longer valid")
                 }
             }
         }
@@ -184,15 +193,11 @@ class ARTrackingManager(
                 if (candidate != null) {
                     val candidateState = runCatching { candidate.trackingState }.getOrNull()
                     val candidatePose = verifiedAnchorPose(candidate, cameraState)
-                    val physicalPlaneStillValid = recoveryPlane?.let { plane ->
-                        isEligiblePhysicalFloorPlane(
-                            plane = plane,
-                            cameraIsTracking = cameraState == TrackingState.TRACKING,
-                            hitPose = candidatePose
-                        )
-                    } == true
+                    val plane = recoveryPlane
+                    val planeStillValid = plane != null && candidatePose != null &&
+                        isEligiblePhysicalFloorPlane(plane, cameraState == TrackingState.TRACKING, candidatePose)
                     when {
-                        physicalPlaneStillValid && isRecoveryCandidateAcceptable(
+                        planeStillValid && isRecoveryCandidateAcceptable(
                             cameraState, candidateState, originalPose, candidatePose
                         ) -> {
                             val safeCandidatePose = candidatePose ?: return
@@ -218,36 +223,38 @@ class ARTrackingManager(
                                 rejectRecoveryCandidate(candidate, "would jump >5 cm")
                             }
                         }
-                        candidateState == TrackingState.STOPPED || candidateState == null || !physicalPlaneStillValid -> {
+                        candidateState == TrackingState.STOPPED || candidateState == null || !planeStillValid ->
                             rejectRecoveryCandidate(candidate, "physical plane stopped or no longer contains the saved pose")
-                        }
                         // A PAUSED candidate on its still-tracked physical plane is kept and polled.
                     }
                 } else if (originalPose != null) {
-                    val targetPlane = runCatching {
-                        session.getAllTrackables(Plane::class.java).firstOrNull { plane ->
-                            isEligiblePhysicalFloorPlane(
-                                plane = plane,
-                                cameraIsTracking = cameraState == TrackingState.TRACKING,
-                                hitPose = originalPose
-                            )
-                        }
-                    }.onFailure {
-                        Log.w(TAG, "[$modeName] Could not inspect tracked physical planes for recovery", it)
-                    }.getOrNull()
-
-                    // Never create a replacement from a free-space estimate: the saved verified
-                    // pose must lie inside a currently tracked, unsubsumed horizontal ARCore plane.
-                    if (targetPlane != null && recoveryGate.shouldAttempt()) {
-                        recoveryPlane = targetPlane
-                        recoveryCandidate = runCatching { targetPlane.createAnchor(originalPose) }
+                    val now = System.nanoTime()
+                    val plane = if (now - lastRecoveryPlaneScanNanos >= PLANE_SCAN_INTERVAL_NANOS) {
+                        lastRecoveryPlaneScanNanos = now
+                        runCatching {
+                            session.getAllTrackables(Plane::class.java).firstOrNull { trackedPlane ->
+                                isEligiblePhysicalFloorPlane(
+                                    plane = trackedPlane,
+                                    cameraIsTracking = cameraState == TrackingState.TRACKING,
+                                    hitPose = originalPose
+                                )
+                            }
+                        }.onFailure {
+                            Log.w(TAG, "[$modeName] Could not inspect tracked physical planes for recovery", it)
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
+                    if (plane != null && recoveryGate.shouldAttempt()) {
+                        recoveryPlane = plane
+                        recoveryCandidate = runCatching { plane.createAnchor(originalPose) }
                             .onFailure { Log.w(TAG, "[$modeName] Physical-plane recovery anchor creation failed", it) }
                             .getOrNull()
                         if (recoveryCandidate == null) {
                             recoveryPlane = null
                             Log.w(TAG, "[$modeName] Recovery failed; retry is rate-limited")
                         }
-                    } else if (targetPlane == null) {
+                    } else if (plane == null) {
                         Log.w(TAG, "[$modeName] Recovery rejected: saved pose is not inside a tracked physical floor plane")
                     }
                 } else {
@@ -258,20 +265,14 @@ class ARTrackingManager(
             }
         }
 
-        val hasTrackedHorizontalSurface = shouldRefreshPlaneDetection(cameraState, System.nanoTime())
-            .let { shouldRefresh ->
-                if (shouldRefresh) {
-                    detectTrackedHorizontalSurface(session, cameraState).also {
-                        cachedHasTrackedHorizontalSurface = it
-                        lastPlaneScanNanos = System.nanoTime()
-                    }
-                } else {
-                    cachedHasTrackedHorizontalSurface
-                }
-            }
-        if (hasTrackedHorizontalSurface != isPlaneDetected) {
-            isPlaneDetected = hasTrackedHorizontalSurface
-            Log.d(TAG, "[$modeName] Tracked physical horizontal plane detected: $hasTrackedHorizontalSurface")
+        val now = System.nanoTime()
+        if (shouldRefreshPlaneDetection(cameraState, now)) {
+            cachedHasTrackedHorizontalSurface = detectTrackedHorizontalSurface(session, cameraState)
+            lastPlaneScanNanos = now
+        }
+        if (cachedHasTrackedHorizontalSurface != isPlaneDetected) {
+            isPlaneDetected = cachedHasTrackedHorizontalSurface
+            Log.d(TAG, "[$modeName] Tracked physical horizontal plane detected: $cachedHasTrackedHorizontalSurface")
         }
     }
 
@@ -292,24 +293,14 @@ class ARTrackingManager(
         plane.subsumedBy == null &&
         hitPose != null && runCatching { plane.isPoseInPolygon(hitPose) }.getOrDefault(false)
 
-    private fun shouldRefreshPlaneDetection(cameraState: TrackingState?, nowNanos: Long): Boolean {
-        if (cameraState != TrackingState.TRACKING) return true
-        return when {
-            activeAnchor == null -> true
-            anchorTrackingState != TrackingState.TRACKING -> true
-            else -> nowNanos - lastPlaneScanNanos >= PLANE_SCAN_INTERVAL_NANOS
-        }
-    }
+    private fun shouldRefreshPlaneDetection(cameraState: TrackingState?, nowNanos: Long): Boolean =
+        cameraState != TrackingState.TRACKING || nowNanos - lastPlaneScanNanos >= PLANE_SCAN_INTERVAL_NANOS
 
     private fun detectTrackedHorizontalSurface(session: Session, cameraState: TrackingState?): Boolean {
         if (cameraState != TrackingState.TRACKING) return false
         return runCatching {
             session.getAllTrackables(Plane::class.java).any { plane ->
-                isEligiblePhysicalFloorPlane(
-                    plane = plane,
-                    cameraIsTracking = true,
-                    hitPose = plane.centerPose
-                )
+                isEligiblePhysicalFloorPlane(plane, true, plane.centerPose)
             }
         }.getOrDefault(false)
     }
@@ -340,6 +331,7 @@ class ARTrackingManager(
         anchorTrackingState = TrackingState.TRACKING
         lastVerifiedWorldPose = verifiedPose
         pendingPlacementAnchor = null
+        pendingPlacementPlane = null
         runCatching { recoveryCandidate?.detach() }
         recoveryCandidate = null
         recoveryPlane = null
@@ -357,6 +349,7 @@ class ARTrackingManager(
         runCatching { recoveryCandidate?.detach() }
         activeAnchor = null
         pendingPlacementAnchor = null
+        pendingPlacementPlane = null
         recoveryCandidate = null
         recoveryPlane = null
         anchorTrackingState = null
@@ -365,6 +358,7 @@ class ARTrackingManager(
         pendingPlacementRef.set(null)
         recoveryGate.reset()
         lastPlaneScanNanos = 0L
+        lastRecoveryPlaneScanNanos = 0L
         cachedHasTrackedHorizontalSurface = false
         isPlaneDetected = false
     }
