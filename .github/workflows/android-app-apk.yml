@@ -1,27 +1,29 @@
-name: Android app APK
+name: Android CI - Full APK Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
+    tags:
+      - 'v*'
   pull_request:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: android-app-apk-${{ github.event.pull_request.number || github.ref }}
+  group: android-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-test-lint:
-    name: Build, test, and lint :app
+  build-and-package:
+    name: Build Full Android APKs
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 21
@@ -33,31 +35,73 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Generate debug keystore
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Setup Keystore
         run: |
-          keytool -genkeypair -v \
-            -keystore debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -dname "CN=Android Debug,O=Android,C=US" \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Decoding signing keystore from secret..."
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > debug.keystore
+          elif [ ! -f debug.keystore ]; then
+            echo "Generating build keystore..."
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000
+          fi
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
-
-      - name: Run app unit tests
+      - name: Run Unit Tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace
 
-      - name: Run app lint
+      - name: Run Lint
         run: ./gradlew :app:lintDebug --stacktrace
 
-      - name: Upload debug APK
+      - name: Build Debug & Release APKs
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace
+
+      - name: Organize APK Artifacts
+        run: |
+          mkdir -p build-apks
+          cp app/build/outputs/apk/debug/*.apk build-apks/
+          cp app/build/outputs/apk/release/*.apk build-apks/
+          echo "Built APK files:"
+          ls -lh build-apks/
+
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: android-app-debug-apk
+          name: mixed-reality-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixed-reality-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Full APK Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixed-reality-all-apks
+          path: build-apks/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APKs to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-apks/*.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: true

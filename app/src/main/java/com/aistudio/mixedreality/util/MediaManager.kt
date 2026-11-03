@@ -82,30 +82,37 @@ object MediaManager {
         val width = decorView.width.coerceAtLeast(1)
         val height = decorView.height.coerceAtLeast(1)
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val location = IntArray(2)
         decorView.getLocationInWindow(location)
 
-        try {
-            PixelCopy.request(
-                window,
-                Rect(location[0], location[1], location[0] + width, location[1] + height),
-                bitmap,
-                { copyResult ->
-                    if (copyResult == PixelCopy.SUCCESS) {
-                        onCaptured(bitmap)
-                    } else {
-                        // Fallback to Canvas draw
-                        val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                        val canvas = Canvas(fallback)
-                        decorView.draw(canvas)
-                        onCaptured(fallback)
-                    }
-                },
-                Handler(Looper.getMainLooper())
-            )
-        } catch (e: Throwable) {
-            Log.w(TAG, "PixelCopy failed, using canvas fallback: ${e.message}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            try {
+                PixelCopy.request(
+                    window,
+                    Rect(location[0], location[1], location[0] + width, location[1] + height),
+                    bitmap,
+                    { copyResult ->
+                        if (copyResult == PixelCopy.SUCCESS) {
+                            onCaptured(bitmap)
+                        } else {
+                            // Fallback to Canvas draw
+                            val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                            val canvas = Canvas(fallback)
+                            decorView.draw(canvas)
+                            onCaptured(fallback)
+                        }
+                    },
+                    Handler(Looper.getMainLooper())
+                )
+            } catch (e: Throwable) {
+                Log.w(TAG, "PixelCopy failed, using canvas fallback: ${e.message}")
+                val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(fallback)
+                decorView.draw(canvas)
+                onCaptured(fallback)
+            }
+        } else {
             val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(fallback)
             decorView.draw(canvas)
