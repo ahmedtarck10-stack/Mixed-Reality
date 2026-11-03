@@ -6,6 +6,7 @@ import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
+import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.TrackingState
 import org.junit.Assert.assertEquals
@@ -78,6 +79,15 @@ class SpatialMathAndGesturesTest {
         assertFalse(isVerifiedTrackingPose(TrackingState.TRACKING, TrackingState.PAUSED))
         assertFalse(isVerifiedTrackingPose(TrackingState.TRACKING, TrackingState.STOPPED))
         assertFalse(isVerifiedTrackingPose(null, TrackingState.TRACKING))
+    }
+
+    @Test
+    fun recoveryGraceRequiresCameraTrackingAndLostAnchorState() {
+        assertFalse(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.PAUSED, 999L))
+        assertTrue(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.PAUSED, 1_000L, 1_000L))
+        assertTrue(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.STOPPED, 1_000L, 1_000L))
+        assertFalse(shouldAttemptAnchorRecovery(TrackingState.PAUSED, TrackingState.STOPPED, 10_000L, 1_000L))
+        assertFalse(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.TRACKING, 10_000L, 1_000L))
     }
 
     @Test
