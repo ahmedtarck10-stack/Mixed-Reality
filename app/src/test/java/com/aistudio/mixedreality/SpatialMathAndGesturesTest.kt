@@ -4,6 +4,7 @@ import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
+import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
@@ -88,6 +89,13 @@ class SpatialMathAndGesturesTest {
         assertTrue(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.STOPPED, 1_000L, 1_000L))
         assertFalse(shouldAttemptAnchorRecovery(TrackingState.PAUSED, TrackingState.STOPPED, 10_000L, 1_000L))
         assertFalse(shouldAttemptAnchorRecovery(TrackingState.TRACKING, TrackingState.TRACKING, 10_000L, 1_000L))
+    }
+
+    @Test
+    fun recoveryCandidateMustStayNearSavedWorldPosition() {
+        assertTrue(isRecoveryTranslationContinuous(1f, 2f, 3f, 1.01f, 2f, 3f))
+        assertFalse(isRecoveryTranslationContinuous(1f, 2f, 3f, 1.1f, 2f, 3f))
+        assertFalse(isRecoveryTranslationContinuous(Float.NaN, 0f, 0f, 0f, 0f, 0f))
     }
 
     @Test

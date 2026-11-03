@@ -37,6 +37,27 @@ internal fun shouldAttemptAnchorRecovery(
     (anchorState == TrackingState.PAUSED || anchorState == TrackingState.STOPPED) &&
     lostDurationNanos >= gracePeriodNanos
 
+/** Reject recovery replacements whose world translation would jump away from the verified pose. */
+internal fun isRecoveryTranslationContinuous(
+    savedX: Float,
+    savedY: Float,
+    savedZ: Float,
+    candidateX: Float,
+    candidateY: Float,
+    candidateZ: Float,
+    maxDistanceMeters: Float = 0.05f
+): Boolean {
+    if (!savedX.isFinite() || !savedY.isFinite() || !savedZ.isFinite() ||
+        !candidateX.isFinite() || !candidateY.isFinite() || !candidateZ.isFinite() ||
+        !maxDistanceMeters.isFinite() || maxDistanceMeters < 0f
+    ) return false
+
+    val dx = candidateX - savedX
+    val dy = candidateY - savedY
+    val dz = candidateZ - savedZ
+    return dx * dx + dy * dy + dz * dz <= maxDistanceMeters * maxDistanceMeters
+}
+
 /** Retries failed anchor recovery with a bounded rate until tracking resumes. */
 internal class AnchorRecoveryGate(
     private val retryIntervalNanos: Long = 750_000_000L,
