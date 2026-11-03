@@ -78,8 +78,9 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
-    implementation("io.github.sceneview:sceneview:4.62.0")
-    implementation("io.github.sceneview:arsceneview:4.62.0")
+    // ARSceneView includes the matching SceneView runtime transitively. Use the complete
+    // published artifact instead of manually importing a partial library source tree.
+    implementation("io.github.sceneview:arsceneview:4.63.0")
     implementation(libs.arcore)
 
     testImplementation("junit:junit:4.13.2")
