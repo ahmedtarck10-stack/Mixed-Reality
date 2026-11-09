@@ -179,8 +179,8 @@ class ARTrackingManager(
                     val candidateState = runCatching { candidate.trackingState }.getOrNull()
                     val candidatePose = verifiedAnchorPose(candidate, cameraState)
                     when {
-                        isRecoveryCandidateAcceptable(cameraState, candidateState, originalPose, candidatePose) -> {
-                            val safeCandidatePose = candidatePose ?: return@let
+                        isRecoveryCandidateAcceptable(cameraState, candidateState, originalPose, candidatePose) && candidatePose != null -> {
+                            val safeCandidatePose = candidatePose
                             // Acceptance is based on the saved verified pose, not a fresh/stale
                             // replacement pose. Preserve that exact baseline across recovery.
                             if (isRecoveryTranslationContinuous(
