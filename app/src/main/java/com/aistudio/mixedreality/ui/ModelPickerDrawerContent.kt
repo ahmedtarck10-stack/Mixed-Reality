@@ -115,12 +115,12 @@ fun ModelPickerDrawerContent(
                 Spacer(modifier = Modifier.width(14.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (customModelFile != null) "ملف مخصص: ${customModelFile.name}" else "اختيار نموذج من الملفات (Open Files)",
+                        text = if (customModelFile != null) "Custom Model: ${customModelFile.name}" else "Select 3D Model from Files (Open)",
                         style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
                         color = if (customModelFile != null) NeonCyan else TextPrimary
                     )
                     Text(
-                        text = "يدعم ملفات 3D بصيغة (.glb / .gltf)",
+                        text = "Supports 3D formats (.glb / .gltf)",
                         style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                         color = TextSecondary
                     )

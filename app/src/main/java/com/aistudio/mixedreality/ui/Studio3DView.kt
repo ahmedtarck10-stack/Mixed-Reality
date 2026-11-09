@@ -249,7 +249,7 @@ fun Studio3DView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (isMoveMode) "🖐️ وضع التحريك: استخدم إصبعين للتحريك" else "🔍 وضع التكبير والتصغير (0.1x – 2500x)",
+                        text = if (isMoveMode) "🖐️ Move Mode: Drag with two fingers" else "🔍 Zoom Mode (0.1x – 2500x)",
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
@@ -275,7 +275,7 @@ fun Studio3DView(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        text = "جاري تحميل النموذج وقراءة الخامات...",
+                        text = "Loading 3D model and textures...",
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
@@ -296,13 +296,13 @@ fun Studio3DView(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "المشهد فارغ",
+                    text = "Scene is Empty",
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                     color = Color.White
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "تم مسح النموذج • اضغط Open لاختيار ملف 3D أو نموذج جديد",
+                    text = "Model cleared • Tap Open to load a 3D model",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                     textAlign = TextAlign.Center

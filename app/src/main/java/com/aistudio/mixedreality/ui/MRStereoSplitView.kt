@@ -516,7 +516,7 @@ private fun MRStereoARCoreView(
                     Text(text = "✋", fontSize = 13.sp)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "وضع التحريك مفعّل • انقر نقراً مزدوجاً للعودة للتدوير",
+                        text = "Move mode active • Double-tap to return to rotate",
                         color = Color.Black,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold

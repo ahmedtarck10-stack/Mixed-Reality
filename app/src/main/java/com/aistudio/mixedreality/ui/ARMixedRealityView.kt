@@ -369,7 +369,7 @@ fun ARMixedRealityView(
                     Text(text = "✋", fontSize = 13.sp)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "وضع التحريك مفعّل • انقر نقراً مزدوجاً للعودة للتدوير",
+                        text = "Move mode active • Double-tap to return to rotate",
                         color = Color.Black,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
@@ -448,7 +448,7 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "مطلوب إذن الكاميرا",
+                    text = "Camera Permission Required",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -456,7 +456,7 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "يحتاج وضع الواقع المعزز (AR) إلى إذن استخدام الكاميرا لرصد الأرضية والسطح الحقيقي وعرض النموذج ثلاثي الأبعاد.",
+                    text = "Mixed Reality AR mode requires camera access to detect physical surfaces and render 3D models in real-time.",
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.7f),
                     textAlign = TextAlign.Center,
@@ -472,7 +472,7 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("grant_camera_button")
                 ) {
-                    Text("منح الإذن الآن", fontWeight = FontWeight.Bold)
+                    Text("Grant Camera Permission", fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -510,7 +510,7 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(14.dp))
                 Text(
-                    text = "تثبيت Google Play Services for AR",
+                    text = "Install Google Play Services for AR",
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -518,7 +518,7 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "يتطلب تتبع الأسطح الحقيقية والأرضيات الفيزيائية تثبيت أو تحديث حزمة Google ARCore الرسمية لتشغيل الكاميرا ثلاثية الأبعاد بدقة.",
+                    text = "Real-world surface and plane tracking requires the official Google ARCore package to be installed or updated.",
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.75f),
                     textAlign = TextAlign.Center,
@@ -534,7 +534,7 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("install_arcore_button")
                 ) {
-                    Text("تثبيت / تحديث ARCore الآن", fontWeight = FontWeight.Bold)
+                    Text("Install / Update ARCore", fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -575,7 +575,7 @@ fun ARCoreUnsupportedCard(
                 )
                 Spacer(modifier = Modifier.height(14.dp))
                 Text(
-                    text = if (isError) "تعذر الاتصال بخدمات ARCore" else "الجهاز غير متوافق مع ARCore",
+                    text = if (isError) "ARCore Service Unavailable" else "ARCore Not Supported on this Device",
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -584,9 +584,9 @@ fun ARCoreUnsupportedCard(
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (isError)
-                        "حدث خطأ أثناء فحص خدمات الواقع المعزز. يمكنك مواصلة استخدام وعرض المجسم في وضع Object."
+                        "An error occurred while checking AR services. You can continue inspecting the 3D model in Object mode."
                     else
-                        "هذا الجهاز أو بيئة المحاكي لا تدعم Google ARCore لتتبع الأسطح الفيزيائية الحقيقية. يمكنك استعراض المجسم والتفاعل مع كافة إيماءات التدوير والتكبير في وضع المجسم (Object Mode).",
+                        "This device does not support Google ARCore physical plane tracking. You can fully explore, rotate, and scale the model in Object Mode.",
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.75f),
                     textAlign = TextAlign.Center,
@@ -602,7 +602,7 @@ fun ARCoreUnsupportedCard(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("back_to_object_button")
                 ) {
-                    Text("العودة إلى وضع المجسم (Object)", fontWeight = FontWeight.Bold)
+                    Text("Return to Object Mode", fontWeight = FontWeight.Bold)
                 }
             }
         }

@@ -26,10 +26,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -145,9 +150,9 @@ fun MRMainScreen() {
                     customModelFile = copiedFile
                     isModelVisible = true
                     val fileName = copiedFile.name
-                    Toast.makeText(context, "تم تحميل النموذج بنجاح: $fileName", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Model loaded successfully: $fileName", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(context, "تعذر قراءة ملف النموذج المختار", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Unable to read 3D model file", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -323,7 +328,7 @@ fun MRMainScreen() {
                     .padding(horizontal = 16.dp, vertical = 7.dp)
             ) {
                 Text(
-                    text = "وضع ملء الشاشة 🥽 • انقر 3 مرات لإظهار القوائم",
+                    text = "Full Screen Mode 🥽 • Triple-tap to toggle bars",
                     color = Color.White,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium
@@ -363,14 +368,14 @@ fun MRMainScreen() {
                             scope.launch {
                                 val uri = MediaManager.saveBitmapToGallery(context, bitmap)
                                 if (uri != null) {
-                                    Toast.makeText(context, "تم حفظ الصورة في المعرض 📸", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Photo saved to Gallery 📸", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    Toast.makeText(context, "تم التقاط الصورة", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Photo captured", Toast.LENGTH_SHORT).show()
                                 }
                             }
                         }
                     } else {
-                        Toast.makeText(context, "تم التقاط الصورة", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Photo captured", Toast.LENGTH_SHORT).show()
                     }
                 },
                 onRecClick = {
@@ -378,16 +383,16 @@ fun MRMainScreen() {
                     if (!isRecording) {
                         isRecording = true
                         videoRecorder.startRecording(activity, surfaceMirrorer, scope)
-                        Toast.makeText(context, "بدأ تسجيل الفيديو 🎥", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Video recording started 🎥", Toast.LENGTH_SHORT).show()
                     } else {
                         isRecording = false
                         scope.launch {
-                            Toast.makeText(context, "جاري معالجة وحفظ الفيديو...", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Saving video to Gallery...", Toast.LENGTH_SHORT).show()
                             val uri = videoRecorder.stopRecording()
                             if (uri != null) {
-                                Toast.makeText(context, "تم حفظ الفيديو في المعرض بنجاح 🎥", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "Video saved to Gallery 🎥", Toast.LENGTH_LONG).show()
                             } else {
-                                Toast.makeText(context, "تم إنهاء التسجيل", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Recording finished", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
@@ -401,7 +406,7 @@ fun MRMainScreen() {
                     isModelVisible = false
                     customModelFile = null
                     clearTrigger++
-                    Toast.makeText(context, "تم مسح النموذج من المشهد 🗑️", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Model removed from scene 🗑️", Toast.LENGTH_SHORT).show()
                 }
             )
         }
@@ -503,24 +508,44 @@ fun queryDisplayName(context: Context, uri: Uri): String? {
 
 /**
  * Top floating segmented control pill: MR | AR | Object
+ * Replicates the liquid-glass capsule with glossy highlight from user reference.
  */
 @Composable
 fun TopModeSegmentedPill(
     currentMode: ViewportMode,
     onModeSelected: (ViewportMode) -> Unit
 ) {
-    Surface(
-        shape = RoundedCornerShape(percent = 50),
-        color = PillContainerColor,
-        shadowElevation = 8.dp,
+    Box(
         modifier = Modifier
             .wrapContentSize()
-            .height(44.dp)
+            .clip(RoundedCornerShape(percent = 50))
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0x73202532),
+                        Color(0x8C10141D),
+                        Color(0xA60A0C13)
+                    )
+                )
+            )
+            .border(
+                width = 1.2.dp,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0x73FFFFFF),
+                        Color(0x2BFFFFFF),
+                        Color(0x1AFFFFFF),
+                        Color(0x4DFFFFFF)
+                    )
+                ),
+                shape = RoundedCornerShape(percent = 50)
+            )
+            .padding(horizontal = 4.dp, vertical = 3.dp)
             .testTag("top_mode_segmented_pill")
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 3.dp)
+            horizontalArrangement = Arrangement.Center
         ) {
             ViewportMode.values().forEach { mode ->
                 val isSelected = currentMode == mode
@@ -529,21 +554,44 @@ fun TopModeSegmentedPill(
                     modifier = Modifier
                         .height(38.dp)
                         .clip(RoundedCornerShape(percent = 50))
-                        .background(if (isSelected) PillSelectedColor else Color.Transparent)
+                        .then(
+                            if (isSelected) {
+                                Modifier
+                                    .background(
+                                        Brush.verticalGradient(
+                                            listOf(
+                                                Color(0x404B576D),
+                                                Color(0x2B333E50)
+                                            )
+                                        )
+                                    )
+                                    .border(
+                                        width = 1.2.dp,
+                                        brush = Brush.verticalGradient(
+                                            listOf(
+                                                Color(0xCCFFFFFF),
+                                                Color(0x66FFFFFF),
+                                                Color(0x99FFFFFF)
+                                            )
+                                        ),
+                                        shape = RoundedCornerShape(percent = 50)
+                                    )
+                            } else {
+                                Modifier
+                            }
+                        )
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) { onModeSelected(mode) }
-                        .padding(horizontal = 22.dp)
+                        .padding(horizontal = 20.dp)
                         .testTag("mode_tab_${mode.name.lowercase(Locale.ROOT)}")
                 ) {
                     Text(
                         text = mode.title,
-                        style = MaterialTheme.typography.bodyMedium.copy(
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                            fontSize = 14.sp
-                        ),
-                        color = if (isSelected) PillTextColor else PillUnselectedTextColor
+                        color = if (isSelected) Color.White else Color(0xB3CAD5E2),
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                        fontSize = 14.sp
                     )
                 }
             }
@@ -553,6 +601,7 @@ fun TopModeSegmentedPill(
 
 /**
  * Bottom action control capsule: PHOTO | ● REC | Open | Clear
+ * Replicates the liquid-glass capsule with glowing circular REC button from user reference.
  */
 @Composable
 fun BottomControlBar(
@@ -562,37 +611,57 @@ fun BottomControlBar(
     onOpenClick: () -> Unit,
     onClearClick: () -> Unit
 ) {
-    Surface(
-        shape = RoundedCornerShape(percent = 50),
-        color = PillContainerColor,
-        shadowElevation = 10.dp,
+    Box(
         modifier = Modifier
             .wrapContentSize()
-            .height(56.dp)
+            .clip(RoundedCornerShape(percent = 50))
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0x73202532),
+                        Color(0x8C10141D),
+                        Color(0xA60A0C13)
+                    )
+                )
+            )
+            .border(
+                width = 1.2.dp,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0x73FFFFFF),
+                        Color(0x2BFFFFFF),
+                        Color(0x1AFFFFFF),
+                        Color(0x4DFFFFFF)
+                    )
+                ),
+                shape = RoundedCornerShape(percent = 50)
+            )
+            .padding(horizontal = 14.dp, vertical = 5.dp)
             .testTag("bottom_control_bar")
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // PHOTO
-            TextButton(
-                onClick = onPhotoClick,
-                colors = ButtonDefaults.textButtonColors(contentColor = PillTextColor),
+            // 1. PHOTO
+            Box(
                 modifier = Modifier
-                    .height(44.dp)
-                    .testTag("photo_button")
+                    .clip(RoundedCornerShape(percent = 50))
+                    .clickable(onClick = onPhotoClick)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("photo_button"),
+                contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "PHOTO",
+                    color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp,
                     letterSpacing = 0.5.sp
                 )
             }
 
-            // ● REC Button
+            // 2. Glowing Red Circular REC Button
             val recTransition = rememberInfiniteTransition(label = "rec_pulse")
             val recScale by recTransition.animateFloat(
                 initialValue = 1.0f,
@@ -604,61 +673,98 @@ fun BottomControlBar(
                 label = "rec_scale"
             )
 
-            Surface(
-                shape = RoundedCornerShape(percent = 50),
-                color = RecButtonColor,
+            Box(
                 modifier = Modifier
+                    .size(46.dp)
                     .scale(recScale)
-                    .height(42.dp)
+                    .clip(CircleShape)
+                    .background(
+                        Brush.radialGradient(
+                            colors = listOf(
+                                Color(0xFFFF334B),
+                                Color(0xFFE50920),
+                                Color(0xFFB30415)
+                            )
+                        )
+                    )
+                    .border(
+                        width = 1.2.dp,
+                        brush = Brush.verticalGradient(
+                            listOf(Color(0x99FFFFFF), Color(0x33FFFFFF))
+                        ),
+                        shape = CircleShape
+                    )
                     .clickable(onClick = onRecClick)
-                    .testTag("rec_button")
+                    .testTag("rec_button"),
+                contentAlignment = Alignment.Center
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(Color.White)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = if (isRecording) "STOP" else "REC",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
-                    )
+                    if (isRecording) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(RoundedCornerShape(1.5.dp))
+                                .background(Color.White)
+                        )
+                        Spacer(modifier = Modifier.height(1.5.dp))
+                        Text(
+                            text = "STOP",
+                            color = Color.White,
+                            fontSize = 7.5.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 0.2.sp
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(Color.White)
+                        )
+                        Spacer(modifier = Modifier.height(1.5.dp))
+                        Text(
+                            text = "REC",
+                            color = Color.White,
+                            fontSize = 7.5.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 0.2.sp
+                        )
+                    }
                 }
             }
 
-            // Open
-            TextButton(
-                onClick = onOpenClick,
-                colors = ButtonDefaults.textButtonColors(contentColor = PillTextColor),
+            // 3. Open
+            Box(
                 modifier = Modifier
-                    .height(44.dp)
-                    .testTag("open_model_picker_button")
+                    .clip(RoundedCornerShape(percent = 50))
+                    .clickable(onClick = onOpenClick)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("open_model_picker_button"),
+                contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "Open",
+                    color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp
                 )
             }
 
-            // Clear
-            TextButton(
-                onClick = onClearClick,
-                colors = ButtonDefaults.textButtonColors(contentColor = PillTextColor),
+            // 4. Clear
+            Box(
                 modifier = Modifier
-                    .height(44.dp)
-                    .testTag("clear_scene_button")
+                    .clip(RoundedCornerShape(percent = 50))
+                    .clickable(onClick = onClearClick)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("clear_scene_button"),
+                contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = "Clear",
+                    color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp
                 )

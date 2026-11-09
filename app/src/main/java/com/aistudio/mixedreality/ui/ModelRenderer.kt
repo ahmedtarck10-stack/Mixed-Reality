@@ -50,12 +50,14 @@ enum class ModelItem(
     SPATIAL_CARD("Spatial Interface", "3D Floating UI Plane", "📄")
 }
 
-// Capsule pill styling colors matching user reference
-val PillContainerColor = Color(0xFFAEB4BC)
-val PillSelectedColor = Color(0xFF8B929B)
-val PillTextColor = Color(0xFF1E2227)
-val PillUnselectedTextColor = Color(0xFF33383F)
-val RecButtonColor = Color(0xFFE53935)
+// Liquid glass capsule pill styling colors matching user reference
+val PillContainerColor = Color(0x8010141D)
+val PillBorderColor = Color(0x40FFFFFF)
+val PillSelectedColor = Color(0x38FFFFFF)
+val PillSelectedBorderColor = Color(0x99FFFFFF)
+val PillTextColor = Color.White
+val PillUnselectedTextColor = Color(0xB3FFFFFF)
+val RecButtonColor = Color(0xFFFF263E)
 
 /**
  * Common 3D model node rendering inside a SceneScope.

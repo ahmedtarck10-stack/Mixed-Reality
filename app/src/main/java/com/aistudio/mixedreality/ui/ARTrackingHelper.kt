@@ -310,14 +310,14 @@ class ARTrackingManager(
 
     fun getHudStatus(): Pair<String, Color> = when {
         activeAnchor != null && anchorTrackingState == TrackingState.TRACKING ->
-            "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
+            "Model placed • Tap floor to move" to NeonGreen
         activeAnchor != null && anchorTrackingState == TrackingState.PAUSED ->
-            "التتبع متوقف مؤقتاً • حرّك الجهاز ببطء" to Color(0xFFFFB300)
+            "Tracking paused • Move device slowly" to Color(0xFFFFB300)
         activeAnchor != null && anchorTrackingState == TrackingState.STOPPED ->
-            "فُقد التتبع • امسح الأرضية ثم انقر لإعادة التثبيت" to Color(0xFFFF5252)
-        activeAnchor != null -> "النموذج مثبت • انقر على أرضية أخرى لنقله" to NeonGreen
-        isPlaneDetected -> "تم رصد سطح أفقي متتبّع • انقر لتثبيت النموذج" to NeonGreen
-        else -> "وجّه الكاميرا نحو الأرضية وحرّكها ببطء" to NeonCyan
+            "Tracking lost • Scan floor and tap to place" to Color(0xFFFF5252)
+        activeAnchor != null -> "Model placed • Tap floor to move" to NeonGreen
+        isPlaneDetected -> "Tracked surface detected • Tap to place" to NeonGreen
+        else -> "Point camera at floor and move slowly" to NeonCyan
     }
 }
 
