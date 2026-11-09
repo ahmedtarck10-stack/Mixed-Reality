@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="open_3d_file"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher_foreground"
+        android:shortcutShortLabel="@string/shortcut_open_file_short"
+        android:shortcutLongLabel="@string/shortcut_open_file_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aistudio.mixedreality.fquznk"
+            android:targetClass="com.aistudio.mixedreality.MainActivity">
+            <extra android:name="shortcut_action" android:value="open_file" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="cloud_library"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher_foreground"
+        android:shortcutShortLabel="@string/shortcut_cloud_library_short"
+        android:shortcutLongLabel="@string/shortcut_cloud_library_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aistudio.mixedreality.fquznk"
+            android:targetClass="com.aistudio.mixedreality.MainActivity">
+            <extra android:name="shortcut_action" android:value="cloud_library" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="launch_ar"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher_foreground"
+        android:shortcutShortLabel="@string/shortcut_ar_scan_short"
+        android:shortcutLongLabel="@string/shortcut_ar_scan_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aistudio.mixedreality.fquznk"
+            android:targetClass="com.aistudio.mixedreality.MainActivity">
+            <extra android:name="shortcut_action" android:value="launch_ar" />
+        </intent>
+    </shortcut>
+</shortcuts>

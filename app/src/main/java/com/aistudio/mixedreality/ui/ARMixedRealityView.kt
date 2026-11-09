@@ -88,6 +88,10 @@ fun ARMixedRealityView(
     onScaleChange: (Float) -> Unit = {},
     rotationY: Float = 0f,
     onRotationYChange: (Float) -> Unit = {},
+    rotationX: Float = 0f,
+    onRotationXChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
     clearTrigger: Int = 0,
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
@@ -224,10 +228,17 @@ fun ARMixedRealityView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx, _ ->
+                onOneFingerRotate = { dx, dy ->
                     onStopAutoRotate()
-                    val newRot = (rotationY + dx * 0.45f) % 360f
-                    onRotationYChange(if (newRot < 0f) newRot + 360f else newRot)
+                    val newRotY = ((rotationY + dx * 0.45f) % 360f + 360f) % 360f
+                    onRotationYChange(newRotY)
+
+                    val newRotX = ((rotationX + dy * 0.45f) % 360f + 360f) % 360f
+                    onRotationXChange(newRotX)
+                },
+                onTwoFingerRotateZ = { dAngle ->
+                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
+                    onRotationZChange(newRotZ)
                 },
                 onTwoFingerZoom = { zoomMultiplier ->
                     val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
@@ -287,9 +298,12 @@ fun ARMixedRealityView(
                     }
                 ) {
                     val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
+                    val safeRotX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
+                    val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
+                    val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
                     Node(
                         position = modelOffset,
-                        rotation = Rotation(x = 0f, y = rotationY, z = 0f),
+                        rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
                         scale = Scale(safeScale)
                     ) {
                         if (isModelVisible) {

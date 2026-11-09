@@ -4,4 +4,11 @@
     <string name="grant_permission">Grant Camera Permission</string>
     <string name="mode_3d">3D Studio</string>
     <string name="mode_ar">Mixed Reality (AR)</string>
+    <string name="shortcut_open_file_short">Open 3D</string>
+    <string name="shortcut_open_file_long">Open 3D Model File</string>
+    <string name="shortcut_cloud_library_short">3D Library</string>
+    <string name="shortcut_cloud_library_long">Open Cloud 3D Library</string>
+    <string name="shortcut_ar_scan_short">AR View</string>
+    <string name="shortcut_ar_scan_long">Launch AR Scanner</string>
+    <string name="quick_settings_tile_label">Mixed Reality</string>
 </resources>

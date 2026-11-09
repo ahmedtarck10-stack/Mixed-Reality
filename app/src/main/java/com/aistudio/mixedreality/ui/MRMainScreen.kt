@@ -14,6 +14,8 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -28,8 +30,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -40,6 +45,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.aistudio.mixedreality.ui.theme.*
 import com.aistudio.mixedreality.util.MediaManager
+import com.aistudio.mixedreality.util.ModelFormatConverter
 import com.aistudio.mixedreality.util.VideoSessionRecorder
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberEnvironmentLoader
@@ -53,7 +59,12 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MRMainScreen() {
+fun MRMainScreen(
+    incomingModelUri: Uri? = null,
+    onModelHandled: () -> Unit = {},
+    shortcutAction: String? = null,
+    onShortcutHandled: () -> Unit = {}
+) {
     val context = LocalContext.current
     val activity = context as? Activity
     val scope = rememberCoroutineScope()
@@ -86,6 +97,39 @@ fun MRMainScreen() {
     var isAutoRotating by remember { mutableStateOf(false) }
     var rotationY by remember { mutableFloatStateOf(0f) }
     var rotationX by remember { mutableFloatStateOf(0f) }
+    var rotationZ by remember { mutableFloatStateOf(0f) }
+
+    // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
+    var showCloudLibrary by remember { mutableStateOf(false) }
+
+    // Handle incoming 3D model files from external apps / file manager
+    LaunchedEffect(incomingModelUri) {
+        val uri = incomingModelUri ?: return@LaunchedEffect
+        val copiedFile = copyUriToLocalCache(context, uri)
+        if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
+            customModelFile = copiedFile
+            isModelVisible = true
+            selectedMode = ViewportMode.OBJECT
+            Toast.makeText(context, "Opened 3D model: ${copiedFile.name}", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Failed to load 3D model from file", Toast.LENGTH_SHORT).show()
+        }
+        onModelHandled()
+    }
+
+    // Handle App Shortcuts and Quick Settings tile launches
+    LaunchedEffect(shortcutAction) {
+        val action = shortcutAction ?: return@LaunchedEffect
+        when (action) {
+            "cloud_library" -> {
+                showCloudLibrary = true
+            }
+            "launch_ar" -> {
+                selectedMode = ViewportMode.AR
+            }
+        }
+        onShortcutHandled()
+    }
 
     // Bottom sheet for model tuning / presets
     var showTuneDrawer by remember { mutableStateOf(false) }
@@ -208,6 +252,8 @@ fun MRMainScreen() {
                     onRotationYChange = { rotationY = it },
                     rotationX = rotationX,
                     onRotationXChange = { rotationX = it },
+                    rotationZ = rotationZ,
+                    onRotationZChange = { rotationZ = it },
                     isMoveMode = isMoveMode,
                     onToggleMoveMode = { isMoveMode = !isMoveMode },
                     isFullScreen = isFullScreen,
@@ -236,6 +282,10 @@ fun MRMainScreen() {
                         onScaleChange = { scaleFactor = it },
                         rotationY = rotationY,
                         onRotationYChange = { rotationY = it },
+                        rotationX = rotationX,
+                        onRotationXChange = { rotationX = it },
+                        rotationZ = rotationZ,
+                        onRotationZChange = { rotationZ = it },
                         clearTrigger = clearTrigger,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
@@ -269,6 +319,10 @@ fun MRMainScreen() {
                         isAutoRotating = isAutoRotating,
                         rotationY = rotationY,
                         onRotationYChange = { rotationY = it },
+                        rotationX = rotationX,
+                        onRotationXChange = { rotationX = it },
+                        rotationZ = rotationZ,
+                        onRotationZChange = { rotationZ = it },
                         isRecording = isRecording,
                         engine = engine,
                         modelLoader = modelLoader,
@@ -398,8 +452,11 @@ fun MRMainScreen() {
                     }
                 },
                 onOpenClick = {
-                    // Requirement 4: Clicking Open goes to Files to pick a 3D model (.glb / .gltf)
-                    filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*"))
+                    // Requirement 4: Clicking Open goes to Files to pick a 3D model (.glb / .gltf / .usdz / .obj)
+                    filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
+                },
+                onOpenCloudLibrary = {
+                    showCloudLibrary = true
                 },
                 onClearClick = {
                     // Requirement 3: Clear button deletes / removes the model
@@ -432,7 +489,7 @@ fun MRMainScreen() {
                     customModelFile = customModelFile,
                     onPickFileClick = {
                         showTuneDrawer = false
-                        filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*"))
+                        filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
                     },
                     selectedModel = selectedModel,
                     onSelectModel = {
@@ -454,18 +511,35 @@ fun MRMainScreen() {
                 )
             }
         }
+
+        // --- 8. CLOUD 3D MODEL LIBRARY SHEET (LONG PRESS OPEN 3-5s) ---
+        if (showCloudLibrary) {
+            CloudLibrarySheet(
+                onDismiss = { showCloudLibrary = false },
+                onModelDownloaded = { downloadedFile, title ->
+                    showCloudLibrary = false
+                    scope.launch {
+                        val converted = ModelFormatConverter.processIncomingModel(context, downloadedFile)
+                        customModelFile = converted.glbFile
+                        isModelVisible = true
+                        selectedMode = ViewportMode.OBJECT
+                        Toast.makeText(context, "Loaded from Cloud: $title", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+        }
     }
 }
 
 /**
- * Copies a selected Content Uri to app's private cache directory.
+ * Copies a selected Content Uri to app's private cache directory and processes USDZ/OBJ/GLB formats.
  */
 fun copyUriToLocalCache(context: Context, uri: Uri): File? {
     return try {
-        var rawName = queryDisplayName(context, uri) ?: "model_${System.currentTimeMillis()}.glb"
-        // Ensure proper 3D extension for Filament model loader
-        val isGlbOrGltf = rawName.endsWith(".glb", ignoreCase = true) || rawName.endsWith(".gltf", ignoreCase = true)
-        val finalName = if (!isGlbOrGltf) {
+        val rawName = queryDisplayName(context, uri) ?: "model_${System.currentTimeMillis()}.glb"
+        val extension = rawName.substringAfterLast('.', "").lowercase()
+        val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj")
+        val finalName = if (!isRecognized3D) {
             if (rawName.contains('.')) "${rawName.substringBeforeLast('.')}.glb" else "$rawName.glb"
         } else {
             rawName
@@ -476,7 +550,8 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
                 input.copyTo(output)
             }
         }
-        cacheFile
+        val conversion = ModelFormatConverter.processIncomingModel(context, cacheFile)
+        conversion.glbFile
     } catch (e: Exception) {
         null
     }
@@ -609,8 +684,11 @@ fun BottomControlBar(
     onPhotoClick: () -> Unit,
     onRecClick: () -> Unit,
     onOpenClick: () -> Unit,
+    onOpenCloudLibrary: () -> Unit = {},
     onClearClick: () -> Unit
 ) {
+    val haptic = LocalHapticFeedback.current
+
     Box(
         modifier = Modifier
             .wrapContentSize()
@@ -736,18 +814,63 @@ fun BottomControlBar(
                 }
             }
 
-            // 3. Open
+            // 3. Open (Short Tap: System Local File Picker | Hold 3-5 seconds: Cloud 3D Library)
+            var isHoldingOpen by remember { mutableStateOf(false) }
+            var holdProgress by remember { mutableFloatStateOf(0f) }
+
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(percent = 50))
-                    .clickable(onClick = onOpenClick)
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            val downTime = System.currentTimeMillis()
+                            isHoldingOpen = true
+                            var triggeredCloud = false
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val elapsed = System.currentTimeMillis() - downTime
+                                holdProgress = (elapsed / 3200f).coerceIn(0f, 1f)
+
+                                if (!triggeredCloud && elapsed >= 3200L) {
+                                    triggeredCloud = true
+                                    isHoldingOpen = false
+                                    holdProgress = 0f
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onOpenCloudLibrary()
+                                    break
+                                }
+
+                                if (event.changes.all { !it.pressed }) {
+                                    if (!triggeredCloud) {
+                                        onOpenClick()
+                                    }
+                                    isHoldingOpen = false
+                                    holdProgress = 0f
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    .then(
+                        if (isHoldingOpen && holdProgress > 0.05f) {
+                            Modifier.border(
+                                width = 1.2.dp,
+                                color = NeonCyan.copy(alpha = 0.3f + (holdProgress * 0.7f)),
+                                shape = RoundedCornerShape(percent = 50)
+                            )
+                        } else {
+                            Modifier
+                        }
+                    )
                     .padding(horizontal = 12.dp, vertical = 10.dp)
                     .testTag("open_model_picker_button"),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "Open",
-                    color = Color.White,
+                    text = if (isHoldingOpen && holdProgress > 0.25f) "Cloud ☁️" else "Open",
+                    color = if (isHoldingOpen) NeonCyan else Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp
                 )

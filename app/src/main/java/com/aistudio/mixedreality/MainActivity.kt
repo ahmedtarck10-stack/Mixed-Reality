@@ -1,5 +1,7 @@
 package com.aistudio.mixedreality
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,13 +29,18 @@ import com.aistudio.mixedreality.ui.SplashScreen
 import com.aistudio.mixedreality.ui.theme.MixedRealityTheme
 
 class MainActivity : ComponentActivity() {
+    private var incomingModelUri by mutableStateOf<Uri?>(null)
+    private var shortcutAction by mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        incomingModelUri = extractModelUri(intent)
+        shortcutAction = intent?.getStringExtra("shortcut_action")
+
         setContent {
             MixedRealityTheme {
                 val systemDensity = LocalDensity.current
-                // Enforce constant 1.0f fontScale so accessibility font sizes do not break layout
                 val fixedDensity = remember(systemDensity.density) {
                     Density(
                         density = systemDensity.density,
@@ -41,7 +48,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // Enforce strictly LTR layout direction so Arabic/RTL language settings never flip the UI
                 CompositionLocalProvider(
                     LocalDensity provides fixedDensity,
                     LocalLayoutDirection provides LayoutDirection.Ltr
@@ -50,24 +56,53 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize(),
                         color = Color.Black
                     ) {
-                        var showSplash by remember { mutableStateOf(true) }
+                        var showSplash by remember { mutableStateOf(incomingModelUri == null && shortcutAction == null) }
 
                         Box(modifier = Modifier.fillMaxSize()) {
-                            MRMainScreen()
+                            MRMainScreen(
+                                incomingModelUri = incomingModelUri,
+                                onModelHandled = { incomingModelUri = null },
+                                shortcutAction = shortcutAction,
+                                onShortcutHandled = { shortcutAction = null }
+                            )
 
-                            AnimatedVisibility(
-                                visible = showSplash,
-                                enter = fadeIn(tween(300)),
-                                exit = fadeOut(tween(500))
-                            ) {
-                                SplashScreen(
-                                    onFinished = { showSplash = false }
-                                )
+                            if (showSplash) {
+                                AnimatedVisibility(
+                                    visible = showSplash,
+                                    enter = fadeIn(tween(300)),
+                                    exit = fadeOut(tween(500))
+                                ) {
+                                    SplashScreen(
+                                        onFinished = { showSplash = false }
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        extractModelUri(intent)?.let { uri ->
+            incomingModelUri = uri
+        }
+        intent.getStringExtra("shortcut_action")?.let { action ->
+            shortcutAction = action
+        }
+    }
+
+    private fun extractModelUri(intent: Intent?): Uri? {
+        if (intent == null) return null
+        return when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data
+            Intent.ACTION_SEND -> {
+                intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: intent.data
+            }
+            else -> intent.data
         }
     }
 }

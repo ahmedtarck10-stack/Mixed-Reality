@@ -74,6 +74,10 @@ fun MRStereoSplitView(
     isAutoRotating: Boolean = false,
     rotationY: Float = 0f,
     onRotationYChange: (Float) -> Unit = {},
+    rotationX: Float = 0f,
+    onRotationXChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
     isRecording: Boolean = false,
     engine: Engine,
     modelLoader: ModelLoader,
@@ -101,6 +105,10 @@ fun MRStereoSplitView(
         onScaleChange = onScaleChange,
         rotationY = rotationY,
         onRotationYChange = onRotationYChange,
+        rotationX = rotationX,
+        onRotationXChange = onRotationXChange,
+        rotationZ = rotationZ,
+        onRotationZChange = onRotationZChange,
         onStopAutoRotate = onStopAutoRotate,
         onFallbackToObject = onFallbackToObject,
         engine = engine,
@@ -133,6 +141,10 @@ private fun MRStereoARCoreView(
     onScaleChange: (Float) -> Unit,
     rotationY: Float,
     onRotationYChange: (Float) -> Unit,
+    rotationX: Float = 0f,
+    onRotationXChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
     onStopAutoRotate: () -> Unit,
     onFallbackToObject: () -> Unit = {},
     engine: Engine,
@@ -284,11 +296,19 @@ private fun MRStereoARCoreView(
                     // Triple Tap: Toggle Full Screen mode
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx, _ ->
-                    // 1 Finger: Yaw Rotation
+                onOneFingerRotate = { dx, dy ->
+                    // 1 Finger: Yaw and Pitch Rotation
                     onStopAutoRotate()
-                    val newRot = (rotationY + dx * 0.45f) % 360f
-                    onRotationYChange(if (newRot < 0f) newRot + 360f else newRot)
+                    val newRotY = ((rotationY + dx * 0.45f) % 360f + 360f) % 360f
+                    onRotationYChange(newRotY)
+
+                    val newRotX = ((rotationX + dy * 0.45f) % 360f + 360f) % 360f
+                    onRotationXChange(newRotX)
+                },
+                onTwoFingerRotateZ = { dAngle ->
+                    // 2 Fingers Twist: Roll Rotation (Z axis)
+                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
+                    onRotationZChange(newRotZ)
                 },
                 onTwoFingerZoom = { zoomFactor ->
                     // 2 Fingers: Zoom (Scale 0.1x to 2500x)
@@ -366,9 +386,12 @@ private fun MRStereoARCoreView(
                             }
                         ) {
                             val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
+                            val safeRotX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
+                            val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
+                            val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
                             Node(
                                 position = modelOffset,
-                                rotation = Rotation(x = 0f, y = rotationY, z = 0f),
+                                rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
                                 scale = Scale(safeScale)
                             ) {
                                 if (isModelVisible) {

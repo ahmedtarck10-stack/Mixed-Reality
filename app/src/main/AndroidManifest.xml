@@ -38,13 +38,100 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@style/Theme.MixedReality">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+
+            <!-- Intent filter 1: Standard 3D MIME types (GLB, glTF, USDZ, OBJ) -->
+            <intent-filter tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="model/gltf-binary" />
+                <data android:mimeType="model/gltf+json" />
+                <data android:mimeType="model/vnd.usdz+zip" />
+                <data android:mimeType="model/vnd.pixar.usd" />
+                <data android:mimeType="model/obj" />
+                <data android:mimeType="model/*" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+
+            <!-- Intent filter 2: File extension pattern matching (.glb / .gltf / .usdz / .obj) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.glb" />
+                <data android:pathPattern=".*\\.gltf" />
+                <data android:pathPattern=".*\\.GLB" />
+                <data android:pathPattern=".*\\.GLTF" />
+                <data android:pathPattern=".*\\.usdz" />
+                <data android:pathPattern=".*\\.USDZ" />
+                <data android:pathPattern=".*\\.usda" />
+                <data android:pathPattern=".*\\.usdc" />
+                <data android:pathPattern=".*\\.obj" />
+                <data android:pathPattern=".*\\.OBJ" />
+            </intent-filter>
+
+            <!-- Intent filter 3: Generic content with 3D extension for aggressive file manager matching -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.glb" />
+                <data android:pathPattern=".*\\.gltf" />
+                <data android:pathPattern=".*\\.GLB" />
+                <data android:pathPattern=".*\\.GLTF" />
+                <data android:pathPattern=".*\\.usdz" />
+                <data android:pathPattern=".*\\.USDZ" />
+                <data android:pathPattern=".*\\.usda" />
+                <data android:pathPattern=".*\\.usdc" />
+                <data android:pathPattern=".*\\.obj" />
+                <data android:pathPattern=".*\\.OBJ" />
+            </intent-filter>
+
+            <!-- Intent filter 4: Send / Share target to receive 3D files shared from other apps -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="model/gltf-binary" />
+                <data android:mimeType="model/gltf+json" />
+                <data android:mimeType="model/vnd.usdz+zip" />
+                <data android:mimeType="model/vnd.pixar.usd" />
+                <data android:mimeType="model/obj" />
+                <data android:mimeType="model/*" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
+
+        <!-- Quick Settings Tile Service -->
+        <service
+            android:name=".service.MRQuickTileService"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/quick_settings_tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

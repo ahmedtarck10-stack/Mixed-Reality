@@ -15,15 +15,27 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.hypot
+
+/**
+ * Calculates angle in degrees between two touch pointers.
+ */
+private fun angleDegrees(p1: Offset, p2: Offset): Float {
+    val rad = atan2((p2.y - p1.y).toDouble(), (p2.x - p1.x).toDouble())
+    return Math.toDegrees(rad).toFloat()
+}
 
 /**
  * Spatial Gesture Modifier for MR / 3D / AR operations:
  * - One tap: Anchor / place model onto the real floor or scene.
- * - One finger drag: Smooth yaw rotation around the upright Y-axis.
- * - Two fingers: Zoom (scale 0.1x to 2500x).
- * - Double tap: Toggle Move Mode.
- * - Triple tap: Toggle Full Screen.
+ * - One finger drag: 360-degree rotation across X (pitch) and Y (yaw) axes.
+ * - Two fingers:
+ *     • Zoom (scale 0.1x to 2500x) when in Zoom mode.
+ *     • Move (translate 3D position) when in Move mode.
+ *     • Twist / rotate around Z-axis (roll) 360 degrees.
+ * - Double tap: Toggle between Zoom Mode and Move Mode.
+ * - Triple tap: Toggle Full Screen (hide/show upper and lower bars).
  */
 @Composable
 fun Modifier.spatialMRGestures(
@@ -34,6 +46,7 @@ fun Modifier.spatialMRGestures(
     onTripleTap: () -> Unit,
     onOneFingerRotate: (dx: Float, dy: Float) -> Unit,
     onTwoFingerZoom: (zoomMultiplier: Float) -> Unit,
+    onTwoFingerRotateZ: (deltaAngle: Float) -> Unit = {},
     onMove: (panX: Float, panY: Float) -> Unit
 ): Modifier {
     val currentIsMoveMode by rememberUpdatedState(isMoveMode)
@@ -42,6 +55,7 @@ fun Modifier.spatialMRGestures(
     val currentOnTripleTap by rememberUpdatedState(onTripleTap)
     val currentOnOneFingerRotate by rememberUpdatedState(onOneFingerRotate)
     val currentOnTwoFingerZoom by rememberUpdatedState(onTwoFingerZoom)
+    val currentOnTwoFingerRotateZ by rememberUpdatedState(onTwoFingerRotateZ)
     val currentOnMove by rememberUpdatedState(onMove)
 
     return this.pointerInput(Unit) {
@@ -63,6 +77,7 @@ fun Modifier.spatialMRGestures(
             var lastPointerPosition = downOffset
             var prevCentroid = downOffset
             var prevSpan = 0f
+            var prevAngle = 0f
             var lastPointerCount = 1
             maxPointersSeen = 1
             skipNextRotationDelta = false
@@ -118,14 +133,11 @@ fun Modifier.spatialMRGestures(
                     if (currentCount == 1) {
                         lastPointerPosition = pressedChanges[0].position
                     } else if (currentCount == 2) {
-                        prevCentroid = Offset(
-                            (pressedChanges[0].position.x + pressedChanges[1].position.x) / 2f,
-                            (pressedChanges[0].position.y + pressedChanges[1].position.y) / 2f
-                        )
-                        prevSpan = hypot(
-                            pressedChanges[0].position.x - pressedChanges[1].position.x,
-                            pressedChanges[0].position.y - pressedChanges[1].position.y
-                        )
+                        val p1 = pressedChanges[0].position
+                        val p2 = pressedChanges[1].position
+                        prevCentroid = Offset((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
+                        prevSpan = hypot(p1.x - p2.x, p1.y - p2.y)
+                        prevAngle = angleDegrees(p1, p2)
                     }
                     continue
                 }
@@ -144,7 +156,9 @@ fun Modifier.spatialMRGestures(
                         tapCount = 0
                         val dx = currentPos.x - lastPointerPosition.x
                         val dy = currentPos.y - lastPointerPosition.y
-                        if (abs(dx) > 0.05f || abs(dy) > 0.05f) currentOnOneFingerRotate(dx, dy)
+                        if (abs(dx) > 0.05f || abs(dy) > 0.05f) {
+                            currentOnOneFingerRotate(dx, dy)
+                        }
                         pressedChanges[0].consume()
                     }
                     lastPointerPosition = currentPos
@@ -156,26 +170,42 @@ fun Modifier.spatialMRGestures(
                     val p2 = pressedChanges[1].position
                     val currentCentroid = Offset((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
                     val currentSpan = hypot(p1.x - p2.x, p1.y - p2.y)
+                    val currentAngle = angleDegrees(p1, p2)
+
                     if (currentIsMoveMode) {
                         val panX = currentCentroid.x - prevCentroid.x
                         val panY = currentCentroid.y - prevCentroid.y
-                        if (abs(panX) > 0.5f || abs(panY) > 0.5f) currentOnMove(panX, panY)
-                    } else if (prevSpan > 15f && currentSpan > 15f) {
-                        val zoomFactor = currentSpan / prevSpan
-                        if (zoomFactor.isFinite() && zoomFactor in 0.5f..2f && abs(zoomFactor - 1f) > 0.0001f) {
-                            zoomAccumulator.add(zoomFactor)
-                            if (zoomFlushJob?.isActive != true) {
-                                zoomFlushJob = scope.launch {
-                                    withFrameNanos { }
-                                    val factor = ZoomScalePolicy.apply(1f, zoomAccumulator.consume())
-                                    if (factor != 1f) currentOnTwoFingerZoom(factor)
-                                    zoomFlushJob = null
+                        if (abs(panX) > 0.5f || abs(panY) > 0.5f) {
+                            currentOnMove(panX, panY)
+                        }
+                    } else {
+                        // Pinch to Zoom
+                        if (prevSpan > 15f && currentSpan > 15f) {
+                            val zoomFactor = currentSpan / prevSpan
+                            if (zoomFactor.isFinite() && zoomFactor in 0.5f..2f && abs(zoomFactor - 1f) > 0.0001f) {
+                                zoomAccumulator.add(zoomFactor)
+                                if (zoomFlushJob?.isActive != true) {
+                                    zoomFlushJob = scope.launch {
+                                        withFrameNanos { }
+                                        val factor = ZoomScalePolicy.apply(1f, zoomAccumulator.consume())
+                                        if (factor != 1f) currentOnTwoFingerZoom(factor)
+                                        zoomFlushJob = null
+                                    }
                                 }
                             }
+                        }
+
+                        // Twist to rotate around Z-axis (360 degrees roll)
+                        var angleDiff = currentAngle - prevAngle
+                        while (angleDiff < -180f) angleDiff += 360f
+                        while (angleDiff > 180f) angleDiff -= 360f
+                        if (abs(angleDiff) > 0.35f && abs(angleDiff) < 60f) {
+                            currentOnTwoFingerRotateZ(angleDiff)
                         }
                     }
                     prevCentroid = currentCentroid
                     prevSpan = currentSpan
+                    prevAngle = currentAngle
                     pressedChanges.forEach { it.consume() }
                 } else if (currentCount >= 3) {
                     isGestureDrag = true

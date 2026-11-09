@@ -68,6 +68,8 @@ fun Studio3DView(
     onRotationYChange: (Float) -> Unit = {},
     rotationX: Float = 0f,
     onRotationXChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
     isFullScreen: Boolean = false,
@@ -167,11 +169,15 @@ fun Studio3DView(
                 },
                 onOneFingerRotate = { dx, dy ->
                     onStopAutoRotate()
-                    val newRotY = (rotationY + dx * 0.35f) % 360f
-                    onRotationYChange(if (newRotY < 0f) newRotY + 360f else newRotY)
+                    val newRotY = ((rotationY + dx * 0.35f) % 360f + 360f) % 360f
+                    onRotationYChange(newRotY)
 
-                    val newRotX = (rotationX + dy * 0.35f).coerceIn(-90f, 90f)
+                    val newRotX = ((rotationX + dy * 0.35f) % 360f + 360f) % 360f
                     onRotationXChange(newRotX)
+                },
+                onTwoFingerRotateZ = { dAngle ->
+                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
+                    onRotationZChange(newRotZ)
                 },
                 onTwoFingerZoom = { zoomMultiplier ->
                     val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
@@ -221,6 +227,7 @@ fun Studio3DView(
                     scale = scale,
                     rotationY = rotationY,
                     rotationX = rotationX,
+                    rotationZ = rotationZ,
                     position = modelPosition
                 )
             }
