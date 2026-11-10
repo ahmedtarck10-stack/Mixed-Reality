@@ -36,12 +36,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Lock display refresh rate to exactly 60.0f Hz on modern 120Hz/LTPO devices (Samsung S21-S26, Z Fold/Flip, A25)
+        // Lock display refresh rate to exactly 30.0f Hz on modern 120Hz/LTPO devices (Samsung S21-S26, Z Fold/Flip, A25)
         // Standard: ARCore camera is 30fps, motion sensors read at 200Hz. 60Hz is an exact 2x multiple,
         // eliminating frame drops and aligning timestamps between sensor and camera image.
         try {
             window.attributes = window.attributes.apply {
-                preferredRefreshRate = 60.0f
+                preferredRefreshRate  =30.0f
             }
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                 val currentDisplay = display
@@ -50,7 +50,8 @@ class MainActivity : ComponentActivity() {
                 if (mode60 != null) {
                     window.attributes = window.attributes.apply {
                         preferredDisplayModeId = mode60.modeId
-                        preferredRefreshRate = 60.0f
+                        preferredRefreshRate =30.0f
+
                     }
                 }
             }
