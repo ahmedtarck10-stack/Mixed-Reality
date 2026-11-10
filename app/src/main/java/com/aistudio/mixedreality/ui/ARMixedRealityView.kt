@@ -5,13 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
-import androidx.compose.ui.platform.LocalContext
-import com.google.ar.core.ArCoreApk
-import java.util.concurrent.atomic.AtomicReference
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
@@ -19,9 +15,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -30,13 +26,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aistudio.mixedreality.ui.theme.*
 import com.google.android.filament.Engine
-import com.google.ar.core.Anchor
+import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
-import com.google.ar.core.Frame
-import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
-import io.github.sceneview.ar.highestResolutionCameraConfig
 import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.loaders.EnvironmentLoader
 import io.github.sceneview.loaders.MaterialLoader
@@ -60,7 +53,10 @@ fun isARCoreSupportedAndInstalled(context: Context): Boolean {
     return try {
         val packageInstalled = runCatching {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                context.packageManager.getPackageInfo("com.google.ar.core", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                context.packageManager.getPackageInfo(
+                    "com.google.ar.core",
+                    android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                )
             } else {
                 @Suppress("DEPRECATION")
                 context.packageManager.getPackageInfo("com.google.ar.core", 0)
@@ -69,13 +65,17 @@ fun isARCoreSupportedAndInstalled(context: Context): Boolean {
         }.getOrDefault(false)
 
         if (packageInstalled) {
-            val availability = com.google.ar.core.ArCoreApk.getInstance().checkAvailability(context)
+            val availability =
+                ArCoreApk.getInstance().checkAvailability(context)
             Log.d("ARCoreAvailability", "ARCore availability checked: $availability")
-            availability == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED
+            availability == ArCoreApk.Availability.SUPPORTED_INSTALLED
         } else {
             val hasPlayStore = runCatching {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    context.packageManager.getPackageInfo("com.android.vending", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                    context.packageManager.getPackageInfo(
+                        "com.android.vending",
+                        android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                    )
                 } else {
                     @Suppress("DEPRECATION")
                     context.packageManager.getPackageInfo("com.android.vending", 0)
@@ -86,12 +86,17 @@ fun isARCoreSupportedAndInstalled(context: Context): Boolean {
             if (!hasPlayStore) {
                 false
             } else {
-                val availability = com.google.ar.core.ArCoreApk.getInstance().checkAvailability(context)
-                availability == com.google.ar.core.ArCoreApk.Availability.SUPPORTED_INSTALLED
+                val availability =
+                    ArCoreApk.getInstance().checkAvailability(context)
+                availability == ArCoreApk.Availability.SUPPORTED_INSTALLED
             }
         }
     } catch (e: Throwable) {
-        Log.w("ARCoreAvailability", "ARCore checkAvailability threw exception: ${e.message}", e)
+        Log.w(
+            "ARCoreAvailability",
+            "ARCore checkAvailability threw exception: ${e.message}",
+            e
+        )
         false
     }
 }
@@ -131,14 +136,17 @@ fun ARMixedRealityView(
 
     val trackingManager = rememberARTrackingManager(
         modeName = "AR",
-        onHapticFeedback = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+        onHapticFeedback = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
     )
     val activeAnchor = trackingManager.activeAnchor
 
-    var isFixedFocusEnabled by remember { mutableStateOf(true) }
     var isAnchorLocked by remember { mutableStateOf(false) }
 
-    var modelOffset by remember { mutableStateOf(Position(0f, 0f, 0f)) }
+    var modelOffset by remember {
+        mutableStateOf(Position(0f, 0f, 0f))
+    }
 
     LaunchedEffect(clearTrigger) {
         if (clearTrigger > 0) {
@@ -186,14 +194,22 @@ fun ARMixedRealityView(
 
     val context = LocalContext.current
     val activity = context as? Activity
-    var arCoreAvailability by remember { mutableStateOf<ArCoreApk.Availability?>(null) }
-    var userRequestedInstall by remember { mutableStateOf(true) }
+
+    var arCoreAvailability by remember {
+        mutableStateOf<ArCoreApk.Availability?>(null)
+    }
+    var userRequestedInstall by remember {
+        mutableStateOf(true)
+    }
 
     LaunchedEffect(Unit) {
         try {
             val packageInstalled = runCatching {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    context.packageManager.getPackageInfo("com.google.ar.core", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                    context.packageManager.getPackageInfo(
+                        "com.google.ar.core",
+                        android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                    )
                 } else {
                     @Suppress("DEPRECATION")
                     context.packageManager.getPackageInfo("com.google.ar.core", 0)
@@ -202,11 +218,15 @@ fun ARMixedRealityView(
             }.getOrDefault(false)
 
             if (packageInstalled) {
-                arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+                arCoreAvailability =
+                    ArCoreApk.getInstance().checkAvailability(context)
             } else {
                 val hasPlayStore = runCatching {
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        context.packageManager.getPackageInfo("com.android.vending", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                        context.packageManager.getPackageInfo(
+                            "com.android.vending",
+                            android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                        )
                     } else {
                         @Suppress("DEPRECATION")
                         context.packageManager.getPackageInfo("com.android.vending", 0)
@@ -215,9 +235,11 @@ fun ARMixedRealityView(
                 }.getOrDefault(false)
 
                 if (!hasPlayStore) {
-                    arCoreAvailability = ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
+                    arCoreAvailability =
+                        ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
                 } else {
-                    arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+                    arCoreAvailability =
+                        ArCoreApk.getInstance().checkAvailability(context)
                 }
             }
         } catch (_: Throwable) {
@@ -225,9 +247,14 @@ fun ARMixedRealityView(
         }
     }
 
-    if (arCoreAvailability == null || arCoreAvailability == ArCoreApk.Availability.UNKNOWN_CHECKING) {
+    if (
+        arCoreAvailability == null ||
+        arCoreAvailability == ArCoreApk.Availability.UNKNOWN_CHECKING
+    ) {
         Box(
-            modifier = modifier.fillMaxSize().background(Color.Black),
+            modifier = modifier
+                .fillMaxSize()
+                .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
             CircularProgressIndicator(color = NeonCyan)
@@ -235,24 +262,38 @@ fun ARMixedRealityView(
         return
     }
 
-    if (arCoreAvailability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
+    if (
+        arCoreAvailability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
         arCoreAvailability == ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD
     ) {
         ARCoreInstallCard(
             onInstall = {
                 val hasPlayStore = runCatching {
-                    context.packageManager.getPackageInfo("com.android.vending", 0) != null
+                    context.packageManager.getPackageInfo(
+                        "com.android.vending",
+                        0
+                    ) != null
                 }.getOrDefault(false)
 
                 if (hasPlayStore && activity != null) {
                     try {
-                        val installStatus = ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)
+                        val installStatus =
+                            ArCoreApk.getInstance().requestInstall(
+                                activity,
+                                userRequestedInstall
+                            )
+
                         if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
                             userRequestedInstall = false
                         }
                     } catch (_: Throwable) {
                         runCatching {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.ar.core")).apply {
+                            val intent = Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse(
+                                    "https://play.google.com/store/apps/details?id=com.google.ar.core"
+                                )
+                            ).apply {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                             context.startActivity(intent)
@@ -260,7 +301,12 @@ fun ARMixedRealityView(
                     }
                 } else {
                     runCatching {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.ar.core")).apply {
+                        val intent = Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse(
+                                "https://play.google.com/store/apps/details?id=com.google.ar.core"
+                            )
+                        ).apply {
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
                         context.startActivity(intent)
@@ -271,13 +317,17 @@ fun ARMixedRealityView(
         return
     }
 
-    if (arCoreAvailability == ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE ||
+    if (
+        arCoreAvailability == ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE ||
         arCoreAvailability == ArCoreApk.Availability.UNKNOWN_ERROR ||
         arCoreAvailability == ArCoreApk.Availability.UNKNOWN_TIMED_OUT
     ) {
         ARCoreUnsupportedCard(
             onBackToObject = onFallbackToObject,
-            isError = (arCoreAvailability != ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE)
+            isError = (
+                arCoreAvailability !=
+                    ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
+            )
         )
         return
     }
@@ -291,7 +341,10 @@ fun ARMixedRealityView(
                 isMoveMode = isMoveMode,
                 activeAxis = activeRotationAxis,
                 onSingleTap = { tapOffset ->
-                    trackingManager.onSingleTap(tapOffset, isModelVisible)
+                    trackingManager.onSingleTap(
+                        tapOffset,
+                        isModelVisible
+                    )
                 },
                 onDoubleTap = {
                     onToggleMoveMode()
@@ -316,11 +369,13 @@ fun ARMixedRealityView(
                     )
                 },
                 onTwoFingerRotateZ = { dAngle ->
-                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
+                    val newRotZ =
+                        ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
                 },
                 onTwoFingerZoom = { zoomMultiplier ->
-                    val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
+                    val newScale =
+                        (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
                     onScaleChange(newScale)
                 },
                 onMove = { panX, panY ->
@@ -333,7 +388,9 @@ fun ARMixedRealityView(
             )
     ) {
         ARSceneView(
-            modifier = Modifier.fillMaxSize().testTag("ar_scene_view"),
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("ar_scene_view"),
             engine = engine,
             modelLoader = modelLoader,
             materialLoader = materialLoader,
@@ -342,14 +399,15 @@ fun ARMixedRealityView(
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
             instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
             focusMode = Config.FocusMode.FIXED,
-            sessionCameraConfig = ::highestResolutionCameraConfig,
             sessionConfiguration = { _, config ->
-                config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
-                // Fixed focus freezes lens at infinity, stopping autofocus movements, OIS adjustments and VIO drift
+                config.planeFindingMode =
+                    Config.PlaneFindingMode.HORIZONTAL
                 config.focusMode = Config.FocusMode.FIXED
                 config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
-                config.lightEstimationMode = Config.LightEstimationMode.DISABLED
+                config.instantPlacementMode =
+                    Config.InstantPlacementMode.LOCAL_Y_UP
+                config.lightEstimationMode =
+                    Config.LightEstimationMode.DISABLED
                 config.depthMode = Config.DepthMode.DISABLED
             },
             planeRenderer = (activeAnchor == null),
@@ -371,24 +429,49 @@ fun ARMixedRealityView(
                 AnchorNode(
                     anchor = anchor,
                     updateAnchorPose = true,
-                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
+                    visibleTrackingStates = setOf(
+                        TrackingState.TRACKING,
+                        TrackingState.PAUSED
+                    ),
                     onTrackingStateChanged = { newState ->
                         trackingManager.onAnchorTrackingStateChanged(newState)
-                    },
-                    apply = {
-                        isPositionEditable = false
-                        isEditable = false
-                        isRotationEditable = false
-                        isScaleEditable = false
                     }
                 ) {
-                    val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
-                    val safeRotX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
-                    val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
-                    val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
+                    val safeScale =
+                        if (scale.isFinite() && scale > 0f) {
+                            scale.coerceIn(0.1f, 2500.0f)
+                        } else {
+                            1.0f
+                        }
+
+                    val safeRotX =
+                        if (rotationX.isFinite()) {
+                            ((rotationX % 360f) + 360f) % 360f
+                        } else {
+                            0f
+                        }
+
+                    val safeRotY =
+                        if (rotationY.isFinite()) {
+                            ((rotationY % 360f) + 360f) % 360f
+                        } else {
+                            0f
+                        }
+
+                    val safeRotZ =
+                        if (rotationZ.isFinite()) {
+                            ((rotationZ % 360f) + 360f) % 360f
+                        } else {
+                            0f
+                        }
+
                     Node(
                         position = modelOffset,
-                        rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
+                        rotation = Rotation(
+                            x = safeRotX,
+                            y = safeRotY,
+                            z = safeRotZ
+                        ),
                         scale = Scale(safeScale)
                     ) {
                         if (isModelVisible) {
@@ -416,6 +499,7 @@ fun ARMixedRealityView(
                                             position = Position(0f, 0.04f, -0.04f)
                                         )
                                     }
+
                                     ModelItem.TOY_CAR -> {
                                         toyCarModel?.let { instance ->
                                             ModelNode(
@@ -428,18 +512,21 @@ fun ARMixedRealityView(
                                             materialInstance = pbrMaterial
                                         )
                                     }
+
                                     ModelItem.HOLO_CUBE -> {
                                         CubeNode(
                                             size = Size(0.24f, 0.24f, 0.24f),
                                             materialInstance = pbrMaterial
                                         )
                                     }
+
                                     ModelItem.QUANTUM_ORB -> {
                                         SphereNode(
                                             radius = 0.18f,
                                             materialInstance = pbrMaterial
                                         )
                                     }
+
                                     ModelItem.SPATIAL_CARD -> {
                                         CubeNode(
                                             size = Size(0.35f, 0.22f, 0.03f),
@@ -475,7 +562,10 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
             colors = CardDefaults.cardColors(
                 containerColor = Color(0xFF141923)
             ),
-            border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.4f))
+            border = BorderStroke(
+                1.dp,
+                NeonCyan.copy(alpha = 0.4f)
+            )
         ) {
             Column(
                 modifier = Modifier.padding(24.dp),
@@ -513,7 +603,10 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("grant_camera_button")
                 ) {
-                    Text("Grant Camera Permission", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Grant Camera Permission",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }
@@ -539,7 +632,10 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
             colors = CardDefaults.cardColors(
                 containerColor = Color(0xFF141923)
             ),
-            border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.5f))
+            border = BorderStroke(
+                1.dp,
+                NeonCyan.copy(alpha = 0.5f)
+            )
         ) {
             Column(
                 modifier = Modifier.padding(24.dp),
@@ -575,7 +671,10 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("install_arcore_button")
                 ) {
-                    Text("Install / Update ARCore", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Install / Update ARCore",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }
@@ -604,7 +703,10 @@ fun ARCoreUnsupportedCard(
             colors = CardDefaults.cardColors(
                 containerColor = Color(0xFF141923)
             ),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.5f))
+            border = BorderStroke(
+                1.dp,
+                Color(0xFFFF5252).copy(alpha = 0.5f)
+            )
         ) {
             Column(
                 modifier = Modifier.padding(24.dp),
@@ -616,7 +718,11 @@ fun ARCoreUnsupportedCard(
                 )
                 Spacer(modifier = Modifier.height(14.dp))
                 Text(
-                    text = if (isError) "ARCore Service Unavailable" else "ARCore Not Supported on this Device",
+                    text = if (isError) {
+                        "ARCore Service Unavailable"
+                    } else {
+                        "ARCore Not Supported on this Device"
+                    },
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
@@ -624,10 +730,11 @@ fun ARCoreUnsupportedCard(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = if (isError)
+                    text = if (isError) {
                         "An error occurred while checking AR services. You can continue inspecting the 3D model in Object mode."
-                    else
-                        "This device does not support Google ARCore physical plane tracking. You can fully explore, rotate, and scale the model in Object Mode.",
+                    } else {
+                        "This device does not support Google ARCore physical plane tracking. You can fully explore, rotate, and scale the model in Object Mode."
+                    },
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.75f),
                     textAlign = TextAlign.Center,
@@ -643,7 +750,10 @@ fun ARCoreUnsupportedCard(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("back_to_object_button")
                 ) {
-                    Text("Return to Object Mode", fontWeight = FontWeight.Bold)
+                    Text(
+                        "Return to Object Mode",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }

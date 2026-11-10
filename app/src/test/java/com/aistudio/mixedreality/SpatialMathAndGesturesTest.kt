@@ -4,6 +4,7 @@ import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
+import com.aistudio.mixedreality.ui.filterPoseWithLegacyDamping
 import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
 import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
@@ -179,5 +180,42 @@ class SpatialMathAndGesturesTest {
         assertFalse(abs(1.00002f - 1f) > 0.0001f)
         assertFalse(Float.NaN.isFinite())
         assertFalse(Float.POSITIVE_INFINITY.isFinite())
+    }
+
+    @Test
+    fun legacyDampingRejectsSubMillimeterStationaryDrift() {
+        val lastPose = Pose.makeTranslation(1.0f, 2.0f, 3.0f)
+        // 0.8mm offset (below 1.5mm deadband)
+        val jitteredPose = Pose.makeTranslation(1.0008f, 2.0f, 3.0f)
+        val filtered = filterPoseWithLegacyDamping(jitteredPose, lastPose)
+
+        // Must lock to previous translation to completely halt stationary drift
+        assertEquals(1.0f, filtered.tx(), 0.00001f)
+        assertEquals(2.0f, filtered.ty(), 0.00001f)
+        assertEquals(3.0f, filtered.tz(), 0.00001f)
+    }
+
+    @Test
+    fun legacyDampingAppliesLowPassSmoothingOnIntentionalMovement() {
+        val lastPose = Pose.makeTranslation(0.0f, 0.0f, 0.0f)
+        // 10cm movement (well above 1.5mm deadband)
+        val movedPose = Pose.makeTranslation(0.10f, 0.0f, 0.0f)
+        val filtered = filterPoseWithLegacyDamping(movedPose, lastPose, alpha = 0.35f)
+
+        // Smoothed = 0.0 + 0.35 * 0.10 = 0.035m
+        assertEquals(0.035f, filtered.tx(), 0.001f)
+        assertEquals(0.0f, filtered.ty(), 0.001f)
+        assertEquals(0.0f, filtered.tz(), 0.001f)
+    }
+
+    @Test
+    fun legacyDampingHandlesNullAndNonFiniteGracefully() {
+        val rawPose = Pose.makeTranslation(1.0f, 2.0f, 3.0f)
+        val resultNull = filterPoseWithLegacyDamping(rawPose, null)
+        assertEquals(1.0f, resultNull.tx(), 0.0001f)
+
+        val nanPose = Pose.makeTranslation(Float.NaN, 2.0f, 3.0f)
+        val resultNan = filterPoseWithLegacyDamping(nanPose, rawPose)
+        assertTrue(resultNan.tx().isNaN())
     }
 }

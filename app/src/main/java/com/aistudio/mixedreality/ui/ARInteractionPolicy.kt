@@ -135,3 +135,48 @@ internal object ZoomScalePolicy {
             .toFloat()
     }
 }
+
+/**
+ * Damps high-frequency sensor noise and micro-tremors from modern 200Hz-400Hz IMU sensors,
+ * replicating the physical damping and stability of legacy phones (Samsung A30, A30s, A20s).
+ * - Deadband (1.5mm): Rejects sub-millimeter noise when the device is stationary.
+ * - Low-Pass Filter (alpha = 0.35f): Smooths motion across frames without latency lag.
+ */
+internal fun filterPoseWithLegacyDamping(
+    rawPose: Pose,
+    lastPose: Pose?,
+    deadbandMeters: Float = 0.0015f,
+    alpha: Float = 0.35f
+): Pose {
+    if (lastPose == null) return rawPose
+    val rx = rawPose.tx()
+    val ry = rawPose.ty()
+    val rz = rawPose.tz()
+    val lx = lastPose.tx()
+    val ly = lastPose.ty()
+    val lz = lastPose.tz()
+
+    if (!rx.isFinite() || !ry.isFinite() || !rz.isFinite() ||
+        !lx.isFinite() || !ly.isFinite() || !lz.isFinite()
+    ) {
+        return rawPose
+    }
+
+    val dx = rx - lx
+    val dy = ry - ly
+    val dz = rz - lz
+    val distSq = dx * dx + dy * dy + dz * dz
+
+    // Deadband: Rejects micro-movements below 1.5mm to eliminate stationary drift
+    if (distSq < deadbandMeters * deadbandMeters) {
+        return Pose(floatArrayOf(lx, ly, lz), rawPose.rotationQuaternion)
+    }
+
+    // Low-pass exponential moving average (simulates 50-60Hz hardware damped sensor)
+    val smoothedX = lx + alpha * dx
+    val smoothedY = ly + alpha * dy
+    val smoothedZ = lz + alpha * dz
+
+    return Pose(floatArrayOf(smoothedX, smoothedY, smoothedZ), rawPose.rotationQuaternion)
+}
+

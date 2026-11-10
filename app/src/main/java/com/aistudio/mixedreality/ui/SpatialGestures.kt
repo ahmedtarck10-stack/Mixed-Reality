@@ -161,7 +161,7 @@ fun Modifier.spatialMRGestures(
                         tapCount = 0
                         val dx = currentPos.x - lastPointerPosition.x
                         val dy = currentPos.y - lastPointerPosition.y
-                        if (abs(dx) > 0.05f || abs(dy) > 0.05f) {
+                        if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
                             currentOnOneFingerRotate(dx, dy, isEdgeStart)
                         }
                         pressedChanges[0].consume()
