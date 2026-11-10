@@ -169,6 +169,22 @@ class ARTrackingManager(
             }
             if (state == TrackingState.TRACKING) {
                 lastVerifiedWorldPose = runCatching { anchor.pose }.getOrNull()
+                trackingLostSinceNanos = null
+            } else if (state == TrackingState.PAUSED || state == TrackingState.STOPPED) {
+                val lostDuration = trackingLossDurationNanos(cameraState)
+                if (shouldAttemptAnchorRecovery(cameraState, state, lostDuration, RECOVERY_GRACE_NANOS) && recoveryGate.shouldAttempt()) {
+                    val savedPose = lastVerifiedWorldPose
+                    if (savedPose != null) {
+                        val candidate = runCatching { session.createAnchor(savedPose) }.getOrNull()
+                        if (candidate != null) {
+                            if (isRecoveryCandidateAcceptable(cameraState, candidate.trackingState, savedPose, candidate.pose)) {
+                                promotePlacementAnchor(candidate, candidate.pose, onPlaced)
+                            } else {
+                                runCatching { candidate.detach() }
+                            }
+                        }
+                    }
+                }
             }
         }
 

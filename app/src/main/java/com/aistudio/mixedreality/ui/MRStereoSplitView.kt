@@ -35,6 +35,7 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
+import io.github.sceneview.ar.highestResolutionCameraConfig
 import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.loaders.EnvironmentLoader
 import io.github.sceneview.loaders.MaterialLoader
@@ -169,10 +170,48 @@ private fun MRStereoARCoreView(
 
     LaunchedEffect(Unit) {
         try {
-            arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+            val packageInstalled = runCatching {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    context.packageManager.getPackageInfo("com.google.ar.core", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    context.packageManager.getPackageInfo("com.google.ar.core", 0)
+                }
+                true
+            }.getOrDefault(false)
+
+            if (packageInstalled) {
+                arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+            } else {
+                val hasPlayStore = runCatching {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        context.packageManager.getPackageInfo("com.android.vending", android.content.pm.PackageManager.PackageInfoFlags.of(0))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.packageManager.getPackageInfo("com.android.vending", 0)
+                    }
+                    true
+                }.getOrDefault(false)
+
+                if (!hasPlayStore) {
+                    arCoreAvailability = ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
+                } else {
+                    arCoreAvailability = ArCoreApk.getInstance().checkAvailability(context)
+                }
+            }
         } catch (_: Throwable) {
             arCoreAvailability = ArCoreApk.Availability.UNKNOWN_ERROR
         }
+    }
+
+    if (arCoreAvailability == null || arCoreAvailability == ArCoreApk.Availability.UNKNOWN_CHECKING) {
+        Box(
+            modifier = modifier.fillMaxSize().background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            androidx.compose.material3.CircularProgressIndicator(color = NeonCyan)
+        }
+        return
     }
 
     if (arCoreAvailability == ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED ||
@@ -180,23 +219,31 @@ private fun MRStereoARCoreView(
     ) {
         ARCoreInstallCard(
             onInstall = {
-                if (activity != null) {
+                val hasPlayStore = runCatching {
+                    context.packageManager.getPackageInfo("com.android.vending", 0) != null
+                }.getOrDefault(false)
+
+                if (hasPlayStore && activity != null) {
                     try {
                         val installStatus = ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)
                         if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
                             userRequestedInstall = false
                         }
                     } catch (_: Throwable) {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
+                        runCatching {
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.ar.core")).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(intent)
+                        }
+                    }
+                } else {
+                    runCatching {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.ar.core")).apply {
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
                         context.startActivity(intent)
                     }
-                } else {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.ar.core")).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(intent)
                 }
             }
         )
@@ -367,6 +414,8 @@ private fun MRStereoARCoreView(
                     planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
                     updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
                     instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
+                    focusMode = Config.FocusMode.FIXED,
+                    sessionCameraConfig = ::highestResolutionCameraConfig,
                     sessionConfiguration = { _, config ->
                         config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
                         // Standard 1: FIXED focus freezes lens at infinity, stopping OIS/Laser autofocus movements and VIO drift
@@ -381,6 +430,7 @@ private fun MRStereoARCoreView(
                         config.depthMode = Config.DepthMode.DISABLED
                     },
                     planeRenderer = (activeAnchor == null),
+                    permissionHandler = null,
                     onGestureListener = null,
                     onSessionUpdated = { session, frame ->
                         trackingManager.onSessionUpdated(
@@ -398,7 +448,7 @@ private fun MRStereoARCoreView(
                     activeAnchor?.let { anchor ->
                         AnchorNode(
                             anchor = anchor,
-                            updateAnchorPose = !isAnchorLocked,
+                            updateAnchorPose = true,
                             // Keep visible in both TRACKING and PAUSED states so the model never flickers or disappears ("يختفي")
                             visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
                             onTrackingStateChanged = { newState ->

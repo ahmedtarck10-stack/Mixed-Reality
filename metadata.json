@@ -1,6 +1,6 @@
 {
   "name": "Mixed Reality",
-  "description": "3D Studio and Mixed Reality AR application with SceneView",
+  "description": "3D and Augmented Reality studio and viewer powered by SceneView",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

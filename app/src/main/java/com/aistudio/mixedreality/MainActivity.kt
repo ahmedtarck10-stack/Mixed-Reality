@@ -36,28 +36,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Lock display refresh rate to exactly 30.0f Hz on modern 120Hz/LTPO devices (Samsung S21-S26, Z Fold/Flip, A25)
-        // Standard: ARCore camera is 30fps, motion sensors read at 200Hz. 60Hz is an exact 2x multiple,
-        // eliminating frame drops and aligning timestamps between sensor and camera image.
-        try {
-            window.attributes = window.attributes.apply {
-                preferredRefreshRate  =30.0f
-            }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-                val currentDisplay = display
-                val modes = currentDisplay?.supportedModes.orEmpty()
-                val mode60 = modes.firstOrNull { kotlin.math.abs(it.refreshRate - 60.0f) < 1.0f }
-                if (mode60 != null) {
-                    window.attributes = window.attributes.apply {
-                        preferredDisplayModeId = mode60.modeId
-                        preferredRefreshRate =30.0f
-
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-            // Gracefully ignore on platforms where refresh rate override is restricted
-        }
+        // Enforce 30Hz display refresh rate strictly to eliminate sensor timestamp jitter and drifting
+        enforce30HzRefreshRate()
 
         incomingModelUri = extractModelUri(intent)
         shortcutAction = intent?.getStringExtra("shortcut_action")
@@ -116,6 +96,45 @@ class MainActivity : ComponentActivity() {
         }
         intent.getStringExtra("shortcut_action")?.let { action ->
             shortcutAction = action
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        enforce30HzRefreshRate()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            enforce30HzRefreshRate()
+        }
+    }
+
+    private fun enforce30HzRefreshRate() {
+        // Enforce display refresh rate strictly to 30.0f Hz (mandatory) to eliminate timestamp jitter and drifting
+        // Modern 120Hz/LTPO devices (Samsung Galaxy S21-S26, Z Fold/Flip, A25) mismatch ARCore camera (30fps)
+        // and motion sensors (~200Hz).
+        // Enforcing 30Hz synchronizes frame presentation and VIO sensor timestamps directly.
+        try {
+            window.attributes = window.attributes.apply {
+                preferredRefreshRate = 30.0f
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                val currentDisplay = display
+                val modes = currentDisplay?.supportedModes.orEmpty()
+                // Pick 30Hz native mode if available on variable refresh rate / LTPO panels, or 60Hz integer multiple fallback
+                val mode30 = modes.firstOrNull { kotlin.math.abs(it.refreshRate - 30.0f) < 1.0f }
+                val targetMode = mode30 ?: modes.firstOrNull { kotlin.math.abs(it.refreshRate - 60.0f) < 1.0f }
+                if (targetMode != null) {
+                    window.attributes = window.attributes.apply {
+                        preferredDisplayModeId = targetMode.modeId
+                        preferredRefreshRate = 30.0f
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // Gracefully ignore on platforms where refresh rate override is restricted
         }
     }
 
