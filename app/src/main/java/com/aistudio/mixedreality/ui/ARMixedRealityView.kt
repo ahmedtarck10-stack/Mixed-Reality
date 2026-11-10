@@ -95,6 +95,7 @@ fun ARMixedRealityView(
     clearTrigger: Int = 0,
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
+    activeRotationAxis: RotationAxis = RotationAxis.ALL,
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
     onStopAutoRotate: () -> Unit = {},
@@ -114,6 +115,10 @@ fun ARMixedRealityView(
     )
     val activeAnchor = trackingManager.activeAnchor
 
+    // Anti-Drift Stabilization Controls (Optimized for modern Samsung Galaxy S21-S26, Ultra, Fold, Flip, A25)
+    var isFixedFocusEnabled by remember { mutableStateOf(true) }
+    var isAnchorLocked by remember { mutableStateOf(false) }
+
     var modelOffset by remember { mutableStateOf(Position(0f, 0f, 0f)) }
 
     // Clear anchor on clear trigger
@@ -121,6 +126,7 @@ fun ARMixedRealityView(
         if (clearTrigger > 0) {
             trackingManager.clear()
             modelOffset = Position(0f, 0f, 0f)
+            isAnchorLocked = false
         }
     }
 
@@ -219,6 +225,7 @@ fun ARMixedRealityView(
             .spatialMRGestures(
                 scope = scope,
                 isMoveMode = isMoveMode,
+                activeAxis = activeRotationAxis,
                 onSingleTap = { tapOffset ->
                     trackingManager.onSingleTap(tapOffset, isModelVisible)
                 },
@@ -228,13 +235,21 @@ fun ARMixedRealityView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx, dy ->
+                onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
-                    val newRotY = ((rotationY + dx * 0.45f) % 360f + 360f) % 360f
-                    onRotationYChange(newRotY)
-
-                    val newRotX = ((rotationX + dy * 0.45f) % 360f + 360f) % 360f
-                    onRotationXChange(newRotX)
+                    applyRotationDelta(
+                        axis = activeRotationAxis,
+                        dx = dx,
+                        dy = dy,
+                        isEdgeDrag = isEdgeDrag,
+                        currentRotX = rotationX,
+                        currentRotY = rotationY,
+                        currentRotZ = rotationZ,
+                        onRotX = onRotationXChange,
+                        onRotY = onRotationYChange,
+                        onRotZ = onRotationZChange,
+                        sensitivity = 0.45f
+                    )
                 },
                 onTwoFingerRotateZ = { dAngle ->
                     val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
@@ -262,12 +277,19 @@ fun ARMixedRealityView(
             environmentLoader = environmentLoader,
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
-            instantPlacementMode = Config.InstantPlacementMode.DISABLED,
+            instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
             sessionConfiguration = { _, config ->
                 config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
+                // Standard 1: FIXED focus freezes lens at infinity, stopping OIS/Laser autofocus movements and VIO drift
+                config.focusMode = Config.FocusMode.FIXED
+                // Standard 2: LATEST_CAMERA_IMAGE binds ARCore lifecycle strictly to camera 30fps cadence rather than screen
                 config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-                config.focusMode = Config.FocusMode.AUTO
-                config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+                // Standard 3: LOCAL_Y_UP enables instant 0.1s model drop without waiting for full polygonal floor mesh
+                config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+                // Standard 4: DISABLED light estimation prevents brightness flashing/blooming ("ينور") on sensor shifts
+                config.lightEstimationMode = Config.LightEstimationMode.DISABLED
+                // Standard 5: DISABLED depth mode prevents uncalibrated ToF/stereo sensor noise from warping floor height
+                config.depthMode = Config.DepthMode.DISABLED
             },
             planeRenderer = (activeAnchor == null),
             onGestureListener = null,
@@ -278,6 +300,7 @@ fun ARMixedRealityView(
                     isModelVisible = isModelVisible,
                     onPlaced = {
                         modelOffset = Position(0f, 0f, 0f)
+                        isAnchorLocked = true // Automatically lock position on floor to eliminate drift
                     }
                 )
             }
@@ -285,8 +308,9 @@ fun ARMixedRealityView(
             activeAnchor?.let { anchor ->
                 AnchorNode(
                     anchor = anchor,
-                    updateAnchorPose = true,
-                    visibleTrackingStates = setOf(TrackingState.TRACKING),
+                    updateAnchorPose = !isAnchorLocked,
+                    // Keep visible in both TRACKING and PAUSED states so the model never flickers or disappears ("يختفي")
+                    visibleTrackingStates = setOf(TrackingState.TRACKING, TrackingState.PAUSED),
                     onTrackingStateChanged = { newState ->
                         trackingManager.onAnchorTrackingStateChanged(newState)
                     },
@@ -423,6 +447,66 @@ fun ARMixedRealityView(
                         style = MaterialTheme.typography.labelSmall,
                         color = Color.White
                     )
+                }
+
+                if (activeAnchor != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Position Lock Toggle (Freezes pose to kill drift on Samsung flagships)
+                        Surface(
+                            onClick = {
+                                isAnchorLocked = !isAnchorLocked
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isAnchorLocked) NeonGreen.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.12f),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (isAnchorLocked) NeonGreen else Color.White.copy(alpha = 0.3f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (isAnchorLocked) "🔒 Locked (Drift Shield ON)" else "🔓 Lock Position",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isAnchorLocked) NeonGreen else Color.White
+                                )
+                            }
+                        }
+
+                        // Fixed Focus Toggle (Fixed is default to prevent OIS focal length shifts)
+                        Surface(
+                            onClick = {
+                                isFixedFocusEnabled = !isFixedFocusEnabled
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            },
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isFixedFocusEnabled) NeonCyan.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.12f),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (isFixedFocusEnabled) NeonCyan else Color.White.copy(alpha = 0.3f)
+                            )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (isFixedFocusEnabled) "🎯 Fixed Focus" else "🔍 Auto Focus",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Normal,
+                                    color = if (isFixedFocusEnabled) NeonCyan else Color.White.copy(alpha = 0.85f)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

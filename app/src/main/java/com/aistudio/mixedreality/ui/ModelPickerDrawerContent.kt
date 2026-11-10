@@ -43,6 +43,12 @@ fun ModelPickerDrawerContent(
     onRoughnessChange: (Float) -> Unit,
     scale: Float,
     onScaleChange: (Float) -> Unit,
+    rotationX: Float = 0f,
+    onRotationXChange: (Float) -> Unit = {},
+    rotationY: Float = 0f,
+    onRotationYChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
     isAutoRotating: Boolean,
     onToggleAutoRotate: () -> Unit,
     onClose: () -> Unit
@@ -268,7 +274,117 @@ fun ModelPickerDrawerContent(
             )
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // 3D SPATIAL ROTATION (360° ON ALL AXES)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "3D ROTATION (360° SPATIAL)",
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                color = TextSecondary
+            )
+            TextButton(
+                onClick = {
+                    onRotationXChange(0f)
+                    onRotationYChange(0f)
+                    onRotationZChange(0f)
+                },
+                contentPadding = PaddingValues(0.dp)
+            ) {
+                Text("Reset 0°", color = NeonCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        val safeX = ((rotationX % 360f) + 360f) % 360f
+        val safeY = ((rotationY % 360f) + 360f) % 360f
+        val safeZ = ((rotationZ % 360f) + 360f) % 360f
+
+        // Rotation X (Pitch)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Pitch (X)",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
+                modifier = Modifier.width(70.dp)
+            )
+            Slider(
+                value = safeX,
+                onValueChange = { onRotationXChange(it) },
+                valueRange = 0f..360f,
+                modifier = Modifier.weight(1f),
+                colors = SliderDefaults.colors(thumbColor = NeonCyan, activeTrackColor = NeonCyan)
+            )
+            Text(
+                text = "${safeX.toInt()}°",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextPrimary,
+                modifier = Modifier.width(40.dp),
+                textAlign = TextAlign.End
+            )
+        }
+
+        // Rotation Y (Yaw)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Yaw (Y)",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
+                modifier = Modifier.width(70.dp)
+            )
+            Slider(
+                value = safeY,
+                onValueChange = { onRotationYChange(it) },
+                valueRange = 0f..360f,
+                modifier = Modifier.weight(1f),
+                colors = SliderDefaults.colors(thumbColor = NeonCyan, activeTrackColor = NeonCyan)
+            )
+            Text(
+                text = "${safeY.toInt()}°",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextPrimary,
+                modifier = Modifier.width(40.dp),
+                textAlign = TextAlign.End
+            )
+        }
+
+        // Rotation Z (Roll)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Roll (Z)",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
+                modifier = Modifier.width(70.dp)
+            )
+            Slider(
+                value = safeZ,
+                onValueChange = { onRotationZChange(it) },
+                valueRange = 0f..360f,
+                modifier = Modifier.weight(1f),
+                colors = SliderDefaults.colors(thumbColor = NeonCyan, activeTrackColor = NeonCyan)
+            )
+            Text(
+                text = "${safeZ.toInt()}°",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextPrimary,
+                modifier = Modifier.width(40.dp),
+                textAlign = TextAlign.End
+            )
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Auto rotate switch
         Row(

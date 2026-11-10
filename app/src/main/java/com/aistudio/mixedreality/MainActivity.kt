@@ -35,6 +35,29 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Lock display refresh rate to exactly 60.0f Hz on modern 120Hz/LTPO devices (Samsung S21-S26, Z Fold/Flip, A25)
+        // Standard: ARCore camera is 30fps, motion sensors read at 200Hz. 60Hz is an exact 2x multiple,
+        // eliminating frame drops and aligning timestamps between sensor and camera image.
+        try {
+            window.attributes = window.attributes.apply {
+                preferredRefreshRate = 60.0f
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                val currentDisplay = display
+                val modes = currentDisplay?.supportedModes.orEmpty()
+                val mode60 = modes.firstOrNull { kotlin.math.abs(it.refreshRate - 60.0f) < 1.0f }
+                if (mode60 != null) {
+                    window.attributes = window.attributes.apply {
+                        preferredDisplayModeId = mode60.modeId
+                        preferredRefreshRate = 60.0f
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // Gracefully ignore on platforms where refresh rate override is restricted
+        }
+
         incomingModelUri = extractModelUri(intent)
         shortcutAction = intent?.getStringExtra("shortcut_action")
 

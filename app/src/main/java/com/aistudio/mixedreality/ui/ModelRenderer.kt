@@ -147,6 +147,7 @@ fun SceneScope.Render3DModel(
                     ModelNode(
                         modelInstance = instance,
                         scaleToUnits = 1.2f,
+                        centerOrigin = Position(0f, 0f, 0f),
                         autoAnimate = true
                     )
                 } ?: CubeNode(

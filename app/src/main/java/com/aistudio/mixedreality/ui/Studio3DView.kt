@@ -72,6 +72,7 @@ fun Studio3DView(
     onRotationZChange: (Float) -> Unit = {},
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
+    activeRotationAxis: RotationAxis = RotationAxis.ALL,
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
     onStopAutoRotate: () -> Unit = {},
@@ -146,6 +147,7 @@ fun Studio3DView(
             .spatialMRGestures(
                 scope = scope,
                 isMoveMode = isMoveMode,
+                activeAxis = activeRotationAxis,
                 onSingleTap = { tapOffset ->
                     if (!isModelVisible) return@spatialMRGestures
                     onStopAutoRotate()
@@ -167,13 +169,21 @@ fun Studio3DView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
-                onOneFingerRotate = { dx, dy ->
+                onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
-                    val newRotY = ((rotationY + dx * 0.35f) % 360f + 360f) % 360f
-                    onRotationYChange(newRotY)
-
-                    val newRotX = ((rotationX + dy * 0.35f) % 360f + 360f) % 360f
-                    onRotationXChange(newRotX)
+                    applyRotationDelta(
+                        axis = activeRotationAxis,
+                        dx = dx,
+                        dy = dy,
+                        isEdgeDrag = isEdgeDrag,
+                        currentRotX = rotationX,
+                        currentRotY = rotationY,
+                        currentRotZ = rotationZ,
+                        onRotX = onRotationXChange,
+                        onRotY = onRotationYChange,
+                        onRotZ = onRotationZChange,
+                        sensitivity = 0.45f
+                    )
                 },
                 onTwoFingerRotateZ = { dAngle ->
                     val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f

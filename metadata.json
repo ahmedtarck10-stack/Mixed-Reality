@@ -1,10 +1,6 @@
 {
   "name": "Mixed Reality",
-  "description": "Mixed Reality and AR experience with 3D model viewing and ARCore plane tracking.",
-  "requestFramePermissions": [
-    "android.permission.CAMERA"
-  ],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "description": "3D Studio and Mixed Reality AR application with SceneView",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

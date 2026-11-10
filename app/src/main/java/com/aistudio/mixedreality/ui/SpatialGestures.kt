@@ -29,7 +29,9 @@ private fun angleDegrees(p1: Offset, p2: Offset): Float {
 /**
  * Spatial Gesture Modifier for MR / 3D / AR operations:
  * - One tap: Anchor / place model onto the real floor or scene.
- * - One finger drag: 360-degree rotation across X (pitch) and Y (yaw) axes.
+ * - One finger drag: 360-degree rotation across X, Y, and Z axes.
+ *     • Center drag: 360° rotation on X (pitch) and Y (yaw).
+ *     • Screen edge drag (outer 15% width): Direct 1-finger 360° roll on Z-axis!
  * - Two fingers:
  *     • Zoom (scale 0.1x to 2500x) when in Zoom mode.
  *     • Move (translate 3D position) when in Move mode.
@@ -41,15 +43,17 @@ private fun angleDegrees(p1: Offset, p2: Offset): Float {
 fun Modifier.spatialMRGestures(
     scope: CoroutineScope,
     isMoveMode: Boolean,
+    activeAxis: RotationAxis = RotationAxis.ALL,
     onSingleTap: (Offset) -> Unit,
     onDoubleTap: () -> Unit,
     onTripleTap: () -> Unit,
-    onOneFingerRotate: (dx: Float, dy: Float) -> Unit,
+    onOneFingerRotate: (dx: Float, dy: Float, isEdgeDrag: Boolean) -> Unit,
     onTwoFingerZoom: (zoomMultiplier: Float) -> Unit,
     onTwoFingerRotateZ: (deltaAngle: Float) -> Unit = {},
     onMove: (panX: Float, panY: Float) -> Unit
 ): Modifier {
     val currentIsMoveMode by rememberUpdatedState(isMoveMode)
+    val currentActiveAxis by rememberUpdatedState(activeAxis)
     val currentOnSingleTap by rememberUpdatedState(onSingleTap)
     val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
     val currentOnTripleTap by rememberUpdatedState(onTripleTap)
@@ -73,6 +77,7 @@ fun Modifier.spatialMRGestures(
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val downTime = System.currentTimeMillis()
             val downOffset = down.position
+            val isEdgeStart = (downOffset.x < size.width * 0.14f || downOffset.x > size.width * 0.86f)
             var isGestureDrag = false
             var lastPointerPosition = downOffset
             var prevCentroid = downOffset
@@ -157,7 +162,7 @@ fun Modifier.spatialMRGestures(
                         val dx = currentPos.x - lastPointerPosition.x
                         val dy = currentPos.y - lastPointerPosition.y
                         if (abs(dx) > 0.05f || abs(dy) > 0.05f) {
-                            currentOnOneFingerRotate(dx, dy)
+                            currentOnOneFingerRotate(dx, dy, isEdgeStart)
                         }
                         pressedChanges[0].consume()
                     }
@@ -199,7 +204,7 @@ fun Modifier.spatialMRGestures(
                         var angleDiff = currentAngle - prevAngle
                         while (angleDiff < -180f) angleDiff += 360f
                         while (angleDiff > 180f) angleDiff -= 360f
-                        if (abs(angleDiff) > 0.35f && abs(angleDiff) < 60f) {
+                        if (abs(angleDiff) > 0.25f && abs(angleDiff) < 60f) {
                             currentOnTwoFingerRotateZ(angleDiff)
                         }
                     }

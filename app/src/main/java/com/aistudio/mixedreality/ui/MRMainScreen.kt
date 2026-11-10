@@ -98,8 +98,12 @@ fun MRMainScreen(
     var rotationY by remember { mutableFloatStateOf(0f) }
     var rotationX by remember { mutableFloatStateOf(0f) }
     var rotationZ by remember { mutableFloatStateOf(0f) }
+    var activeRotationAxis by remember { mutableStateOf(RotationAxis.ALL) }
 
-    // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
+    // Open Source Chooser Sheet (Long press on Open)
+    var showOpenSourceChooser by remember { mutableStateOf(false) }
+
+    // Cloud 3D Library Sheet (Google Drive Models)
     var showCloudLibrary by remember { mutableStateOf(false) }
 
     // Handle incoming 3D model files from external apps / file manager
@@ -256,6 +260,7 @@ fun MRMainScreen(
                     onRotationZChange = { rotationZ = it },
                     isMoveMode = isMoveMode,
                     onToggleMoveMode = { isMoveMode = !isMoveMode },
+                    activeRotationAxis = activeRotationAxis,
                     isFullScreen = isFullScreen,
                     onToggleFullScreen = { isFullScreen = !isFullScreen },
                     onStopAutoRotate = { isAutoRotating = false },
@@ -289,6 +294,7 @@ fun MRMainScreen(
                         clearTrigger = clearTrigger,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
+                        activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
                         onStopAutoRotate = { isAutoRotating = false },
@@ -333,6 +339,7 @@ fun MRMainScreen(
                         clearTrigger = clearTrigger,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
+                        activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
                         onStopAutoRotate = { isAutoRotating = false },
@@ -401,6 +408,25 @@ fun MRMainScreen(
             )
         }
 
+        // --- 4. 360° SPATIAL ROTATION QUICK CONTROLLER (X, Y, Z) ---
+        if (isModelVisible && !isFullScreen) {
+            SpatialRotationController(
+                rotationX = rotationX,
+                onRotationXChange = { rotationX = it },
+                rotationY = rotationY,
+                onRotationYChange = { rotationY = it },
+                rotationZ = rotationZ,
+                onRotationZChange = { rotationZ = it },
+                activeAxis = activeRotationAxis,
+                onActiveAxisChange = { activeRotationAxis = it },
+                onStopAutoRotate = { isAutoRotating = false },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(top = 16.dp, end = 16.dp)
+            )
+        }
+
         // --- 5. BOTTOM FLOATING CONTROL PILL (PHOTO | ● REC | Open | Clear) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
         androidx.compose.animation.AnimatedVisibility(
@@ -455,6 +481,9 @@ fun MRMainScreen(
                     // Requirement 4: Clicking Open goes to Files to pick a 3D model (.glb / .gltf / .usdz / .obj)
                     filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
                 },
+                onOpenLongClick = {
+                    showOpenSourceChooser = true
+                },
                 onOpenCloudLibrary = {
                     showCloudLibrary = true
                 },
@@ -505,6 +534,12 @@ fun MRMainScreen(
                     onRoughnessChange = { roughness = it },
                     scale = scaleFactor,
                     onScaleChange = { scaleFactor = it },
+                    rotationX = rotationX,
+                    onRotationXChange = { rotationX = it },
+                    rotationY = rotationY,
+                    onRotationYChange = { rotationY = it },
+                    rotationZ = rotationZ,
+                    onRotationZChange = { rotationZ = it },
                     isAutoRotating = isAutoRotating,
                     onToggleAutoRotate = { isAutoRotating = !isAutoRotating },
                     onClose = { showTuneDrawer = false }
@@ -512,7 +547,23 @@ fun MRMainScreen(
             }
         }
 
-        // --- 8. CLOUD 3D MODEL LIBRARY SHEET (LONG PRESS OPEN 3-5s) ---
+        // --- 8. OPEN SOURCE CHOOSER SHEET (LONG PRESS ON OPEN) ---
+        if (showOpenSourceChooser) {
+            OpenSourceChooserSheet(
+                onDismiss = { showOpenSourceChooser = false },
+                onOpenLocalFiles = {
+                    filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
+                },
+                onOpenCloudDrive = {
+                    openAhmedTarckCloudDrive(context)
+                },
+                onOpenCloudLibrarySheet = {
+                    showCloudLibrary = true
+                }
+            )
+        }
+
+        // --- 9. CLOUD 3D MODEL LIBRARY SHEET ---
         if (showCloudLibrary) {
             CloudLibrarySheet(
                 onDismiss = { showCloudLibrary = false },
@@ -684,6 +735,7 @@ fun BottomControlBar(
     onPhotoClick: () -> Unit,
     onRecClick: () -> Unit,
     onOpenClick: () -> Unit,
+    onOpenLongClick: () -> Unit = {},
     onOpenCloudLibrary: () -> Unit = {},
     onClearClick: () -> Unit
 ) {
@@ -814,7 +866,7 @@ fun BottomControlBar(
                 }
             }
 
-            // 3. Open (Short Tap: System Local File Picker | Hold 3-5 seconds: Cloud 3D Library)
+            // 3. Open (Short Tap: System Local File Picker | Long Press: Open / Cloud Chooser)
             var isHoldingOpen by remember { mutableStateOf(false) }
             var holdProgress by remember { mutableFloatStateOf(0f) }
 
@@ -826,24 +878,24 @@ fun BottomControlBar(
                             awaitFirstDown(requireUnconsumed = false)
                             val downTime = System.currentTimeMillis()
                             isHoldingOpen = true
-                            var triggeredCloud = false
+                            var triggeredLongPress = false
 
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val elapsed = System.currentTimeMillis() - downTime
-                                holdProgress = (elapsed / 3200f).coerceIn(0f, 1f)
+                                holdProgress = (elapsed / 450f).coerceIn(0f, 1f)
 
-                                if (!triggeredCloud && elapsed >= 3200L) {
-                                    triggeredCloud = true
+                                if (!triggeredLongPress && elapsed >= 450L) {
+                                    triggeredLongPress = true
                                     isHoldingOpen = false
                                     holdProgress = 0f
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    onOpenCloudLibrary()
+                                    onOpenLongClick()
                                     break
                                 }
 
                                 if (event.changes.all { !it.pressed }) {
-                                    if (!triggeredCloud) {
+                                    if (!triggeredLongPress) {
                                         onOpenClick()
                                     }
                                     isHoldingOpen = false
@@ -869,7 +921,7 @@ fun BottomControlBar(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (isHoldingOpen && holdProgress > 0.25f) "Cloud ☁️" else "Open",
+                    text = if (isHoldingOpen && holdProgress > 0.30f) "Cloud ☁️" else "Open",
                     color = if (isHoldingOpen) NeonCyan else Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 13.sp

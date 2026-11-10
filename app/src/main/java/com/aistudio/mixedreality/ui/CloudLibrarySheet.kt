@@ -225,10 +225,7 @@ fun CloudLibrarySheet(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable {
-                        val driveIntent = Intent(Intent.ACTION_VIEW, Uri.parse(CLOUD_DRIVE_LIBRARY_URL)).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(driveIntent)
+                        openAhmedTarckCloudDrive(context)
                     }
                     .testTag("open_google_drive_button")
             ) {

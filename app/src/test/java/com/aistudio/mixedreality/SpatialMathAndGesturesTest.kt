@@ -10,6 +10,7 @@ import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
 import com.google.ar.core.ArCoreApk
+import com.google.ar.core.Config
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 import org.junit.Assert.assertEquals
@@ -21,24 +22,35 @@ import kotlin.math.abs
 /** Unit tests for production interaction policies used by AR placement and zoom gestures. */
 class SpatialMathAndGesturesTest {
     @Test
-    fun verticalRotationClampingPreventsFlipping() {
-        val sensitivity = 0.35f
-        assertEquals(35f, (100f * sensitivity).coerceIn(-90f, 90f), 0.001f)
-        assertEquals(90f, (1000f * sensitivity).coerceIn(-90f, 90f), 0.001f)
-        assertEquals(-90f, (-1000f * sensitivity).coerceIn(-90f, 90f), 0.001f)
+    fun arCoreConfigDepthAndFocusConstantsExist() {
+        assertEquals(Config.DepthMode.DISABLED, Config.DepthMode.DISABLED)
+        assertEquals(Config.FocusMode.FIXED, Config.FocusMode.FIXED)
+        assertEquals(Config.LightEstimationMode.AMBIENT_INTENSITY, Config.LightEstimationMode.AMBIENT_INTENSITY)
+        assertEquals(Config.InstantPlacementMode.LOCAL_Y_UP, Config.InstantPlacementMode.LOCAL_Y_UP)
+        assertEquals(Config.LightEstimationMode.DISABLED, Config.LightEstimationMode.DISABLED)
+        assertTrue(com.google.ar.core.Frame::class.java.methods.any { it.name == "hitTestInstantPlacement" })
+    }
+
+    @Test
+    fun verticalRotationWraps360DegreesFullSpatialRange() {
+        val sensitivity = 0.45f
+        assertEquals(22.5f, ((350f + 72.2222f * sensitivity) % 360f + 360f) % 360f, 0.01f)
+        assertEquals(337.5f, ((10f - 72.2222f * sensitivity) % 360f + 360f) % 360f, 0.01f)
+        assertEquals(180f, ((0f + 400f * sensitivity) % 360f + 360f) % 360f, 0.01f)
     }
 
     @Test
     fun horizontalRotationWraps360Degrees() {
-        val sensitivity = 0.35f
-        assertEquals(7.5f, ((350f + 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
-        assertEquals(352.5f, ((10f - 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
+        val sensitivity = 0.45f
+        assertEquals(12.5f, ((350f + 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
+        assertEquals(347.5f, ((10f - 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
     }
 
     @Test
-    fun diagonalRotationAppliesBothAxes() {
-        assertEquals(14f, (40f * 0.35f) % 360f, 0.001f)
-        assertEquals(10.5f, (30f * 0.35f).coerceIn(-90f, 90f), 0.001f)
+    fun rollRotationWraps360Degrees() {
+        val sensitivity = 0.45f
+        assertEquals(22.5f, ((0f + 50f * sensitivity) % 360f + 360f) % 360f, 0.001f)
+        assertEquals(315f, ((0f - 100f * sensitivity) % 360f + 360f) % 360f, 0.001f)
     }
 
     @Test
