@@ -238,7 +238,13 @@ class ARTrackingManager(
                 )
 
                 if (verifiedPose != null) {
-                    lastVerifiedWorldPose = verifiedPose
+                    val dampedPose = filterPoseWithLegacyDamping(
+                        rawPose = verifiedPose,
+                        lastPose = lastVerifiedWorldPose,
+                        deadbandMeters = 0.0015f,
+                        alpha = 0.35f
+                    )
+                    lastVerifiedWorldPose = dampedPose
                     trackingLostSinceNanos = null
                     recoveryGate.reset()
                 }

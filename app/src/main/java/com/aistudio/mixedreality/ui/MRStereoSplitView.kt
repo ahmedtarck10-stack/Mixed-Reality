@@ -509,7 +509,7 @@ private fun MRStereoARCoreView(
                     activeAnchor?.let { anchor ->
                         AnchorNode(
                             anchor = anchor,
-                            updateAnchorPose = true,
+                            updateAnchorPose = !isAnchorLocked,
                             visibleTrackingStates = setOf(
                                 TrackingState.TRACKING,
                                 TrackingState.PAUSED
