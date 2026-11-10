@@ -138,6 +138,9 @@ fun MRMainScreen(
     // Bottom sheet for model tuning / presets
     var showTuneDrawer by remember { mutableStateOf(false) }
 
+    // AR Tracking Test & Diagnostics dialog
+    var showARDiagnosticsDialog by remember { mutableStateOf(false) }
+
     // Shutter flash animation
     var showFlash by remember { mutableStateOf(false) }
 
@@ -408,7 +411,36 @@ fun MRMainScreen(
             )
         }
 
-        // --- 4. 360° SPATIAL ROTATION QUICK CONTROLLER (X, Y, Z) ---
+        // --- 4. AR TRACKING TEST BUTTON (Top-left floating chip) ---
+        if (!isFullScreen) {
+            Surface(
+                onClick = { showARDiagnosticsDialog = true },
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xCC10141D),
+                border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.6f)),
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(top = 16.dp, start = 16.dp)
+                    .testTag("main_ar_test_button")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("🧪", fontSize = 13.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "AR Test",
+                        color = NeonCyan,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // --- 5. 360° SPATIAL ROTATION QUICK CONTROLLER (X, Y, Z) ---
         if (isModelVisible && !isFullScreen) {
             SpatialRotationController(
                 rotationX = rotationX,
@@ -576,6 +608,19 @@ fun MRMainScreen(
                         selectedMode = ViewportMode.OBJECT
                         Toast.makeText(context, "Loaded from Cloud: $title", Toast.LENGTH_SHORT).show()
                     }
+                }
+            )
+        }
+
+        // --- 10. AR TRACKING TEST & DIAGNOSTICS DIALOG ---
+        if (showARDiagnosticsDialog) {
+            ARTrackingDiagnosticsDialog(
+                trackingManager = null,
+                isRealARCoreAvailable = isARCoreAvailable,
+                onDismiss = { showARDiagnosticsDialog = false },
+                onLaunchTestMode = {
+                    showARDiagnosticsDialog = false
+                    selectedMode = ViewportMode.AR
                 }
             )
         }

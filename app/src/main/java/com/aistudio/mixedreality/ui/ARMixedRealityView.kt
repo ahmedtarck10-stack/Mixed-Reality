@@ -7,6 +7,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -15,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -201,6 +203,42 @@ fun ARMixedRealityView(
     val context = LocalContext.current
     val activity = context as? Activity
 
+    var isTestSimulationMode by remember { mutableStateOf(false) }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+
+    if (isTestSimulationMode) {
+        ARTrackingSimulationView(
+            modelItem = modelItem,
+            customModelFile = customModelFile,
+            isModelVisible = isModelVisible,
+            color = color,
+            metallic = metallic,
+            roughness = roughness,
+            scale = scale,
+            onScaleChange = onScaleChange,
+            rotationY = rotationY,
+            onRotationYChange = onRotationYChange,
+            rotationX = rotationX,
+            onRotationXChange = onRotationXChange,
+            rotationZ = rotationZ,
+            onRotationZChange = onRotationZChange,
+            clearTrigger = clearTrigger,
+            isMoveMode = isMoveMode,
+            onToggleMoveMode = onToggleMoveMode,
+            activeRotationAxis = activeRotationAxis,
+            isFullScreen = isFullScreen,
+            onToggleFullScreen = onToggleFullScreen,
+            onStopAutoRotate = onStopAutoRotate,
+            onFallbackToObject = onFallbackToObject,
+            engine = engine,
+            modelLoader = modelLoader,
+            materialLoader = materialLoader,
+            environmentLoader = environmentLoader,
+            modifier = modifier
+        )
+        return
+    }
+
     var arCoreAvailability by remember {
         mutableStateOf<ArCoreApk.Availability?>(null)
     }
@@ -345,11 +383,21 @@ fun ARMixedRealityView(
     ) {
         ARCoreUnsupportedCard(
             onBackToObject = onFallbackToObject,
+            onStartTestMode = { isTestSimulationMode = true },
+            onOpenDiagnostics = { showDiagnosticsDialog = true },
             isError = (
                 arCoreAvailability !=
                     ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
             )
         )
+        if (showDiagnosticsDialog) {
+            ARTrackingDiagnosticsDialog(
+                trackingManager = trackingManager,
+                isRealARCoreAvailable = false,
+                onDismiss = { showDiagnosticsDialog = false },
+                onLaunchTestMode = { isTestSimulationMode = true }
+            )
+        }
         return
     }
 
@@ -561,6 +609,159 @@ fun ARMixedRealityView(
                 }
             }
         }
+
+        // --- OVERLAYS ---
+
+        // 1. Move Mode Active Banner
+        if (isMoveMode) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = NeonCyan,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 68.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("✋", fontSize = 13.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Move mode active • Double-tap to return to rotate",
+                        color = Color.Black,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        } else if (isModelVisible) {
+            // 2. Real-Time HUD Status Badge
+            val (hudText, hudColor) = trackingManager.getHudStatus()
+
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 68.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .background(
+                            Color.Black.copy(alpha = 0.65f),
+                            RoundedCornerShape(20.dp)
+                        )
+                        .border(
+                            1.dp,
+                            hudColor.copy(alpha = 0.7f),
+                            RoundedCornerShape(20.dp)
+                        )
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .testTag("ar_tracking_hud_badge")
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(hudColor)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = hudText,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                if (activeAnchor != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Surface(
+                            onClick = {
+                                isAnchorLocked = !isAnchorLocked
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (isAnchorLocked) Color(0x99000000) else Color(0xCC00E5FF),
+                            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = if (isAnchorLocked) "🔒 Anchor Locked" else "🔓 Anchor Unlocked",
+                                color = if (isAnchorLocked) NeonCyan else Color.Black,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                            )
+                        }
+
+                        Surface(
+                            onClick = {
+                                trackingManager.clear()
+                                modelOffset = Position(0f, 0f, 0f)
+                                isAnchorLocked = false
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color(0x99000000),
+                            border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = "↺ Reset Anchor",
+                                color = Color(0xFFFF5252),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Diagnostics & Test Mode Button (Top-left floating chip)
+        Surface(
+            onClick = { showDiagnosticsDialog = true },
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xCC141E2D),
+            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.6f)),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .statusBarsPadding()
+                .padding(top = if (isFullScreen) 16.dp else 68.dp, start = 16.dp)
+                .testTag("ar_test_diagnostics_button")
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🧪", fontSize = 13.sp)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "AR Test",
+                    color = NeonCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // 4. Diagnostics Dialog
+        if (showDiagnosticsDialog) {
+            ARTrackingDiagnosticsDialog(
+                trackingManager = trackingManager,
+                isRealARCoreAvailable = true,
+                onDismiss = { showDiagnosticsDialog = false }
+            )
+        }
     }
 }
 
@@ -704,10 +905,13 @@ fun ARCoreInstallCard(onInstall: () -> Unit) {
 
 /**
  * Clean fallback card displayed when the device hardware or emulator does not support ARCore.
+ * Allows running interactive AR Tracking Test Mode and comprehensive diagnostics.
  */
 @Composable
 fun ARCoreUnsupportedCard(
     onBackToObject: () -> Unit,
+    onStartTestMode: (() -> Unit)? = null,
+    onOpenDiagnostics: (() -> Unit)? = null,
     isError: Boolean = false
 ) {
     Box(
@@ -719,14 +923,14 @@ fun ARCoreUnsupportedCard(
         Card(
             modifier = Modifier
                 .padding(24.dp)
-                .fillMaxWidth(0.88f),
+                .fillMaxWidth(0.92f),
             shape = RoundedCornerShape(24.dp),
             colors = CardDefaults.cardColors(
                 containerColor = Color(0xFF141923)
             ),
             border = BorderStroke(
                 1.dp,
-                Color(0xFFFF5252).copy(alpha = 0.5f)
+                if (isError) Color(0xFFFF5252).copy(alpha = 0.5f) else NeonCyan.copy(alpha = 0.5f)
             )
         ) {
             Column(
@@ -734,7 +938,7 @@ fun ARCoreUnsupportedCard(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = if (isError) "⚠️" else "📱",
+                    text = if (isError) "⚠️" else "🥽",
                     fontSize = 42.sp
                 )
                 Spacer(modifier = Modifier.height(14.dp))
@@ -742,7 +946,7 @@ fun ARCoreUnsupportedCard(
                     text = if (isError) {
                         "ARCore Service Unavailable"
                     } else {
-                        "ARCore Not Supported on this Device"
+                        "ARCore Not Supported / Emulator"
                     },
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Bold,
@@ -752,28 +956,67 @@ fun ARCoreUnsupportedCard(
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (isError) {
-                        "An error occurred while checking AR services. You can continue inspecting the 3D model in Object mode."
+                        "An error occurred while checking AR services. You can continue testing AR tracking in simulation mode."
                     } else {
-                        "This device does not support Google ARCore physical plane tracking. You can fully explore, rotate, and scale the model in Object Mode."
+                        "Physical plane tracking requires hardware ARCore. You can run the interactive AR Tracking Test Mode with simulated plane detection, damping & tap placement."
                     },
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.75f),
                     textAlign = TextAlign.Center,
                     lineHeight = 19.sp
                 )
-                Spacer(modifier = Modifier.height(22.dp))
-                Button(
+                Spacer(modifier = Modifier.height(20.dp))
+
+                if (onStartTestMode != null) {
+                    Button(
+                        onClick = onStartTestMode,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NeonCyan,
+                            contentColor = Color.Black
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("start_ar_test_mode_button")
+                    ) {
+                        Text(
+                            "🧪 Start AR Tracking Test Mode (اختبار تتبع AR)",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
+                if (onOpenDiagnostics != null) {
+                    OutlinedButton(
+                        onClick = onOpenDiagnostics,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = NeonCyan
+                        ),
+                        border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("open_ar_diagnostics_button")
+                    ) {
+                        Text(
+                            "🔬 Run AR Tracking Self-Test (فحص شامل)",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+
+                TextButton(
                     onClick = onBackToObject,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = NeonCyan,
-                        contentColor = Color.Black
-                    ),
-                    shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.testTag("back_to_object_button")
                 ) {
                     Text(
                         "Return to Object Mode",
-                        fontWeight = FontWeight.Bold
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 13.sp
                     )
                 }
             }

@@ -1,0 +1,499 @@
+package com.aistudio.mixedreality.ui
+
+import androidx.compose.animation.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Assessment
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.aistudio.mixedreality.ui.theme.*
+import com.google.android.filament.Engine
+import com.google.ar.core.Pose
+import com.google.ar.core.TrackingState
+import io.github.sceneview.SceneView
+import io.github.sceneview.loaders.EnvironmentLoader
+import io.github.sceneview.loaders.MaterialLoader
+import io.github.sceneview.loaders.ModelLoader
+import io.github.sceneview.math.Position
+import io.github.sceneview.math.Rotation
+import io.github.sceneview.math.Scale
+import io.github.sceneview.math.Size
+import io.github.sceneview.node.CubeNode
+import io.github.sceneview.node.CylinderNode
+import io.github.sceneview.node.ModelNode
+import io.github.sceneview.node.Node
+import io.github.sceneview.node.SphereNode
+import io.github.sceneview.rememberCameraNode
+import io.github.sceneview.rememberMainLightNode
+import io.github.sceneview.rememberModelInstance
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
+
+/**
+ * Interactive AR Tracking Test & Simulation View.
+ * Provides an on-device simulation of ARCore plane tracking, tap-to-place anchoring,
+ * IMU sensor damping (1.5mm deadband), and spatial gestures for emulators and devices
+ * without Google Play Services for AR.
+ */
+@Composable
+fun ARTrackingSimulationView(
+    modelItem: ModelItem,
+    customModelFile: File?,
+    isModelVisible: Boolean,
+    color: Color,
+    metallic: Float = 0.25f,
+    roughness: Float = 0.45f,
+    scale: Float,
+    onScaleChange: (Float) -> Unit = {},
+    rotationY: Float = 0f,
+    onRotationYChange: (Float) -> Unit = {},
+    rotationX: Float = 0f,
+    onRotationXChange: (Float) -> Unit = {},
+    rotationZ: Float = 0f,
+    onRotationZChange: (Float) -> Unit = {},
+    clearTrigger: Int = 0,
+    isMoveMode: Boolean = false,
+    onToggleMoveMode: () -> Unit = {},
+    activeRotationAxis: RotationAxis = RotationAxis.ALL,
+    isFullScreen: Boolean = false,
+    onToggleFullScreen: () -> Unit = {},
+    onStopAutoRotate: () -> Unit = {},
+    onFallbackToObject: () -> Unit = {},
+    engine: Engine,
+    modelLoader: ModelLoader,
+    materialLoader: MaterialLoader,
+    environmentLoader: EnvironmentLoader,
+    modifier: Modifier = Modifier
+) {
+    val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+
+    // Simulation tracking states
+    var simulatedTrackingState by remember { mutableStateOf(TrackingState.TRACKING) }
+    var isSimulatedPlaneDetected by remember { mutableStateOf(false) }
+    var simulatedModelPlaced by remember { mutableStateOf(false) }
+    var modelPosition by remember { mutableStateOf(Position(0f, -0.2f, -1.2f)) }
+    var lastRawPose by remember { mutableStateOf<Pose?>(null) }
+    var isAnchorLocked by remember { mutableStateOf(false) }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+
+    // Plane detection delay simulation
+    LaunchedEffect(Unit) {
+        delay(600L)
+        isSimulatedPlaneDetected = true
+    }
+
+    LaunchedEffect(clearTrigger) {
+        if (clearTrigger > 0) {
+            simulatedModelPlaced = false
+            modelPosition = Position(0f, -0.2f, -1.2f)
+            lastRawPose = null
+            isAnchorLocked = false
+        }
+    }
+
+    val pbrMaterial = remember(materialLoader, color, metallic, roughness) {
+        materialLoader.createColorInstance(
+            color = color,
+            metallic = metallic.coerceIn(0.0f, 0.5f),
+            roughness = roughness.coerceIn(0.2f, 0.85f)
+        )
+    }
+
+    val visorGlassMaterial = remember(materialLoader) {
+        materialLoader.createColorInstance(
+            color = Color(0xFF141923),
+            metallic = 0.85f,
+            roughness = 0.15f
+        )
+    }
+
+    val floorGridMaterial = remember(materialLoader) {
+        materialLoader.createColorInstance(
+            color = Color(0x3300E5FF),
+            metallic = 0.1f,
+            roughness = 0.9f
+        )
+    }
+
+    val reticleMaterial = remember(materialLoader) {
+        materialLoader.createColorInstance(
+            color = Color(0x8800E5FF),
+            metallic = 0.2f,
+            roughness = 0.5f
+        )
+    }
+
+    val toyCarModel = rememberModelInstance(
+        modelLoader = modelLoader,
+        fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
+    )
+
+    val customModelInstance = key(customModelFile?.absolutePath) {
+        customModelFile?.let { file ->
+            rememberModelInstance(
+                modelLoader = modelLoader,
+                fileLocation = "file://${file.absolutePath}"
+            )
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .spatialMRGestures(
+                scope = scope,
+                isMoveMode = isMoveMode,
+                activeAxis = activeRotationAxis,
+                onSingleTap = { tapOffset ->
+                    if (!isModelVisible) return@spatialMRGestures
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+
+                    // Convert screen tap to simulated floor plane placement with damping
+                    val screenNormX = (tapOffset.x / 1080f - 0.5f) * 1.4f
+                    val screenNormZ = -1.2f + (tapOffset.y / 1920f - 0.5f) * 0.8f
+
+                    val rawPose = Pose(floatArrayOf(screenNormX, -0.2f, screenNormZ), floatArrayOf(0f, 0f, 0f, 1f))
+                    val filteredPose = filterPoseWithLegacyDamping(
+                        rawPose = rawPose,
+                        lastPose = lastRawPose,
+                        deadbandMeters = 0.0015f,
+                        alpha = 0.35f
+                    )
+                    lastRawPose = filteredPose
+
+                    modelPosition = Position(filteredPose.tx(), filteredPose.ty(), filteredPose.tz())
+                    simulatedModelPlaced = true
+                },
+                onDoubleTap = {
+                    onToggleMoveMode()
+                },
+                onTripleTap = {
+                    onToggleFullScreen()
+                },
+                onOneFingerRotate = { dx, dy, isEdgeDrag ->
+                    onStopAutoRotate()
+                    applyRotationDelta(
+                        axis = activeRotationAxis,
+                        dx = dx,
+                        dy = dy,
+                        isEdgeDrag = isEdgeDrag,
+                        currentRotX = rotationX,
+                        currentRotY = rotationY,
+                        currentRotZ = rotationZ,
+                        onRotX = onRotationXChange,
+                        onRotY = onRotationYChange,
+                        onRotZ = onRotationZChange,
+                        sensitivity = 0.45f
+                    )
+                },
+                onTwoFingerRotateZ = { dAngle ->
+                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
+                    onRotationZChange(newRotZ)
+                },
+                onTwoFingerZoom = { zoomMultiplier ->
+                    val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)
+                    onScaleChange(newScale)
+                },
+                onMove = { panX, panY ->
+                    modelPosition = Position(
+                        x = modelPosition.x + (panX * 0.0025f),
+                        y = modelPosition.y,
+                        z = modelPosition.z + (panY * 0.0025f)
+                    )
+                }
+            )
+            .testTag("ar_tracking_simulation_view")
+    ) {
+        // Camera passthrough background
+        CameraPassthroughBackground(modifier = Modifier.fillMaxSize())
+
+        // 3D SceneView with lights & placement plane
+        SceneView(
+            modifier = Modifier.fillMaxSize(),
+            engine = engine,
+            modelLoader = modelLoader,
+            materialLoader = materialLoader,
+            environmentLoader = environmentLoader,
+            mainLightNode = rememberMainLightNode(engine) {
+                intensity = 55_000.0f
+            },
+            cameraNode = rememberCameraNode(engine) {
+                position = Position(0f, 0.4f, 0.6f)
+                lookAt(Position(0f, -0.2f, -1.2f))
+            }
+        ) {
+            // Simulated horizontal floor grid
+            if (isSimulatedPlaneDetected) {
+                CubeNode(
+                    size = Size(2.2f, 0.005f, 2.2f),
+                    position = Position(0f, -0.22f, -1.2f),
+                    materialInstance = floorGridMaterial
+                )
+            }
+
+            // Placement reticle indicator on the floor
+            if (!simulatedModelPlaced && isSimulatedPlaneDetected) {
+                CylinderNode(
+                    radius = 0.14f,
+                    height = 0.006f,
+                    position = Position(0f, -0.21f, -1.2f),
+                    materialInstance = reticleMaterial
+                )
+            }
+
+            // Placed 3D Model
+            if (isModelVisible && (simulatedModelPlaced || isSimulatedPlaneDetected)) {
+                val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
+                val safeRotX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
+                val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
+                val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
+
+                Node(
+                    position = modelPosition,
+                    rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
+                    scale = Scale(safeScale)
+                ) {
+                    if (customModelFile != null) {
+                        customModelInstance?.let { instance ->
+                            ModelNode(
+                                modelInstance = instance,
+                                scaleToUnits = 0.35f,
+                                centerOrigin = Position(0f, 0f, 0f),
+                                autoAnimate = true
+                            )
+                        }
+                    } else {
+                        when (modelItem) {
+                            ModelItem.VISION_HEADSET -> {
+                                SphereNode(
+                                    radius = 0.16f,
+                                    materialInstance = visorGlassMaterial,
+                                    position = Position(0f, 0.04f, 0.08f)
+                                )
+                                CylinderNode(
+                                    radius = 0.18f,
+                                    height = 0.06f,
+                                    materialInstance = pbrMaterial,
+                                    position = Position(0f, 0.04f, -0.04f)
+                                )
+                            }
+                            ModelItem.TOY_CAR -> {
+                                toyCarModel?.let { instance ->
+                                    ModelNode(
+                                        modelInstance = instance,
+                                        scaleToUnits = 0.40f,
+                                        centerOrigin = Position(0f, 0f, 0f)
+                                    )
+                                } ?: CubeNode(
+                                    size = Size(0.25f, 0.25f, 0.25f),
+                                    materialInstance = pbrMaterial
+                                )
+                            }
+                            ModelItem.HOLO_CUBE -> {
+                                CubeNode(
+                                    size = Size(0.24f, 0.24f, 0.24f),
+                                    materialInstance = pbrMaterial
+                                )
+                            }
+                            ModelItem.QUANTUM_ORB -> {
+                                SphereNode(
+                                    radius = 0.18f,
+                                    materialInstance = pbrMaterial
+                                )
+                            }
+                            ModelItem.SPATIAL_CARD -> {
+                                CubeNode(
+                                    size = Size(0.35f, 0.22f, 0.03f),
+                                    materialInstance = pbrMaterial
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- OVERLAYS ---
+
+        // 1. Move Mode Active Banner
+        if (isMoveMode) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = NeonCyan,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 68.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("✋", fontSize = 13.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Move mode active • Double-tap to return to rotate",
+                        color = Color.Black,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        } else if (isModelVisible) {
+            // 2. Real-Time HUD Status Badge
+            val hudText = when {
+                simulatedModelPlaced -> "Model placed • Tap floor to move"
+                isSimulatedPlaneDetected -> "Tracked floor detected • Tap to place"
+                else -> "Point camera at floor and move slowly"
+            }
+            val hudColor = when {
+                simulatedModelPlaced -> NeonGreen
+                isSimulatedPlaneDetected -> NeonGreen
+                else -> NeonCyan
+            }
+
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = if (isFullScreen) 16.dp else 68.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Tracking Status Pill
+                Box(
+                    modifier = Modifier
+                        .background(
+                            Color.Black.copy(alpha = 0.65f),
+                            RoundedCornerShape(20.dp)
+                        )
+                        .border(
+                            1.dp,
+                            hudColor.copy(alpha = 0.7f),
+                            RoundedCornerShape(20.dp)
+                        )
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(hudColor)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = hudText,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                // Controls when model is placed
+                if (simulatedModelPlaced) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Surface(
+                            onClick = {
+                                isAnchorLocked = !isAnchorLocked
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (isAnchorLocked) Color(0x99000000) else Color(0xCC00E5FF),
+                            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = if (isAnchorLocked) "🔒 Anchor Locked" else "🔓 Anchor Unlocked",
+                                color = if (isAnchorLocked) NeonCyan else Color.Black,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                            )
+                        }
+
+                        Surface(
+                            onClick = {
+                                simulatedModelPlaced = false
+                                modelPosition = Position(0f, -0.2f, -1.2f)
+                                isAnchorLocked = false
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color(0x99000000),
+                            border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.7f))
+                        ) {
+                            Text(
+                                text = "↺ Reset Anchor",
+                                color = Color(0xFFFF5252),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Diagnostics & Test Mode Badge (Top-left floating chip)
+        Surface(
+            onClick = { showDiagnosticsDialog = true },
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xCC141E2D),
+            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.6f)),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .statusBarsPadding()
+                .padding(top = if (isFullScreen) 16.dp else 68.dp, start = 16.dp)
+                .testTag("ar_test_diagnostics_button")
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🧪", fontSize = 13.sp)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "AR Test",
+                    color = NeonCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // 4. Diagnostics Dialog
+        if (showDiagnosticsDialog) {
+            ARTrackingDiagnosticsDialog(
+                trackingManager = null,
+                isRealARCoreAvailable = false,
+                onDismiss = { showDiagnosticsDialog = false }
+            )
+        }
+    }
+}

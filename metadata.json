@@ -1,10 +1,6 @@
 {
   "name": "Mixed Reality",
-  "description": "3D and Mixed Reality (AR) viewer and studio built with Jetpack Compose and SceneView.",
-  "requestFramePermissions": [
-    "android.permission.CAMERA"
-  ],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "description": "Interactive Mixed Reality and 3D Studio app for viewing and placing 3D models with AR capabilities.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
