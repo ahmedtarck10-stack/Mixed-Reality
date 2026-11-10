@@ -52,32 +52,37 @@ fun applyRotationDelta(
     onRotZ: (Float) -> Unit,
     sensitivity: Float = 0.45f
 ) {
+    if (!dx.isFinite() || !dy.isFinite()) return
+    val safeCurrentX = if (currentRotX.isFinite()) currentRotX else 0f
+    val safeCurrentY = if (currentRotY.isFinite()) currentRotY else 0f
+    val safeCurrentZ = if (currentRotZ.isFinite()) currentRotZ else 0f
+
     when (axis) {
         RotationAxis.ALL -> {
             if (isEdgeDrag) {
                 // Dragging along screen edge turns Z (Roll) 360° directly with 1 finger
-                val newZ = ((currentRotZ + dy * sensitivity) % 360f + 360f) % 360f
+                val newZ = ((safeCurrentZ + dy * sensitivity) % 360f + 360f) % 360f
                 onRotZ(newZ)
             } else {
                 // Center drag: dx modifies Yaw (Y) 360°, dy modifies Pitch (X) 360°
-                val newY = ((currentRotY + dx * sensitivity) % 360f + 360f) % 360f
-                val newX = ((currentRotX - dy * sensitivity) % 360f + 360f) % 360f
+                val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
+                val newX = ((safeCurrentX - dy * sensitivity) % 360f + 360f) % 360f
                 onRotY(newY)
                 onRotX(newX)
             }
         }
         RotationAxis.X -> {
             val delta = if (abs(dy) > abs(dx)) -dy else -dx
-            val newX = ((currentRotX + delta * sensitivity) % 360f + 360f) % 360f
+            val newX = ((safeCurrentX + delta * sensitivity) % 360f + 360f) % 360f
             onRotX(newX)
         }
         RotationAxis.Y -> {
-            val newY = ((currentRotY + dx * sensitivity) % 360f + 360f) % 360f
+            val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
             onRotY(newY)
         }
         RotationAxis.Z -> {
             val delta = if (abs(dy) > abs(dx)) dy else dx
-            val newZ = ((currentRotZ + delta * sensitivity) % 360f + 360f) % 360f
+            val newZ = ((safeCurrentZ + delta * sensitivity) % 360f + 360f) % 360f
             onRotZ(newZ)
         }
     }

@@ -445,6 +445,7 @@ object ModelFormatConverter {
 
         val totalGlbLength = 12 + 8 + paddedJsonLength + 8 + paddedBinaryLength
 
+        outFile.parentFile?.mkdirs()
         FileOutputStream(outFile).use { fos ->
             val header = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
             header.putInt(0x46546C67) // "glTF"

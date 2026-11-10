@@ -588,19 +588,25 @@ fun MRMainScreen(
 fun copyUriToLocalCache(context: Context, uri: Uri): File? {
     return try {
         val rawName = queryDisplayName(context, uri) ?: "model_${System.currentTimeMillis()}.glb"
-        val extension = rawName.substringAfterLast('.', "").lowercase()
+        val cleanName = rawName.substringAfterLast('/').substringAfterLast('\\').trim()
+        val extension = cleanName.substringAfterLast('.', "").lowercase()
         val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj")
         val finalName = if (!isRecognized3D) {
-            if (rawName.contains('.')) "${rawName.substringBeforeLast('.')}.glb" else "$rawName.glb"
+            if (cleanName.contains('.')) "${cleanName.substringBeforeLast('.')}.glb" else "$cleanName.glb"
         } else {
-            rawName
+            cleanName
         }
         val cacheFile = File(context.cacheDir, finalName)
         context.contentResolver.openInputStream(uri)?.use { input ->
             cacheFile.outputStream().use { output ->
                 input.copyTo(output)
             }
+        } ?: return null
+
+        if (!cacheFile.exists() || cacheFile.length() == 0L) {
+            return null
         }
+
         val conversion = ModelFormatConverter.processIncomingModel(context, cacheFile)
         conversion.glbFile
     } catch (e: Exception) {

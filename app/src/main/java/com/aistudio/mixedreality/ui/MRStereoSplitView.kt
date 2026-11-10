@@ -190,10 +190,27 @@ private fun MRStereoARCoreView(
                     true
                 }.getOrDefault(false)
 
-                arCoreAvailability = if (!hasPlayStore) {
-                    ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
-                } else {
+                val canBindPlayStore = runCatching {
+                    val intent = Intent("com.google.android.play.core.install.BIND_INSTALL_SERVICE")
+                        .setPackage("com.android.vending")
+                    val resolveInfo = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        context.packageManager.queryIntentServices(
+                            intent,
+                            android.content.pm.PackageManager.ResolveInfoFlags.of(0)
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.packageManager.queryIntentServices(intent, 0)
+                    }
+                    resolveInfo.isNotEmpty()
+                }.getOrDefault(false)
+
+                arCoreAvailability = if (canBindPlayStore && !isEmulatorDevice()) {
                     ArCoreApk.getInstance().checkAvailability(context)
+                } else if (hasPlayStore && !isEmulatorDevice()) {
+                    ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED
+                } else {
+                    ArCoreApk.Availability.UNSUPPORTED_DEVICE_NOT_CAPABLE
                 }
             }
         } catch (_: Throwable) {
@@ -224,14 +241,14 @@ private fun MRStereoARCoreView(
     ) {
         ARCoreInstallCard(
             onInstall = {
-                val hasPlayStore = runCatching {
-                    context.packageManager.getPackageInfo(
-                        "com.android.vending",
-                        0
-                    ) != null
+                val canBindPlayStore = runCatching {
+                    val intent = Intent("com.google.android.play.core.install.BIND_INSTALL_SERVICE")
+                        .setPackage("com.android.vending")
+                    val resolveInfo = context.packageManager.queryIntentServices(intent, 0)
+                    resolveInfo.isNotEmpty()
                 }.getOrDefault(false)
 
-                if (hasPlayStore && activity != null) {
+                if (canBindPlayStore && !isEmulatorDevice() && activity != null) {
                     try {
                         val installStatus = ArCoreApk.getInstance()
                             .requestInstall(activity, userRequestedInstall)

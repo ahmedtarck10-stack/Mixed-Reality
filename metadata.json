@@ -1,6 +1,10 @@
 {
   "name": "Mixed Reality",
-  "description": "3D and Augmented Reality studio and viewer powered by SceneView",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "description": "3D and Mixed Reality (AR) viewer and studio built with Jetpack Compose and SceneView.",
+  "requestFramePermissions": [
+    "android.permission.CAMERA"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
