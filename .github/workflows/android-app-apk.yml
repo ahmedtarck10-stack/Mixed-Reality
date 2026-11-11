@@ -43,6 +43,9 @@ jobs:
           if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
             echo "Decoding signing keystore from secret..."
             echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > debug.keystore
+          elif [ -f debug.keystore.base64 ]; then
+            echo "Decoding debug.keystore.base64 from repository..."
+            base64 -d debug.keystore.base64 > debug.keystore
           elif [ ! -f debug.keystore ]; then
             echo "Generating build keystore..."
             keytool -genkeypair -v \
