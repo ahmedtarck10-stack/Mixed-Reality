@@ -51,25 +51,40 @@ object ModelFormatConverter {
             "gltf" -> {
                 var binWarning: String? = null
                 var hasMissingBuffer = false
+                val missingResources = mutableListOf<String>()
                 try {
                     val content = sourceFile.readText()
-                    val binRegex = Regex(""""uri"\s*:\s*"([^"]+\.bin)"""")
-                    val match = binRegex.find(content)
-                    if (match != null) {
-                        val binName = match.groupValues[1]
-                        val companionBin = File(sourceFile.parentFile, binName)
-                        if (!companionBin.exists() || companionBin.length() == 0L) {
-                            binWarning = "Referenced binary buffer '$binName' not found in model folder"
+                    val uriRegex = Regex(""""uri"\s*:\s*"([^"]+)"""")
+                    for (match in uriRegex.findAll(content)) {
+                        val uriStr = match.groupValues[1]
+                        if (uriStr.startsWith("data:", ignoreCase = true)) {
+                            // Embedded data URI, self-contained
+                            continue
+                        }
+                        val companion = File(sourceFile.parentFile, uriStr)
+                        if (!companion.exists() || companion.length() == 0L) {
+                            missingResources.add(uriStr)
                             hasMissingBuffer = true
                         }
                     }
+                    if (missingResources.isNotEmpty()) {
+                        binWarning = "Referenced external buffers/textures not found: ${missingResources.joinToString(", ")}"
+                    }
                 } catch (_: Exception) {}
 
+                val finalFile = if (hasMissingBuffer) {
+                    val proxyGlb = File(cacheDir, "${sourceFile.nameWithoutExtension}_gltf_fallback.glb")
+                    generateUsdzSpatialProxy(proxyGlb, sourceFile.name)
+                    proxyGlb
+                } else {
+                    sourceFile
+                }
+
                 ConversionResult(
-                    glbFile = sourceFile,
+                    glbFile = finalFile,
                     originalFormat = "glTF",
-                    triangleCount = 0,
-                    vertexCount = 0,
+                    triangleCount = if (hasMissingBuffer) 12 else 0,
+                    vertexCount = if (hasMissingBuffer) 24 else 0,
                     message = if (binWarning != null) "Incomplete glTF model ($binWarning)" else "Native glTF Model Loaded",
                     isSuccess = !hasMissingBuffer
                 )

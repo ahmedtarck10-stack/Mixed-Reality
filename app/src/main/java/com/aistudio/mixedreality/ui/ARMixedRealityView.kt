@@ -484,13 +484,12 @@ fun ARMixedRealityView(
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
             instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
-            // FocusMode.FIXED locks hyperfocal depth to prevent autofocus hunting
-            // from inducing feature-point micro-drift and plane instability during continuous 6DoF tracking.
-            focusMode = Config.FocusMode.FIXED,
+            // FocusMode.AUTO provides sharp continuous auto-focus across near and far planes
+            focusMode = Config.FocusMode.AUTO,
             sessionConfiguration = { _, config ->
                 config.planeFindingMode =
                     Config.PlaneFindingMode.HORIZONTAL
-                config.focusMode = Config.FocusMode.FIXED
+                config.focusMode = Config.FocusMode.AUTO
                 config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                 config.instantPlacementMode =
                     Config.InstantPlacementMode.LOCAL_Y_UP

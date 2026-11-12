@@ -483,11 +483,11 @@ private fun MRStereoARCoreView(
                     planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
                     updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
                     instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
-                    focusMode = Config.FocusMode.FIXED,
+                    focusMode = Config.FocusMode.AUTO,
                     sessionConfiguration = { _, config ->
                         config.planeFindingMode =
                             Config.PlaneFindingMode.HORIZONTAL
-                        config.focusMode = Config.FocusMode.FIXED
+                        config.focusMode = Config.FocusMode.AUTO
                         config.updateMode =
                             Config.UpdateMode.LATEST_CAMERA_IMAGE
                         config.instantPlacementMode =
