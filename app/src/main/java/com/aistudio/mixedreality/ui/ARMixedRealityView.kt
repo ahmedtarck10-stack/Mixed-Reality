@@ -661,10 +661,7 @@ fun ARMixedRealityView(
                     )
                 }
             }
-        } else if (isModelVisible) {
-            // 2. Real-Time HUD Status Badge
-            val (hudText, hudColor) = trackingManager.getHudStatus()
-
+        } else if (isModelVisible && activeAnchor != null) {
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -672,110 +669,48 @@ fun ARMixedRealityView(
                     .padding(top = if (isFullScreen) 16.dp else 68.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Box(
-                    modifier = Modifier
-                        .background(
-                            Color.Black.copy(alpha = 0.65f),
-                            RoundedCornerShape(20.dp)
-                        )
-                        .border(
-                            1.dp,
-                            hudColor.copy(alpha = 0.7f),
-                            RoundedCornerShape(20.dp)
-                        )
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
-                        .testTag("ar_tracking_hud_badge")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(androidx.compose.foundation.shape.CircleShape)
-                                .background(hudColor)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = hudText,
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-
-                if (activeAnchor != null) {
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Surface(
+                        onClick = {
+                            isAnchorLocked = !isAnchorLocked
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        color = if (isAnchorLocked) Color(0x99000000) else Color(0xCC00E5FF),
+                        border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f))
                     ) {
-                        Surface(
-                            onClick = {
-                                isAnchorLocked = !isAnchorLocked
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            },
-                            shape = RoundedCornerShape(16.dp),
-                            color = if (isAnchorLocked) Color(0x99000000) else Color(0xCC00E5FF),
-                            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f))
-                        ) {
-                            Text(
-                                text = if (isAnchorLocked) "🔒 Anchor Locked" else "🔓 Anchor Unlocked",
-                                color = if (isAnchorLocked) NeonCyan else Color.Black,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                            )
-                        }
+                        Text(
+                            text = if (isAnchorLocked) "🔒 Anchor Locked" else "🔓 Anchor Unlocked",
+                            color = if (isAnchorLocked) NeonCyan else Color.Black,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                        )
+                    }
 
-                        Surface(
-                            onClick = {
-                                trackingManager.clear()
-                                modelOffset = Position(0f, 0f, 0f)
-                                isAnchorLocked = false
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            },
-                            shape = RoundedCornerShape(16.dp),
-                            color = Color(0x99000000),
-                            border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.7f))
-                        ) {
-                            Text(
-                                text = "↺ Reset Anchor",
-                                color = Color(0xFFFF5252),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                            )
-                        }
+                    Surface(
+                        onClick = {
+                            trackingManager.clear()
+                            modelOffset = Position(0f, 0f, 0f)
+                            isAnchorLocked = false
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color(0x99000000),
+                        border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.7f))
+                    ) {
+                        Text(
+                            text = "↺ Reset Anchor",
+                            color = Color(0xFFFF5252),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                        )
                     }
                 }
-            }
-        }
-
-        // 3. Diagnostics & Test Mode Button (Top-left floating chip)
-        Surface(
-            onClick = { showDiagnosticsDialog = true },
-            shape = RoundedCornerShape(20.dp),
-            color = Color(0xCC141E2D),
-            border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.6f)),
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .statusBarsPadding()
-                .padding(top = if (isFullScreen) 16.dp else 68.dp, start = 16.dp)
-                .testTag("ar_test_diagnostics_button")
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("🧪", fontSize = 13.sp)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "AR Test",
-                    color = NeonCyan,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                )
             }
         }
 

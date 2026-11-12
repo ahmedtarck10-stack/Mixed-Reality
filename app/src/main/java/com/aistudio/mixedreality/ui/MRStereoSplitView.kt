@@ -771,9 +771,7 @@ private fun MRStereoARCoreView(
                     )
                 }
             }
-        } else if (isModelVisible) {
-            val (hudText, hudColor) = trackingManager.getHudStatus()
-
+        } else if (isModelVisible && activeAnchor != null) {
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -781,43 +779,10 @@ private fun MRStereoARCoreView(
                     .padding(top = if (isFullScreen) 16.dp else 68.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Box(
-                    modifier = Modifier
-                        .background(
-                            Color.Black.copy(alpha = 0.65f),
-                            RoundedCornerShape(20.dp)
-                        )
-                        .border(
-                            1.dp,
-                            hudColor.copy(alpha = 0.7f),
-                            RoundedCornerShape(20.dp)
-                        )
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(hudColor)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = hudText,
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-
-                if (activeAnchor != null) {
-                    Spacer(modifier = Modifier.height(6.dp))
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
                         androidx.compose.material3.Surface(
                             onClick = {
                                 isAnchorLocked = !isAnchorLocked
@@ -914,4 +879,3 @@ private fun MRStereoARCoreView(
             }
         }
     }
-}

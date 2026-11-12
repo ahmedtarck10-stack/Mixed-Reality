@@ -77,7 +77,7 @@ fun Modifier.spatialMRGestures(
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val downTime = System.currentTimeMillis()
             val downOffset = down.position
-            val isEdgeStart = (downOffset.x < size.width * 0.14f || downOffset.x > size.width * 0.86f)
+            val isEdgeStart = (downOffset.x < size.width * 0.22f || downOffset.x > size.width * 0.78f || downOffset.y < size.height * 0.18f || downOffset.y > size.height * 0.82f)
             var isGestureDrag = false
             var lastPointerPosition = downOffset
             var prevCentroid = downOffset
@@ -199,14 +199,14 @@ fun Modifier.spatialMRGestures(
                                 }
                             }
                         }
+                    }
 
-                        // Twist to rotate around Z-axis (360 degrees roll)
-                        var angleDiff = currentAngle - prevAngle
-                        while (angleDiff < -180f) angleDiff += 360f
-                        while (angleDiff > 180f) angleDiff -= 360f
-                        if (abs(angleDiff) > 0.25f && abs(angleDiff) < 60f) {
-                            currentOnTwoFingerRotateZ(angleDiff)
-                        }
+                    // Twist with two fingers to rotate 360° around Z-axis (roll)
+                    var angleDiff = currentAngle - prevAngle
+                    while (angleDiff < -180f) angleDiff += 360f
+                    while (angleDiff > 180f) angleDiff -= 360f
+                    if (abs(angleDiff) > 0.08f && abs(angleDiff) < 90f) {
+                        currentOnTwoFingerRotateZ(angleDiff)
                     }
                     prevCentroid = currentCentroid
                     prevSpan = currentSpan

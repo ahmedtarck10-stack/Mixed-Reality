@@ -102,10 +102,7 @@ fun MRMainScreen(
     var rotationZ by remember { mutableFloatStateOf(0f) }
     var activeRotationAxis by remember { mutableStateOf(RotationAxis.ALL) }
 
-    // Open Source Chooser Sheet (Long press on Open)
-    var showOpenSourceChooser by remember { mutableStateOf(false) }
-
-    // Cloud 3D Library Sheet (Google Drive Models)
+    // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
     var showCloudLibrary by remember { mutableStateOf(false) }
 
     // Handle incoming 3D model files from external apps / file manager on background thread
@@ -140,8 +137,7 @@ fun MRMainScreen(
     // Bottom sheet for model tuning / presets
     var showTuneDrawer by remember { mutableStateOf(false) }
 
-    // AR Tracking Test & Diagnostics dialog
-    var showARDiagnosticsDialog by remember { mutableStateOf(false) }
+
 
     // Shutter flash animation
     var showFlash by remember { mutableStateOf(false) }
@@ -413,53 +409,7 @@ fun MRMainScreen(
             )
         }
 
-        // --- 4. AR TRACKING TEST BUTTON (Top-left floating chip) ---
-        if (!isFullScreen) {
-            Surface(
-                onClick = { showARDiagnosticsDialog = true },
-                shape = RoundedCornerShape(20.dp),
-                color = Color(0xCC10141D),
-                border = androidx.compose.foundation.BorderStroke(1.dp, NeonCyan.copy(alpha = 0.6f)),
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .statusBarsPadding()
-                    .padding(top = 16.dp, start = 16.dp)
-                    .testTag("main_ar_test_button")
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("🧪", fontSize = 13.sp)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "AR Test",
-                        color = NeonCyan,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
 
-        // --- 5. 360° SPATIAL ROTATION QUICK CONTROLLER (X, Y, Z) ---
-        if (isModelVisible && !isFullScreen) {
-            SpatialRotationController(
-                rotationX = rotationX,
-                onRotationXChange = { rotationX = it },
-                rotationY = rotationY,
-                onRotationYChange = { rotationY = it },
-                rotationZ = rotationZ,
-                onRotationZChange = { rotationZ = it },
-                activeAxis = activeRotationAxis,
-                onActiveAxisChange = { activeRotationAxis = it },
-                onStopAutoRotate = { isAutoRotating = false },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(top = 16.dp, end = 16.dp)
-            )
-        }
 
         // --- 5. BOTTOM FLOATING CONTROL PILL (PHOTO | ● REC | Open | Clear) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
@@ -516,7 +466,7 @@ fun MRMainScreen(
                     filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
                 },
                 onOpenLongClick = {
-                    showOpenSourceChooser = true
+                    showCloudLibrary = true
                 },
                 onOpenCloudLibrary = {
                     showCloudLibrary = true
@@ -581,21 +531,7 @@ fun MRMainScreen(
             }
         }
 
-        // --- 8. OPEN SOURCE CHOOSER SHEET (LONG PRESS ON OPEN) ---
-        if (showOpenSourceChooser) {
-            OpenSourceChooserSheet(
-                onDismiss = { showOpenSourceChooser = false },
-                onOpenLocalFiles = {
-                    filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
-                },
-                onOpenCloudDrive = {
-                    openAhmedTarckCloudDrive(context)
-                },
-                onOpenCloudLibrarySheet = {
-                    showCloudLibrary = true
-                }
-            )
-        }
+
 
         // --- 9. CLOUD 3D MODEL LIBRARY SHEET ---
         if (showCloudLibrary) {
@@ -614,18 +550,7 @@ fun MRMainScreen(
             )
         }
 
-        // --- 10. AR TRACKING TEST & DIAGNOSTICS DIALOG ---
-        if (showARDiagnosticsDialog) {
-            ARTrackingDiagnosticsDialog(
-                trackingManager = null,
-                isRealARCoreAvailable = isARCoreAvailable,
-                onDismiss = { showARDiagnosticsDialog = false },
-                onLaunchTestMode = {
-                    showARDiagnosticsDialog = false
-                    selectedMode = ViewportMode.AR
-                }
-            )
-        }
+
     }
 }
 
