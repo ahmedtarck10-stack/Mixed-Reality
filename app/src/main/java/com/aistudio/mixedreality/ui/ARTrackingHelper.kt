@@ -18,6 +18,7 @@ import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import io.github.sceneview.math.Position
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -206,14 +207,16 @@ class ARTrackingHelper {
     /**
      * دالة مساعدة موحّدة للتحقق من مرشح الاسترداد.
      *
-     * ✅ إصلاح Nitpick (PR خط 42-51): كانت الشروط مكررة inline بدلاً
-     * من استخدام isEligiblePhysicalFloorPlane، مما يسبب تباين القواعد.
+     * ✅ يتضمن التحقق من فارق الارتفاع (Y-axis) لتوحيد القواعد مع الوضع الأولي.
      *
      * @param cameraIsTracking حالة الكاميرا
      * @param planeIsTracking حالة السطح
      * @param isUpwardHorizontalPlane هل السطح أفقي للأعلى
      * @param isSubsumed هل تم استيعاب السطح
      * @param savedPoseInsidePolygon هل الوضعية داخل مضلع السطح
+     * @param planeCenterY ارتفاع مركز السطح على محور Y
+     * @param savedPoseY ارتفاع الوضعية المحفوظة على محور Y
+     * @param checkHeightDelta هل نتحقق من فارق الارتفاع
      * @return true إذا كان المرشح مقبولاً للاسترداد
      */
     fun isEligibleRecoveryPlane(
@@ -221,14 +224,33 @@ class ARTrackingHelper {
         planeIsTracking: Boolean,
         isUpwardHorizontalPlane: Boolean,
         isSubsumed: Boolean,
-        savedPoseInsidePolygon: Boolean
+        savedPoseInsidePolygon: Boolean,
+        planeCenterY: Float = 0f,
+        savedPoseY: Float = 0f,
+        checkHeightDelta: Boolean = false
     ): Boolean {
-        return cameraIsTracking &&
-            planeIsTracking &&
-            isUpwardHorizontalPlane &&
-            !isSubsumed &&
-            savedPoseInsidePolygon
+        if (!cameraIsTracking || !planeIsTracking || !isUpwardHorizontalPlane || isSubsumed || !savedPoseInsidePolygon) {
+            return false
+        }
+        if (checkHeightDelta && abs(planeCenterY - savedPoseY) > MAX_HEIGHT_DELTA_M) {
+            return false
+        }
+        return true
     }
+
+    /**
+     * التحقق الموحّد من سطح الاسترداد باستخدام كائن Plane وPose مباشرةً.
+     */
+    fun isEligibleRecoveryPlane(
+        plane: Plane,
+        cameraIsTracking: Boolean,
+        savedPose: Pose?
+    ): Boolean = isEligiblePhysicalFloorPlane(
+        plane = plane,
+        cameraIsTracking = cameraIsTracking,
+        hitPose = savedPose,
+        checkHeightDelta = true
+    )
 
     // ─────────────────────────────────────────────
     //  منطق قبول مرشح الاسترداد
@@ -664,6 +686,12 @@ class ARTrackingManager(
     var isPlaneDetected by mutableStateOf(false)
         private set
 
+    var currentSmoothedPose by mutableStateOf<Pose?>(null)
+        private set
+
+    var smoothedOffset by mutableStateOf(Position(0f, 0f, 0f))
+        private set
+
     private val pendingPlacementRef =
         AtomicReference<PendingPlacementTap?>(null)
 
@@ -674,6 +702,7 @@ class ARTrackingManager(
     private var trackingLostSinceNanos: Long? = null
 
     val trackingHelper = ARTrackingHelper()
+    val interactionPolicy = ARInteractionPolicy(trackingHelper)
 
     fun onSingleTap(
         tapOffset: Offset,
@@ -771,10 +800,6 @@ class ARTrackingManager(
             PlacementTapDecision.HIT_TEST_ON_CURRENT_FRAME -> Unit
         }
 
-        if (!pendingPlacementRef.compareAndSet(pending, null)) {
-            return
-        }
-
         val hitX = if (
             splitWidthPx > 0f &&
             pending.offset.x > splitWidthPx
@@ -784,30 +809,33 @@ class ARTrackingManager(
             pending.offset.x
         }
 
-        // Only accept a physically detected, tracked horizontal floor plane.
-        // Estimated Instant Placement points are intentionally excluded.
-        val floorHit = runCatching {
-            frame.hitTest(
-                hitX,
-                pending.offset.y
-            ).firstOrNull { hit ->
-                val plane = hit.trackable as? Plane
-                    ?: return@firstOrNull false
+        val camera = runCatching { frame.camera }.getOrNull() ?: return
+        val cameraPose = runCatching { camera.pose }.getOrNull() ?: return
+        val cameraState = runCatching { camera.trackingState }.getOrNull() ?: return
 
-                plane.trackingState == TrackingState.TRACKING &&
-                    plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
-                    plane.subsumedBy == null &&
-                    plane.isPoseInPolygon(hit.hitPose)
-            }
+        val hits = runCatching {
+            frame.hitTest(hitX, pending.offset.y)
         }.onFailure {
             Log.w(TRACKING_TAG, "[$modeName] Physical plane hit test failed", it)
-        }.getOrNull()
+        }.getOrDefault(emptyList())
+
+        // Connect ARInteractionPolicy to filter hits using unified surface acceptance
+        val floorHit = interactionPolicy.filterBestHitResult(
+            hitResults = hits,
+            cameraPose = cameraPose,
+            cameraState = cameraState
+        )
 
         if (floorHit == null) {
-            Log.w(
+            // Retain pending tap until hitTest finds a tracked floor plane or times out (2.5s)
+            Log.d(
                 TRACKING_TAG,
-                "[$modeName] No tracked horizontal floor plane found"
+                "[$modeName] Waiting for tracked horizontal floor plane hit (elapsed ${elapsedMs}ms)"
             )
+            return
+        }
+
+        if (!pendingPlacementRef.compareAndSet(pending, null)) {
             return
         }
 
@@ -872,6 +900,17 @@ class ARTrackingManager(
                         alpha = 0.35f
                     )
                     lastVerifiedWorldPose = dampedPose
+                    currentSmoothedPose = dampedPose
+
+                    // Apply smoothed offset delta to visually damp micro-tremors on rendered model
+                    val rawX = verifiedPose.tx()
+                    val rawY = verifiedPose.ty()
+                    val rawZ = verifiedPose.tz()
+                    val smoothX = dampedPose.tx()
+                    val smoothY = dampedPose.ty()
+                    val smoothZ = dampedPose.tz()
+                    smoothedOffset = Position(smoothX - rawX, smoothY - rawY, smoothZ - rawZ)
+
                     trackingLostSinceNanos = null
                     recoveryGate.reset()
                 }
@@ -911,8 +950,28 @@ class ARTrackingManager(
                     return
                 }
 
+                // Verify savedPose is supported by an active physical floor plane with height check
+                val eligiblePlane = runCatching {
+                    session.getAllTrackables(Plane::class.java).firstOrNull { plane ->
+                        trackingHelper.isEligiblePhysicalFloorPlane(
+                            plane = plane,
+                            cameraIsTracking = cameraState == TrackingState.TRACKING,
+                            hitPose = savedPose,
+                            checkHeightDelta = true
+                        )
+                    }
+                }.getOrNull()
+
+                if (eligiblePlane == null) {
+                    Log.d(
+                        TRACKING_TAG,
+                        "[$modeName] Recovery deferred: no matching physical floor plane for saved pose"
+                    )
+                    return
+                }
+
                 val candidate = runCatching {
-                    session.createAnchor(savedPose)
+                    eligiblePlane.createAnchor(savedPose)
                 }.onFailure {
                     Log.w(TRACKING_TAG, "[$modeName] Anchor recovery failed", it)
                 }.getOrNull() ?: return
@@ -938,7 +997,7 @@ class ARTrackingManager(
 
                     Log.i(
                         TRACKING_TAG,
-                        "[$modeName] Anchor recovered with verified pose"
+                        "[$modeName] Anchor recovered on verified floor plane"
                     )
                 } else {
                     runCatching { candidate.detach() }
@@ -1040,10 +1099,18 @@ class ARTrackingManager(
         }
     }
 
+    private var lastPlaneCheckTimestamp = 0L
+
     private fun updateRealHorizontalPlaneStatus(
         session: Session,
         cameraState: TrackingState?
     ) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPlaneCheckTimestamp < 250L) {
+            return
+        }
+        lastPlaneCheckTimestamp = now
+
         val detected =
             cameraState == TrackingState.TRACKING &&
                 runCatching {
@@ -1074,6 +1141,8 @@ class ARTrackingManager(
         activeAnchor = null
         anchorTrackingState = null
         lastVerifiedWorldPose = null
+        currentSmoothedPose = null
+        smoothedOffset = Position(0f, 0f, 0f)
         trackingLostSinceNanos = null
 
         pendingPlacementRef.set(null)
@@ -1081,6 +1150,7 @@ class ARTrackingManager(
 
         isPlaneDetected = false
         lastCameraTrackingState = null
+        lastPlaneCheckTimestamp = 0L
     }
 
     fun dispose() = clear()

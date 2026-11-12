@@ -60,6 +60,7 @@ fun ARTrackingSimulationView(
     customModelFile: File?,
     isModelVisible: Boolean,
     color: Color,
+    modifier: Modifier = Modifier,
     metallic: Float = 0.25f,
     roughness: Float = 0.45f,
     scale: Float,
@@ -81,8 +82,7 @@ fun ARTrackingSimulationView(
     engine: Engine,
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader,
-    modifier: Modifier = Modifier
+    environmentLoader: EnvironmentLoader
 ) {
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
@@ -143,10 +143,14 @@ fun ARTrackingSimulationView(
         )
     }
 
-    val toyCarModel = rememberModelInstance(
-        modelLoader = modelLoader,
-        fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
-    )
+    val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
+        rememberModelInstance(
+            modelLoader = modelLoader,
+            fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
+        )
+    } else {
+        null
+    }
 
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->

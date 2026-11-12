@@ -89,6 +89,8 @@ filamentWebsite = "1.72.1"
 # that changes MATERIAL_VERSION needs no blob here, only a desktop-demo run.
 filamentKmp = "0.8.0"
 arCore = "1.57.0"
+arsceneview = "4.63.0"
+junit = "4.13.2"
 
 # Networking
 fuel = "2.3.1"
@@ -221,6 +223,7 @@ filament-kmp-gltfio = { group = "io.github.erkko68.filament", name = "gltfio", v
 
 # AR
 arcore = { group = "com.google.ar", name = "core", version.ref = "arCore" }
+arsceneview = { group = "io.github.sceneview", name = "arsceneview", version.ref = "arsceneview" }
 
 # Jetpack XR ARCore (preview) — opt-in for headsets / glasses. Consumers add
 # this themselves; arsceneview/ wires it as compileOnly so non-XR apps don't
@@ -286,6 +289,7 @@ litert-gpu = { group = "com.google.ai.edge.litert", name = "litert-gpu", version
 onnxruntime-jvm = { group = "com.microsoft.onnxruntime", name = "onnxruntime", version.ref = "onnxruntime" }
 
 # Testing
+junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestJunit" }
 androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 androidx-test-rules = { group = "androidx.test", name = "rules", version.ref = "androidxTestRules" }

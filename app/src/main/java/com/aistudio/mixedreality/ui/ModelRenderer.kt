@@ -27,15 +27,16 @@ import io.github.sceneview.model.ModelInstance
 import io.github.sceneview.node.CubeNode
 import io.github.sceneview.node.CylinderNode
 import io.github.sceneview.node.ModelNode
+import com.aistudio.mixedreality.R
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
 import io.github.sceneview.node.ViewNode
 import java.io.File
 
-enum class ViewportMode(val title: String) {
-    MR("MR"),
-    AR("AR"),
-    OBJECT("Object")
+enum class ViewportMode(val title: String, val titleRes: Int = 0) {
+    MR("MR", R.string.mode_ar),
+    AR("AR", R.string.mode_ar),
+    OBJECT("Object", R.string.mode_3d)
 }
 
 enum class ModelItem(

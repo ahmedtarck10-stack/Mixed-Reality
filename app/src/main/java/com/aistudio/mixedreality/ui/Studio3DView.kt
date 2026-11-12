@@ -60,6 +60,7 @@ fun Studio3DView(
     customModelFile: File?,
     isModelVisible: Boolean,
     color: Color,
+    modifier: Modifier = Modifier,
     metallic: Float,
     roughness: Float,
     scale: Float,
@@ -81,8 +82,7 @@ fun Studio3DView(
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
     environmentLoader: EnvironmentLoader,
-    surfaceMirrorer: SurfaceMirrorer? = null,
-    modifier: Modifier = Modifier
+    surfaceMirrorer: SurfaceMirrorer? = null
 ) {
     val windowManager = rememberViewNodeManager()
     val scope = rememberCoroutineScope()
@@ -116,10 +116,14 @@ fun Studio3DView(
         )
     }
 
-    val toyCarModel = rememberModelInstance(
-        modelLoader = modelLoader,
-        fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
-    )
+    val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
+        rememberModelInstance(
+            modelLoader = modelLoader,
+            fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
+        )
+    } else {
+        null
+    }
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
             rememberModelInstance(

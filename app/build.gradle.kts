@@ -11,7 +11,7 @@ android {
     defaultConfig {
         applicationId = "com.aistudio.mixedreality.fquznk"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 2
         versionName = "1.1"
 
@@ -84,10 +84,9 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
-    // ARSceneView includes the matching SceneView runtime transitively. Use the complete
-    // published artifact instead of manually importing a partial library source tree.
-    implementation("io.github.sceneview:arsceneview:4.63.0")
+    // ARSceneView includes the matching SceneView runtime transitively.
+    implementation(libs.arsceneview)
     implementation(libs.arcore)
 
-    testImplementation("junit:junit:4.13.2")
+    testImplementation(libs.junit)
 }

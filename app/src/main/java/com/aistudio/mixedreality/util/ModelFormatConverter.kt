@@ -48,12 +48,26 @@ object ModelFormatConverter {
                 )
             }
             "gltf" -> {
+                var binWarning: String? = null
+                try {
+                    val content = sourceFile.readText()
+                    val binRegex = Regex(""""uri"\s*:\s*"([^"]+\.bin)"""")
+                    val match = binRegex.find(content)
+                    if (match != null) {
+                        val binName = match.groupValues[1]
+                        val companionBin = File(sourceFile.parentFile, binName)
+                        if (!companionBin.exists() || companionBin.length() == 0L) {
+                            binWarning = "Referenced binary buffer '$binName' not found in model folder"
+                        }
+                    }
+                } catch (_: Exception) {}
+
                 ConversionResult(
                     glbFile = sourceFile,
                     originalFormat = "glTF",
                     triangleCount = 0,
                     vertexCount = 0,
-                    message = "Native glTF Model Loaded"
+                    message = if (binWarning != null) "glTF Model Loaded ($binWarning)" else "Native glTF Model Loaded"
                 )
             }
             "obj" -> {
@@ -129,19 +143,51 @@ object ModelFormatConverter {
                                 rawUvs.add(parts[2].toFloatOrNull() ?: 0f)
                             }
                         }
+                        "mtllib" -> {
+                            val mtlName = parts.getOrNull(1)
+                            if (mtlName != null) {
+                                val mtlFile = File(objFile.parentFile, mtlName)
+                                if (mtlFile.exists()) {
+                                    runCatching {
+                                        mtlFile.bufferedReader().useLines { mLines ->
+                                            for (mLine in mLines) {
+                                                val mParts = mLine.trim().split("\\s+".toRegex())
+                                                if (mParts.getOrNull(0) == "Kd" && mParts.size >= 4) {
+                                                    // Parsed companion MTL diffuse color
+                                                    Log.d(TAG, "Parsed diffuse color from MTL: $mLine")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         "f" -> {
-                            // Faces (support triangles and quads)
+                            // Faces (support triangles, quads, and negative relative indices)
                             val faceVerts = parts.drop(1)
                             if (faceVerts.size >= 3) {
-                                val vertexTuples = faceVerts.map { parseObjFaceVertex(it) }
+                                val totalV = rawPositions.size / 3
+                                val totalU = rawUvs.size / 2
+                                val totalN = rawNormals.size / 3
+                                val vertexTuples = faceVerts.map { parseObjFaceVertex(it, totalV, totalU, totalN) }
+
                                 // Triangulate as fan
                                 for (i in 1 until vertexTuples.size - 1) {
                                     val tri = listOf(vertexTuples[0], vertexTuples[i], vertexTuples[i + 1])
+                                    // Skip invalid triangles instead of replacing with (0,0,0) to prevent spiky origin distortion
+                                    val allVerticesValid = tri.all { tv ->
+                                        val vIdx = (tv.vIdx - 1) * 3
+                                        vIdx in 0 until (rawPositions.size - 2)
+                                    }
+                                    if (!allVerticesValid) {
+                                        continue
+                                    }
+
                                     for (tv in tri) {
                                         val vIdx = (tv.vIdx - 1) * 3
-                                        val px = if (vIdx in 0 until rawPositions.size - 2) rawPositions[vIdx] else 0f
-                                        val py = if (vIdx in 0 until rawPositions.size - 2) rawPositions[vIdx + 1] else 0f
-                                        val pz = if (vIdx in 0 until rawPositions.size - 2) rawPositions[vIdx + 2] else 0f
+                                        val px = rawPositions[vIdx]
+                                        val py = rawPositions[vIdx + 1]
+                                        val pz = rawPositions[vIdx + 2]
 
                                         positions.add(px)
                                         positions.add(py)
@@ -284,7 +330,7 @@ object ModelFormatConverter {
             originalFormat = "USDZ (Apple)",
             triangleCount = 12,
             vertexCount = 24,
-            message = "Apple USDZ Model Imported & Ready"
+            message = "Apple USDZ contains proprietary binary USDC/USDA. A spatial bounding proxy is shown; convert to GLB for full fidelity."
         )
     }
 
@@ -295,11 +341,23 @@ object ModelFormatConverter {
 
     private data class ObjFaceVertex(val vIdx: Int, val tIdx: Int, val nIdx: Int)
 
-    private fun parseObjFaceVertex(token: String): ObjFaceVertex {
+    private fun parseObjFaceVertex(
+        token: String,
+        totalV: Int = 0,
+        totalT: Int = 0,
+        totalN: Int = 0
+    ): ObjFaceVertex {
         val parts = token.split('/')
-        val v = parts.getOrNull(0)?.toIntOrNull() ?: 1
-        val t = parts.getOrNull(1)?.toIntOrNull() ?: 0
-        val n = parts.getOrNull(2)?.toIntOrNull() ?: 0
+        val rawV = parts.getOrNull(0)?.toIntOrNull() ?: 1
+        val rawT = parts.getOrNull(1)?.toIntOrNull() ?: 0
+        val rawN = parts.getOrNull(2)?.toIntOrNull() ?: 0
+
+        // Handle negative relative indices in OBJ specification:
+        // -1 refers to the most recently added element, -2 to the second most recent, etc.
+        val v = if (rawV < 0) (totalV + 1 + rawV).coerceAtLeast(1) else rawV
+        val t = if (rawT < 0) (totalT + 1 + rawT).coerceAtLeast(0) else rawT
+        val n = if (rawN < 0) (totalN + 1 + rawN).coerceAtLeast(0) else rawN
+
         return ObjFaceVertex(v, t, n)
     }
 

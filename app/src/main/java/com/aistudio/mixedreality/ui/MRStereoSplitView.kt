@@ -57,6 +57,7 @@ fun MRStereoSplitView(
     customModelFile: File?,
     isModelVisible: Boolean,
     color: Color,
+    modifier: Modifier = Modifier,
     metallic: Float,
     roughness: Float,
     scale: Float,
@@ -82,8 +83,7 @@ fun MRStereoSplitView(
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
     onStopAutoRotate: () -> Unit = {},
-    onFallbackToObject: () -> Unit = {},
-    modifier: Modifier = Modifier
+    onFallbackToObject: () -> Unit = {}
 ) {
     MRStereoARCoreView(
         modelItem = modelItem,
@@ -381,10 +381,15 @@ private fun MRStereoARCoreView(
         )
     }
 
-    val toyCarModel = rememberModelInstance(
-        modelLoader = modelLoader,
-        fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
-    )
+    // Lazy conditional loading: only load toyCarModel when actively displayed
+    val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
+        rememberModelInstance(
+            modelLoader = modelLoader,
+            fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
+        )
+    } else {
+        null
+    }
 
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
@@ -546,8 +551,14 @@ private fun MRStereoARCoreView(
                                     0f
                                 }
 
+                            val effectivePosition = Position(
+                                x = modelOffset.x + trackingManager.smoothedOffset.x,
+                                y = modelOffset.y + trackingManager.smoothedOffset.y,
+                                z = modelOffset.z + trackingManager.smoothedOffset.z
+                            )
+
                             Node(
-                                position = modelOffset,
+                                position = effectivePosition,
                                 rotation = Rotation(
                                     x = safeRotX,
                                     y = safeRotY,

@@ -1,6 +1,6 @@
 {
   "name": "Mixed Reality",
-  "description": "Mixed Reality 3D Studio and AR viewer app with spatial gestures, model rendering, and cloud library.",
+  "description": "3D and Augmented Reality studio viewer and interaction app",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -90,10 +90,20 @@ class VideoSessionRecorder(private val context: Context) {
             captureJob = scope.launch(Dispatchers.Main) {
                 while (isActive) {
                     MediaManager.captureWindowBitmap(activity) { bmp ->
-                        if (capturedBitmaps.size < 120) {
-                            // Scale down slightly for fast memory/encoding
-                            val scaled = Bitmap.createScaledBitmap(bmp, 540, 960, true)
-                            capturedBitmaps.add(scaled)
+                        try {
+                            if (capturedBitmaps.size < 120) {
+                                val scaled = Bitmap.createScaledBitmap(bmp, 540, 960, true)
+                                val rgb565 = if (scaled.config != Bitmap.Config.RGB_565) {
+                                    val copy = scaled.copy(Bitmap.Config.RGB_565, false)
+                                    if (copy != null) {
+                                        scaled.recycle()
+                                        copy
+                                    } else scaled
+                                } else scaled
+                                capturedBitmaps.add(rgb565)
+                            }
+                        } finally {
+                            bmp.recycle()
                         }
                     }
                     delay(200L) // ~5 frames per second snapshot capture
@@ -263,8 +273,14 @@ class VideoSessionRecorder(private val context: Context) {
     }
 
     private fun bitmapToYuv420(bitmap: Bitmap, width: Int, height: Int): ByteArray {
+        val safeBmp = if (bitmap.width != width || bitmap.height != height) {
+            Bitmap.createScaledBitmap(bitmap, width, height, true)
+        } else null
+        val target = safeBmp ?: bitmap
+
         val argb = IntArray(width * height)
-        bitmap.getPixels(argb, 0, width, 0, 0, width, height)
+        target.getPixels(argb, 0, width, 0, 0, width, height)
+        safeBmp?.recycle()
         val yuv = ByteArray(width * height * 3 / 2)
 
         var yIndex = 0

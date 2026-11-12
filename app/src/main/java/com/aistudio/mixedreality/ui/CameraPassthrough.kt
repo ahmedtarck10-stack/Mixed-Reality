@@ -90,13 +90,35 @@ fun CameraPassthroughBackground(
 class CameraPassthroughTextureView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private var backgroundThread: android.os.HandlerThread? = null
+    private var backgroundHandler: Handler? = null
 
     init {
         surfaceTextureListener = this
     }
 
+    private fun startBackgroundThread() {
+        if (backgroundThread == null) {
+            backgroundThread = android.os.HandlerThread("CameraPassthroughBackground").apply {
+                start()
+                backgroundHandler = Handler(looper)
+            }
+        }
+    }
+
+    private fun stopBackgroundThread() {
+        try {
+            backgroundThread?.quitSafely()
+            backgroundThread?.join(400)
+        } catch (_: InterruptedException) {
+        } finally {
+            backgroundThread = null
+            backgroundHandler = null
+        }
+    }
+
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        startBackgroundThread()
         openBackCamera(surface)
     }
 
@@ -104,6 +126,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         stopCamera()
+        stopBackgroundThread()
         return true
     }
 
@@ -112,6 +135,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         stopCamera()
+        stopBackgroundThread()
     }
 
     @SuppressLint("MissingPermission")
@@ -123,6 +147,8 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
                 val chars = cameraManager.getCameraCharacteristics(id)
                 chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             } ?: cameraManager.cameraIdList.firstOrNull() ?: return
+
+            val handler = backgroundHandler ?: Handler(Looper.getMainLooper())
 
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -140,7 +166,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
                     camera.close()
                     cameraDevice = null
                 }
-            }, mainHandler)
+            }, handler)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to open camera for passthrough: ${e.message}")
         }
@@ -155,6 +181,8 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             }
 
+            val handler = backgroundHandler ?: Handler(Looper.getMainLooper())
+
             camera.createCaptureSession(
                 listOf(previewSurface),
                 object : CameraCaptureSession.StateCallback() {
@@ -162,7 +190,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
                         if (cameraDevice == null) return
                         captureSession = session
                         try {
-                            session.setRepeatingRequest(requestBuilder.build(), null, mainHandler)
+                            session.setRepeatingRequest(requestBuilder.build(), null, handler)
                         } catch (e: Exception) {
                             Log.w(TAG, "Failed repeating request: ${e.message}")
                         }
@@ -172,7 +200,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
                         Log.w(TAG, "Camera capture session configuration failed")
                     }
                 },
-                mainHandler
+                handler
             )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to start preview session: ${e.message}")

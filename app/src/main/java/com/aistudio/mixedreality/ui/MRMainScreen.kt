@@ -52,8 +52,10 @@ import io.github.sceneview.rememberEnvironmentLoader
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberModelLoader
 import io.github.sceneview.rememberSurfaceMirrorer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -106,10 +108,10 @@ fun MRMainScreen(
     // Cloud 3D Library Sheet (Google Drive Models)
     var showCloudLibrary by remember { mutableStateOf(false) }
 
-    // Handle incoming 3D model files from external apps / file manager
+    // Handle incoming 3D model files from external apps / file manager on background thread
     LaunchedEffect(incomingModelUri) {
         val uri = incomingModelUri ?: return@LaunchedEffect
-        val copiedFile = copyUriToLocalCache(context, uri)
+        val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
         if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
             customModelFile = copiedFile
             isModelVisible = true
@@ -196,7 +198,7 @@ fun MRMainScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                val copiedFile = copyUriToLocalCache(context, uri)
+                val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
                 if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
                     customModelFile = copiedFile
                     isModelVisible = true
@@ -636,12 +638,10 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
         val cleanName = rawName.substringAfterLast('/').substringAfterLast('\\').trim()
         val extension = cleanName.substringAfterLast('.', "").lowercase()
         val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj")
-        val finalName = if (!isRecognized3D) {
-            if (cleanName.contains('.')) "${cleanName.substringBeforeLast('.')}.glb" else "$cleanName.glb"
-        } else {
-            cleanName
-        }
-        val cacheFile = File(context.cacheDir, finalName)
+        val baseName = if (cleanName.contains('.')) cleanName.substringBeforeLast('.') else cleanName
+        val safeExt = if (isRecognized3D) ".$extension" else ".glb"
+        val uniqueName = "${baseName}_${System.currentTimeMillis()}$safeExt"
+        val cacheFile = File(context.cacheDir, uniqueName)
         context.contentResolver.openInputStream(uri)?.use { input ->
             cacheFile.outputStream().use { output ->
                 input.copyTo(output)

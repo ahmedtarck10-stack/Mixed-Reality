@@ -24,8 +24,10 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.aistudio.mixedreality.R
 import com.aistudio.mixedreality.ui.theme.*
 import com.google.android.filament.Engine
 import com.google.ar.core.ArCoreApk
@@ -115,6 +117,7 @@ fun ARMixedRealityView(
     customModelFile: File?,
     isModelVisible: Boolean,
     color: Color,
+    modifier: Modifier = Modifier,
     metallic: Float = 0.25f,
     roughness: Float = 0.45f,
     scale: Float,
@@ -136,8 +139,7 @@ fun ARMixedRealityView(
     engine: Engine,
     modelLoader: ModelLoader,
     materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader,
-    modifier: Modifier = Modifier
+    environmentLoader: EnvironmentLoader
 ) {
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
@@ -186,10 +188,15 @@ fun ARMixedRealityView(
         )
     }
 
-    val toyCarModel = rememberModelInstance(
-        modelLoader = modelLoader,
-        fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
-    )
+    // Lazy conditional loading: only fetch 3D model if it is actively selected
+    val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
+        rememberModelInstance(
+            modelLoader = modelLoader,
+            fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
+        )
+    } else {
+        null
+    }
 
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
@@ -330,7 +337,15 @@ fun ARMixedRealityView(
                 val canBindPlayStore = runCatching {
                     val intent = Intent("com.google.android.play.core.install.BIND_INSTALL_SERVICE")
                         .setPackage("com.android.vending")
-                    val resolveInfo = context.packageManager.queryIntentServices(intent, 0)
+                    val resolveInfo = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        context.packageManager.queryIntentServices(
+                            intent,
+                            android.content.pm.PackageManager.ResolveInfoFlags.of(0)
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.packageManager.queryIntentServices(intent, 0)
+                    }
                     resolveInfo.isNotEmpty()
                 }.getOrDefault(false)
 
@@ -467,6 +482,8 @@ fun ARMixedRealityView(
             planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
             updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
             instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
+            // FocusMode.FIXED locks hyperfocal depth to prevent autofocus hunting
+            // from inducing feature-point micro-drift and plane instability during continuous 6DoF tracking.
             focusMode = Config.FocusMode.FIXED,
             sessionConfiguration = { _, config ->
                 config.planeFindingMode =
@@ -534,8 +551,14 @@ fun ARMixedRealityView(
                             0f
                         }
 
+                    val effectivePosition = Position(
+                        x = modelOffset.x + trackingManager.smoothedOffset.x,
+                        y = modelOffset.y + trackingManager.smoothedOffset.y,
+                        z = modelOffset.z + trackingManager.smoothedOffset.z
+                    )
+
                     Node(
-                        position = modelOffset,
+                        position = effectivePosition,
                         rotation = Rotation(
                             x = safeRotX,
                             y = safeRotY,
@@ -809,7 +832,7 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Mixed Reality AR mode requires camera access to detect physical surfaces and render 3D models in real-time.",
+                    text = stringResource(R.string.camera_permission_required),
                     fontSize = 13.sp,
                     color = Color.White.copy(alpha = 0.7f),
                     textAlign = TextAlign.Center,
@@ -826,7 +849,7 @@ fun PermissionRequestPlaceholder(onGrant: () -> Unit) {
                     modifier = Modifier.testTag("grant_camera_button")
                 ) {
                     Text(
-                        "Grant Camera Permission",
+                        stringResource(R.string.grant_permission),
                         fontWeight = FontWeight.Bold
                     )
                 }

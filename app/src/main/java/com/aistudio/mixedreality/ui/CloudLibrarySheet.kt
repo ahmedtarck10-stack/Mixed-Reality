@@ -65,10 +65,10 @@ fun CloudLibrarySheet(
     val presetCloudModels = remember {
         listOf(
             CloudLibraryItem(
-                title = "Vision Headset (Apple Spatial)",
-                format = "USDZ / GLB",
-                description = "Ahmed Tarck Mixed Reality Model Library",
-                directUrl = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb",
+                title = "Spatial Helmet / Visor",
+                format = "GLB 2.0 PBR",
+                description = "Classic spatial visor model with reflective glass & PBR textures",
+                directUrl = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
                 icon = "🥽"
             ),
             CloudLibraryItem(
@@ -102,14 +102,39 @@ fun CloudLibrarySheet(
 
         scope.launch(Dispatchers.IO) {
             try {
-                val url = URL(urlStr)
-                val connection = url.openConnection()
-                connection.connectTimeout = 12000
-                connection.readTimeout = 15000
-                val input = connection.getInputStream()
+                var currentUrl = urlStr.trim()
+                var connection: java.net.HttpURLConnection? = null
+                var redirects = 0
+                val maxRedirects = 6
 
-                val safeExt = if (urlStr.contains(".usdz", ignoreCase = true)) "usdz"
-                else if (urlStr.contains(".obj", ignoreCase = true)) "obj"
+                while (redirects < maxRedirects) {
+                    val url = URL(currentUrl)
+                    connection = (url.openConnection() as? java.net.HttpURLConnection)?.apply {
+                        connectTimeout = 12000
+                        readTimeout = 15000
+                        instanceFollowRedirects = true
+                        setRequestProperty("User-Agent", "MixedReality-3D-Viewer/1.1")
+                    } ?: break
+
+                    val status = connection.responseCode
+                    if (status in listOf(301, 302, 303, 307, 308)) {
+                        val newUrl = connection.getHeaderField("Location") ?: break
+                        currentUrl = if (newUrl.startsWith("http")) newUrl else URL(URL(currentUrl), newUrl).toString()
+                        connection.disconnect()
+                        redirects++
+                    } else if (status in 200..299) {
+                        break
+                    } else {
+                        throw java.io.IOException("Server returned HTTP $status")
+                    }
+                }
+
+                val finalConnection = connection ?: throw java.io.IOException("Failed opening connection")
+                val input = finalConnection.inputStream
+
+                val safeExt = if (currentUrl.contains(".usdz", ignoreCase = true)) "usdz"
+                else if (currentUrl.contains(".obj", ignoreCase = true)) "obj"
+                else if (currentUrl.contains(".gltf", ignoreCase = true)) "gltf"
                 else "glb"
 
                 val fileName = "${name.replace("\\s+".toRegex(), "_")}_${System.currentTimeMillis()}.$safeExt"
@@ -121,6 +146,12 @@ fun CloudLibrarySheet(
 
                 destFile.outputStream().use { output ->
                     input.copyTo(output)
+                }
+                finalConnection.disconnect()
+
+                if (!destFile.exists() || destFile.length() < 32L) {
+                    destFile.delete()
+                    throw java.io.IOException("Downloaded file was empty or corrupted")
                 }
 
                 withContext(Dispatchers.Main) {

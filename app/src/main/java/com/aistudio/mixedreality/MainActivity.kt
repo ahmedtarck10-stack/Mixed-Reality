@@ -45,10 +45,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             MixedRealityTheme {
                 val systemDensity = LocalDensity.current
-                val fixedDensity = remember(systemDensity.density) {
+                val fixedDensity = remember(systemDensity.density, systemDensity.fontScale) {
                     Density(
                         density = systemDensity.density,
-                        fontScale = 1.0f
+                        fontScale = systemDensity.fontScale
                     )
                 }
 
@@ -112,10 +112,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enforce30HzRefreshRate() {
-        // Enforce display refresh rate strictly to 30.0f Hz (mandatory) to eliminate timestamp jitter and drifting
-        // Modern 120Hz/LTPO devices (Samsung Galaxy S21-S26, Z Fold/Flip, A25) mismatch ARCore camera (30fps)
-        // and motion sensors (~200Hz).
-        // Enforcing 30Hz synchronizes frame presentation and VIO sensor timestamps directly.
+        // Enforce display refresh rate preference strictly to 30.0f Hz to eliminate sensor jitter
         try {
             window.attributes = window.attributes.apply {
                 preferredRefreshRate = 30.0f
@@ -123,12 +120,12 @@ class MainActivity : ComponentActivity() {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                 val currentDisplay = display
                 val modes = currentDisplay?.supportedModes.orEmpty()
-                // Pick 30Hz native mode if available on variable refresh rate / LTPO panels, or 60Hz integer multiple fallback
+                // Pick 30Hz native mode if available on variable refresh rate / LTPO panels.
+                // Strictly prioritize 30Hz without forcing 60Hz.
                 val mode30 = modes.firstOrNull { kotlin.math.abs(it.refreshRate - 30.0f) < 1.0f }
-                val targetMode = mode30 ?: modes.firstOrNull { kotlin.math.abs(it.refreshRate - 60.0f) < 1.0f }
-                if (targetMode != null) {
+                if (mode30 != null) {
                     window.attributes = window.attributes.apply {
-                        preferredDisplayModeId = targetMode.modeId
+                        preferredDisplayModeId = mode30.modeId
                         preferredRefreshRate = 30.0f
                     }
                 }
@@ -143,7 +140,12 @@ class MainActivity : ComponentActivity() {
         return when (intent.action) {
             Intent.ACTION_VIEW -> intent.data
             Intent.ACTION_SEND -> {
-                intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: intent.data
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                } ?: intent.data
             }
             else -> intent.data
         }
