@@ -595,17 +595,31 @@ class ARTrackingHelper {
         recoveryConfirmationCount = 0
         listener?.onTrackingLost()
 
-        val eligiblePlane = frame.getUpdatedTrackables(Plane::class.java)
+        // 1. Check updated trackables in current frame (zero extra cost)
+        var eligiblePlane = frame.getUpdatedTrackables(Plane::class.java)
             .firstOrNull { plane ->
-                // ✅ استخدام isEligibleRecoveryPlane بدلاً من الشروط المكررة
                 isEligibleRecoveryPlane(
+                    plane = plane,
                     cameraIsTracking = cameraState == TrackingState.TRACKING,
-                    planeIsTracking = plane.trackingState == TrackingState.TRACKING,
-                    isUpwardHorizontalPlane = plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING,
-                    isSubsumed = plane.subsumedBy != null,
-                    savedPoseInsidePolygon = plane.isPoseInPolygon(originalPose)
+                    savedPose = originalPose
                 )
             }
+
+        // 2. If updated trackables did not yield a plane, check the cached floor plane
+        if (eligiblePlane == null && cachedFloorPlane != null) {
+            val cached = cachedFloorPlane
+            if (cached != null && isEligibleRecoveryPlane(cached, cameraState == TrackingState.TRACKING, originalPose)) {
+                eligiblePlane = cached
+            }
+        }
+
+        // 3. Fallback: query detectFloorPlane which uses a 250ms throttled cache
+        if (eligiblePlane == null) {
+            val detected = detectFloorPlane(frame, cameraState)
+            if (detected != null && isEligibleRecoveryPlane(detected, cameraState == TrackingState.TRACKING, originalPose)) {
+                eligiblePlane = detected
+            }
+        }
 
         eligiblePlane?.let { plane ->
             try {

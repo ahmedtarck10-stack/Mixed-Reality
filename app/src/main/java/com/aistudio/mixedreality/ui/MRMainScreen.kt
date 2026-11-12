@@ -640,8 +640,8 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
         val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj")
         val baseName = if (cleanName.contains('.')) cleanName.substringBeforeLast('.') else cleanName
         val safeExt = if (isRecognized3D) ".$extension" else ".glb"
-        val uniqueName = "${baseName}_${System.currentTimeMillis()}$safeExt"
-        val cacheFile = File(context.cacheDir, uniqueName)
+        val modelFolder = File(context.cacheDir, "model_${System.currentTimeMillis()}").apply { mkdirs() }
+        val cacheFile = File(modelFolder, "$baseName$safeExt")
         context.contentResolver.openInputStream(uri)?.use { input ->
             cacheFile.outputStream().use { output ->
                 input.copyTo(output)
@@ -652,7 +652,7 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
             return null
         }
 
-        val conversion = ModelFormatConverter.processIncomingModel(context, cacheFile)
+        val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile)
         conversion.glbFile
     } catch (e: Exception) {
         null

@@ -300,17 +300,15 @@ class ARInteractionPolicy(private val trackingHelper: ARTrackingHelper) {
 
             val planeEligible = if (savedPose != null) {
                 trackingHelper.isEligibleRecoveryPlane(
-                    cameraIsTracking        = cameraIsTracking,
-                    planeIsTracking         = plane.trackingState == TrackingState.TRACKING,
-                    isUpwardHorizontalPlane = plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING,
-                    isSubsumed              = plane.subsumedBy != null,
-                    savedPoseInsidePolygon  = plane.isPoseInPolygon(savedPose)
+                    plane = plane,
+                    cameraIsTracking = cameraIsTracking,
+                    savedPose = savedPose
                 )
             } else {
                 trackingHelper.isEligiblePhysicalFloorPlane(
-                    plane           = plane,
+                    plane = plane,
                     cameraIsTracking = cameraIsTracking,
-                    hitPose         = hitResult.hitPose
+                    hitPose = hitResult.hitPose
                 )
             }
 

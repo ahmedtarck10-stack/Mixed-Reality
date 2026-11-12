@@ -2,7 +2,6 @@ package com.aistudio.mixedreality.util
 
 import android.content.Context
 import android.util.Log
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -26,11 +25,12 @@ object ModelFormatConverter {
         val originalFormat: String,
         val triangleCount: Int,
         val vertexCount: Int,
-        val message: String
+        val message: String,
+        val isSuccess: Boolean = true
     )
 
     /**
-     * Determines whether the given file needs conversion (e.g. .obj, .usdz, .usda).
+     * Determines whether the given file needs conversion (e.g. .obj, .usdz, .usda, .usdc).
      */
     fun processIncomingModel(context: Context, sourceFile: File): ConversionResult =
         processIncomingModel(context.cacheDir, sourceFile)
@@ -44,11 +44,13 @@ object ModelFormatConverter {
                     originalFormat = "GLB",
                     triangleCount = 0,
                     vertexCount = 0,
-                    message = "Native GLB Model Loaded"
+                    message = "Native GLB Model Loaded",
+                    isSuccess = true
                 )
             }
             "gltf" -> {
                 var binWarning: String? = null
+                var hasMissingBuffer = false
                 try {
                     val content = sourceFile.readText()
                     val binRegex = Regex(""""uri"\s*:\s*"([^"]+\.bin)"""")
@@ -58,6 +60,7 @@ object ModelFormatConverter {
                         val companionBin = File(sourceFile.parentFile, binName)
                         if (!companionBin.exists() || companionBin.length() == 0L) {
                             binWarning = "Referenced binary buffer '$binName' not found in model folder"
+                            hasMissingBuffer = true
                         }
                     }
                 } catch (_: Exception) {}
@@ -67,14 +70,39 @@ object ModelFormatConverter {
                     originalFormat = "glTF",
                     triangleCount = 0,
                     vertexCount = 0,
-                    message = if (binWarning != null) "glTF Model Loaded ($binWarning)" else "Native glTF Model Loaded"
+                    message = if (binWarning != null) "Incomplete glTF model ($binWarning)" else "Native glTF Model Loaded",
+                    isSuccess = !hasMissingBuffer
                 )
             }
             "obj" -> {
                 convertObjToGlb(cacheDir, sourceFile)
             }
-            "usdz", "usda", "usdc" -> {
+            "usdz" -> {
                 convertUsdzToGlb(cacheDir, sourceFile)
+            }
+            "usda" -> {
+                val proxyGlb = File(cacheDir, "${sourceFile.nameWithoutExtension}_usda.glb")
+                generateUsdzSpatialProxy(proxyGlb, sourceFile.name)
+                ConversionResult(
+                    glbFile = proxyGlb,
+                    originalFormat = "USDZ (Apple)",
+                    triangleCount = 12,
+                    vertexCount = 24,
+                    message = "USDA text format contains no compiled binary geometry. A bounding box proxy is shown.",
+                    isSuccess = false
+                )
+            }
+            "usdc" -> {
+                val proxyGlb = File(cacheDir, "${sourceFile.nameWithoutExtension}_usdc.glb")
+                generateUsdzSpatialProxy(proxyGlb, sourceFile.name)
+                ConversionResult(
+                    glbFile = proxyGlb,
+                    originalFormat = "USDZ (Apple)",
+                    triangleCount = 12,
+                    vertexCount = 24,
+                    message = "USDC binary Crate format contains proprietary Apple geometry. A bounding box proxy is shown.",
+                    isSuccess = false
+                )
             }
             else -> {
                 // If unknown extension, assume it might be a binary GLB renamed or try directly
@@ -83,7 +111,8 @@ object ModelFormatConverter {
                     originalFormat = extension.uppercase(),
                     triangleCount = 0,
                     vertexCount = 0,
-                    message = "3D Model Ready"
+                    message = "3D Model Ready",
+                    isSuccess = true
                 )
             }
         }
@@ -112,6 +141,8 @@ object ModelFormatConverter {
         var maxX = -Float.MAX_VALUE
         var maxY = -Float.MAX_VALUE
         var maxZ = -Float.MAX_VALUE
+
+        var parsedMtlNote: String? = null
 
         try {
             objFile.bufferedReader().useLines { lines ->
@@ -153,12 +184,13 @@ object ModelFormatConverter {
                                             for (mLine in mLines) {
                                                 val mParts = mLine.trim().split("\\s+".toRegex())
                                                 if (mParts.getOrNull(0) == "Kd" && mParts.size >= 4) {
-                                                    // Parsed companion MTL diffuse color
-                                                    Log.d(TAG, "Parsed diffuse color from MTL: $mLine")
+                                                    parsedMtlNote = "Material definition parsed ($mtlName)"
                                                 }
                                             }
                                         }
                                     }
+                                } else {
+                                    parsedMtlNote = "Companion MTL file '$mtlName' not found"
                                 }
                             }
                         }
@@ -232,8 +264,9 @@ object ModelFormatConverter {
             Log.e(TAG, "Error parsing OBJ file: ${e.message}", e)
         }
 
-        if (positions.isEmpty()) {
-            // Fallback: minimal single triangle if empty
+        val hasValidGeometry = positions.isNotEmpty()
+        if (!hasValidGeometry) {
+            // Fallback: minimal single triangle if empty to guarantee valid GLB structure
             positions.addAll(listOf(-0.5f, 0f, 0f, 0.5f, 0f, 0f, 0f, 1f, 0f))
             normals.addAll(listOf(0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 1f))
             texCoords.addAll(listOf(0f, 0f, 1f, 0f, 0.5f, 1f))
@@ -253,12 +286,16 @@ object ModelFormatConverter {
 
         val triCount = indices.size / 3
         val vertCount = positions.size / 3
+        val baseMsg = if (hasValidGeometry) "Converted OBJ ($triCount triangles) to Native GLB" else "No valid faces found in OBJ file"
+        val fullMsg = if (parsedMtlNote != null) "$baseMsg ($parsedMtlNote)" else baseMsg
+
         return ConversionResult(
             glbFile = targetGlb,
             originalFormat = "OBJ",
             triangleCount = triCount,
             vertexCount = vertCount,
-            message = "Converted OBJ ($triCount triangles) to Native GLB"
+            message = fullMsg,
+            isSuccess = hasValidGeometry
         )
     }
 
@@ -306,7 +343,8 @@ object ModelFormatConverter {
                 originalFormat = "USDZ",
                 triangleCount = 0,
                 vertexCount = 0,
-                message = "Extracted native GLB from Apple USDZ Package"
+                message = "Extracted native GLB from Apple USDZ Package",
+                isSuccess = true
             )
         }
 
@@ -318,7 +356,8 @@ object ModelFormatConverter {
                 originalFormat = "USDZ",
                 triangleCount = converted.triangleCount,
                 vertexCount = converted.vertexCount,
-                message = "Extracted & Converted Apple USDZ Model"
+                message = "Extracted & Converted Apple USDZ Model",
+                isSuccess = converted.isSuccess
             )
         }
 
@@ -330,7 +369,8 @@ object ModelFormatConverter {
             originalFormat = "USDZ (Apple)",
             triangleCount = 12,
             vertexCount = 24,
-            message = "Apple USDZ contains proprietary binary USDC/USDA. A spatial bounding proxy is shown; convert to GLB for full fidelity."
+            message = "Apple USDZ contains proprietary binary USDC/USDA. A spatial bounding proxy is shown; convert to GLB for full fidelity.",
+            isSuccess = false
         )
     }
 

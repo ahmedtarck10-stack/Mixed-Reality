@@ -463,11 +463,13 @@ fun ARMixedRealityView(
                     onScaleChange(newScale)
                 },
                 onMove = { panX, panY ->
-                    modelOffset = Position(
-                        x = modelOffset.x + (panX * 0.0025f),
-                        y = modelOffset.y,
-                        z = modelOffset.z + (panY * 0.0025f)
-                    )
+                    if (!isAnchorLocked) {
+                        modelOffset = Position(
+                            x = modelOffset.x + (panX * 0.0025f),
+                            y = modelOffset.y,
+                            z = modelOffset.z + (panY * 0.0025f)
+                        )
+                    }
                 }
             )
     ) {
@@ -514,7 +516,8 @@ fun ARMixedRealityView(
             activeAnchor?.let { anchor ->
                 AnchorNode(
                     anchor = anchor,
-                    updateAnchorPose = !isAnchorLocked,
+                    // Keep real-world anchor pose tracking active regardless of gesture lock
+                    updateAnchorPose = true,
                     visibleTrackingStates = setOf(
                         TrackingState.TRACKING,
                         TrackingState.PAUSED

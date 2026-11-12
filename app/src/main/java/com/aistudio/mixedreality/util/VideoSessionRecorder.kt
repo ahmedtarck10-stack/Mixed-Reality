@@ -21,8 +21,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
 
 class VideoSessionRecorder(private val context: Context) {
     companion object {
@@ -50,7 +48,6 @@ class VideoSessionRecorder(private val context: Context) {
         val tempFile = File(context.cacheDir, "temp_mr_recording_${System.currentTimeMillis()}.mp4")
         recordingFile = tempFile
 
-        var mediaRecorderStarted = false
         if (surfaceMirrorer != null) {
             try {
                 val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -76,7 +73,6 @@ class VideoSessionRecorder(private val context: Context) {
                 mediaRecorder = recorder
                 mirroredSurface = surface
                 boundMirrorer = surfaceMirrorer
-                mediaRecorderStarted = true
                 Log.d(TAG, "Hardware MediaRecorder started with SurfaceMirrorer")
             } catch (e: Throwable) {
                 Log.w(TAG, "MediaRecorder failed to initialize: ${e.message}, falling back to frame recorder")
@@ -91,7 +87,7 @@ class VideoSessionRecorder(private val context: Context) {
                 while (isActive) {
                     MediaManager.captureWindowBitmap(activity) { bmp ->
                         try {
-                            if (capturedBitmaps.size < 120) {
+                            if (capturedBitmaps.size < 60) { // Capped at 60 frames to safeguard memory
                                 val scaled = Bitmap.createScaledBitmap(bmp, 540, 960, true)
                                 val rgb565 = if (scaled.config != Bitmap.Config.RGB_565) {
                                     val copy = scaled.copy(Bitmap.Config.RGB_565, false)
@@ -124,49 +120,57 @@ class VideoSessionRecorder(private val context: Context) {
 
         var videoUri: Uri? = null
 
-        // 1. If hardware mediaRecorder was running, finalize it
-        val recorder = mediaRecorder
-        val surface = mirroredSurface
-        val mirrorer = boundMirrorer
+        try {
+            // 1. If hardware mediaRecorder was running, finalize it
+            val recorder = mediaRecorder
+            val surface = mirroredSurface
+            val mirrorer = boundMirrorer
 
-        if (recorder != null) {
-            try {
-                if (mirrorer != null && surface != null) {
-                    mirrorer.stopMirroring(surface)
+            if (recorder != null) {
+                try {
+                    if (mirrorer != null && surface != null) {
+                        mirrorer.stopMirroring(surface)
+                    }
+                    recorder.stop()
+                    recorder.release()
+                    Log.d(TAG, "MediaRecorder stopped successfully")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Error stopping MediaRecorder: ${e.message}")
+                } finally {
+                    mediaRecorder = null
+                    mirroredSurface = null
+                    boundMirrorer = null
                 }
-                recorder.stop()
-                recorder.release()
-                Log.d(TAG, "MediaRecorder stopped successfully")
-            } catch (e: Throwable) {
-                Log.w(TAG, "Error stopping MediaRecorder: ${e.message}")
-            } finally {
-                mediaRecorder = null
-                mirroredSurface = null
-                boundMirrorer = null
             }
-        }
 
-        val targetFile = recordingFile
-        if (targetFile != null && targetFile.exists() && targetFile.length() > 1024L) {
-            videoUri = MediaManager.saveVideoToGallery(context, targetFile)
-        }
+            val targetFile = recordingFile
+            if (targetFile != null && targetFile.exists() && targetFile.length() > 1024L) {
+                videoUri = MediaManager.saveVideoToGallery(context, targetFile)
+            }
 
-        // 2. If hardware file was empty or missing, encode captured frames into valid MP4
-        if (videoUri == null && capturedBitmaps.isNotEmpty()) {
-            try {
-                val fallbackFile = File(context.cacheDir, "mr_video_fallback_${System.currentTimeMillis()}.mp4")
-                val success = encodeBitmapsToMp4(capturedBitmaps, fallbackFile, 540, 960)
-                if (success && fallbackFile.exists() && fallbackFile.length() > 0) {
-                    videoUri = MediaManager.saveVideoToGallery(context, fallbackFile)
+            // 2. If hardware file was empty or missing, encode captured frames into valid MP4
+            if (videoUri == null && capturedBitmaps.isNotEmpty()) {
+                try {
+                    val fallbackFile = File(context.cacheDir, "mr_video_fallback_${System.currentTimeMillis()}.mp4")
+                    val success = encodeBitmapsToMp4(capturedBitmaps, fallbackFile, 540, 960)
+                    if (success && fallbackFile.exists() && fallbackFile.length() > 0) {
+                        videoUri = MediaManager.saveVideoToGallery(context, fallbackFile)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Fallback frame encoding failed", e)
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Fallback frame encoding failed", e)
             }
+        } finally {
+            // Strictly guarantee memory cleanup even if errors occur during encoding or saving
+            capturedBitmaps.forEach {
+                try {
+                    if (!it.isRecycled) {
+                        it.recycle()
+                    }
+                } catch (_: Exception) {}
+            }
+            capturedBitmaps.clear()
         }
-
-        // Clean up memory
-        capturedBitmaps.forEach { it.recycle() }
-        capturedBitmaps.clear()
 
         videoUri
     }
