@@ -2,8 +2,10 @@ package com.aistudio.mixedreality
 
 import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
+import com.aistudio.mixedreality.ui.RotationAxis
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
+import com.aistudio.mixedreality.ui.applyRotationDelta
 import com.aistudio.mixedreality.ui.filterPoseWithLegacyDamping
 import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
 import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
@@ -217,5 +219,66 @@ class SpatialMathAndGesturesTest {
         val nanPose = Pose.makeTranslation(Float.NaN, 2.0f, 3.0f)
         val resultNan = filterPoseWithLegacyDamping(nanPose, rawPose)
         assertTrue(resultNan.tx().isNaN())
+    }
+
+    @Test
+    fun independentAxisRotationLocksAndWraps360OnX_Y_And_Z() {
+        var rx = 350f
+        var ry = 10f
+        var rz = 200f
+
+        // Lock X only -> only X changes and wraps across 360 -> 0
+        applyRotationDelta(
+            axis = RotationAxis.X,
+            dx = 0f,
+            dy = -50f,
+            isEdgeDrag = false,
+            currentRotX = rx,
+            currentRotY = ry,
+            currentRotZ = rz,
+            onRotX = { rx = it },
+            onRotY = { ry = it },
+            onRotZ = { rz = it },
+            sensitivity = 0.45f
+        )
+        assertEquals(12.5f, rx, 0.01f)
+        assertEquals(10f, ry, 0.001f)
+        assertEquals(200f, rz, 0.001f)
+
+        // Lock Y only -> only Y changes and wraps cleanly across 0 <-> 360
+        applyRotationDelta(
+            axis = RotationAxis.Y,
+            dx = -50f,
+            dy = 0f,
+            isEdgeDrag = false,
+            currentRotX = rx,
+            currentRotY = ry,
+            currentRotZ = rz,
+            onRotX = { rx = it },
+            onRotY = { ry = it },
+            onRotZ = { rz = it },
+            sensitivity = 0.45f
+        )
+        assertEquals(12.5f, rx, 0.01f)
+        assertEquals(347.5f, ry, 0.01f)
+        assertEquals(200f, rz, 0.001f)
+
+        // Lock Z only -> only Z changes across full 360 range (400px -> +180deg -> 20deg)
+        applyRotationDelta(
+            axis = RotationAxis.Z,
+            dx = 400f,
+            dy = 0f,
+            isEdgeDrag = false,
+            currentRotX = rx,
+            currentRotY = ry,
+            currentRotZ = rz,
+            onRotX = { rx = it },
+            onRotY = { ry = it },
+            onRotZ = { rz = it },
+            sensitivity = 0.45f
+        )
+        assertEquals(12.5f, rx, 0.01f)
+        assertEquals(347.5f, ry, 0.01f)
+        assertEquals(20f, rz, 0.01f)
     }
 }

@@ -84,28 +84,27 @@ fun SceneScope.Render3DModel(
     val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
     val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
 
-    // Parent Node receives position, full 3-axis 360-degree rotation (X, Y, Z), and real-time scale
+    // Parent Node receives position and uniform scale; nested per-axis nodes give clean independent 360° X, Y, Z rotation
     Node(
         position = position,
-        rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
         scale = Scale(safeScale)
     ) {
-        // If user loaded a custom file and instance is ready, render it
-        if (customModelFile != null) {
-            if (customModelInstance != null) {
-                ModelNode(
-                    modelInstance = customModelInstance,
-                    scaleToUnits = 1.0f,
-                    centerOrigin = Position(0f, 0f, 0f),
-                    autoAnimate = true
-                )
-            }
-            // Do not render preset shapes while custom 3D model is active
-            return@Node
-        }
-
-        // Otherwise render selected preset model with canonical dimensions
-        when (modelItem) {
+        Node(rotation = Rotation(y = safeRotY)) {
+            Node(rotation = Rotation(x = safeRotX)) {
+                Node(rotation = Rotation(z = safeRotZ)) {
+                    // If user loaded a custom file and instance is ready, render it
+                    if (customModelFile != null) {
+                        if (customModelInstance != null) {
+                            ModelNode(
+                                modelInstance = customModelInstance,
+                                scaleToUnits = 1.0f,
+                                centerOrigin = Position(0f, 0f, 0f),
+                                autoAnimate = true
+                            )
+                        }
+                    } else {
+                        // Otherwise render selected preset model with canonical dimensions
+                        when (modelItem) {
             ModelItem.VISION_HEADSET -> {
                 // High-fidelity Vision Pro Spatial Visor (strictly non-overlapping geometry to eliminate Z-fighting & flicker)
                 Node(
@@ -213,5 +212,10 @@ fun SceneScope.Render3DModel(
                 }
             }
         }
+                    }
+                }
+            }
+        }
     }
 }
+

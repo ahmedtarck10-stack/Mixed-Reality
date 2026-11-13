@@ -77,7 +77,7 @@ fun Modifier.spatialMRGestures(
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val downTime = System.currentTimeMillis()
             val downOffset = down.position
-            val isEdgeStart = (downOffset.x < size.width * 0.22f || downOffset.x > size.width * 0.78f || downOffset.y < size.height * 0.18f || downOffset.y > size.height * 0.82f)
+            val isEdgeStart = (downOffset.x < size.width * 0.12f || downOffset.x > size.width * 0.88f)
             var isGestureDrag = false
             var lastPointerPosition = downOffset
             var prevCentroid = downOffset
@@ -101,31 +101,38 @@ fun Modifier.spatialMRGestures(
                 if (currentCount == 0) {
                     val totalDuration = System.currentTimeMillis() - downTime
                     val totalDistance = (lastPointerPosition - downOffset).getDistance()
-                    if (maxPointersSeen == 1 && !isGestureDrag && totalDuration < 400L && totalDistance < touchSlop * 2f) {
+                    if (maxPointersSeen == 1 && !isGestureDrag && totalDuration < 450L && totalDistance < touchSlop * 2.5f) {
                         val tapTime = System.currentTimeMillis()
                         val diffTime = tapTime - lastTapTime
                         val diffDist = (downOffset - lastTapOffset).getDistance()
-                        tapCount = if (diffTime < 400L && diffDist < 120f) tapCount + 1 else 1
+                        tapCount = if (diffTime < 450L && diffDist < 160f) tapCount + 1 else 1
                         lastTapTime = tapTime
                         lastTapOffset = downOffset
                         tapTimeoutJob?.cancel()
-                        when {
-                            tapCount >= 3 -> {
-                                tapCount = 0
-                                currentOnTripleTap()
-                            }
-                            tapCount == 2 -> {
-                                currentOnDoubleTap()
-                                tapCount = 0
-                            }
-                            tapCount == 1 -> {
+                        when (tapCount) {
+                            1 -> {
                                 tapTimeoutJob = scope.launch {
-                                    delay(260L)
+                                    delay(280L)
                                     if (tapCount == 1) {
                                         currentOnSingleTap(lastTapOffset)
                                         tapCount = 0
                                     }
                                 }
+                            }
+                            2 -> {
+                                tapTimeoutJob = scope.launch {
+                                    delay(280L)
+                                    if (tapCount == 2) {
+                                        currentOnDoubleTap()
+                                        tapCount = 0
+                                    }
+                                }
+                            }
+                            else -> {
+                                // Triple tap (3 clicks): Toggle full screen mode!
+                                tapTimeoutJob?.cancel()
+                                tapCount = 0
+                                currentOnTripleTap()
                             }
                         }
                     }

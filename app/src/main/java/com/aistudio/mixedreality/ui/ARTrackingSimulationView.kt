@@ -48,6 +48,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 
+import io.github.sceneview.rememberEnvironmentLoader
+import io.github.sceneview.rememberMaterialLoader
+import io.github.sceneview.rememberModelLoader
+
 /**
  * Interactive AR Tracking Test & Simulation View.
  * Provides an on-device simulation of ARCore plane tracking, tap-to-place anchoring,
@@ -77,13 +81,17 @@ fun ARTrackingSimulationView(
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
+    isFlashlightOn: Boolean = false,
     onStopAutoRotate: () -> Unit = {},
     onFallbackToObject: () -> Unit = {},
     engine: Engine,
-    modelLoader: ModelLoader,
-    materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader
+    modelLoader: ModelLoader? = null,
+    materialLoader: MaterialLoader? = null,
+    environmentLoader: EnvironmentLoader? = null
 ) {
+    val localModelLoader = rememberModelLoader(engine)
+    val localMaterialLoader = rememberMaterialLoader(engine)
+    val localEnvironmentLoader = rememberEnvironmentLoader(engine)
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
@@ -111,32 +119,32 @@ fun ARTrackingSimulationView(
         }
     }
 
-    val pbrMaterial = remember(materialLoader, color, metallic, roughness) {
-        materialLoader.createColorInstance(
+    val pbrMaterial = remember(localMaterialLoader, color, metallic, roughness) {
+        localMaterialLoader.createColorInstance(
             color = color,
             metallic = metallic.coerceIn(0.0f, 0.5f),
             roughness = roughness.coerceIn(0.2f, 0.85f)
         )
     }
 
-    val visorGlassMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
+    val visorGlassMaterial = remember(localMaterialLoader) {
+        localMaterialLoader.createColorInstance(
             color = Color(0xFF141923),
             metallic = 0.85f,
             roughness = 0.15f
         )
     }
 
-    val floorGridMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
+    val floorGridMaterial = remember(localMaterialLoader) {
+        localMaterialLoader.createColorInstance(
             color = Color(0x3300E5FF),
             metallic = 0.1f,
             roughness = 0.9f
         )
     }
 
-    val reticleMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
+    val reticleMaterial = remember(localMaterialLoader) {
+        localMaterialLoader.createColorInstance(
             color = Color(0x8800E5FF),
             metallic = 0.2f,
             roughness = 0.5f
@@ -145,7 +153,7 @@ fun ARTrackingSimulationView(
 
     val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
         rememberModelInstance(
-            modelLoader = modelLoader,
+            modelLoader = localModelLoader,
             fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
         )
     } else {
@@ -155,7 +163,7 @@ fun ARTrackingSimulationView(
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
             rememberModelInstance(
-                modelLoader = modelLoader,
+                modelLoader = localModelLoader,
                 fileLocation = "file://${file.absolutePath}"
             )
         }
@@ -230,15 +238,18 @@ fun ARTrackingSimulationView(
             .testTag("ar_tracking_simulation_view")
     ) {
         // Camera passthrough background
-        CameraPassthroughBackground(modifier = Modifier.fillMaxSize())
+        CameraPassthroughBackground(
+            modifier = Modifier.fillMaxSize(),
+            isFlashlightOn = isFlashlightOn
+        )
 
         // 3D SceneView with lights & placement plane
         SceneView(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
-            modelLoader = modelLoader,
-            materialLoader = materialLoader,
-            environmentLoader = environmentLoader,
+            modelLoader = localModelLoader,
+            materialLoader = localMaterialLoader,
+            environmentLoader = localEnvironmentLoader,
             mainLightNode = rememberMainLightNode(engine) {
                 intensity = 55_000.0f
             },
@@ -275,62 +286,67 @@ fun ARTrackingSimulationView(
 
                 Node(
                     position = modelPosition,
-                    rotation = Rotation(x = safeRotX, y = safeRotY, z = safeRotZ),
                     scale = Scale(safeScale)
                 ) {
-                    if (customModelFile != null) {
-                        customModelInstance?.let { instance ->
-                            ModelNode(
-                                modelInstance = instance,
-                                scaleToUnits = 0.35f,
-                                centerOrigin = Position(0f, 0f, 0f),
-                                autoAnimate = true
-                            )
-                        }
-                    } else {
-                        when (modelItem) {
-                            ModelItem.VISION_HEADSET -> {
-                                SphereNode(
-                                    radius = 0.16f,
-                                    materialInstance = visorGlassMaterial,
-                                    position = Position(0f, 0.04f, 0.08f)
-                                )
-                                CylinderNode(
-                                    radius = 0.18f,
-                                    height = 0.06f,
-                                    materialInstance = pbrMaterial,
-                                    position = Position(0f, 0.04f, -0.04f)
-                                )
-                            }
-                            ModelItem.TOY_CAR -> {
-                                toyCarModel?.let { instance ->
-                                    ModelNode(
-                                        modelInstance = instance,
-                                        scaleToUnits = 0.40f,
-                                        centerOrigin = Position(0f, 0f, 0f)
-                                    )
-                                } ?: CubeNode(
-                                    size = Size(0.25f, 0.25f, 0.25f),
-                                    materialInstance = pbrMaterial
-                                )
-                            }
-                            ModelItem.HOLO_CUBE -> {
-                                CubeNode(
-                                    size = Size(0.24f, 0.24f, 0.24f),
-                                    materialInstance = pbrMaterial
-                                )
-                            }
-                            ModelItem.QUANTUM_ORB -> {
-                                SphereNode(
-                                    radius = 0.18f,
-                                    materialInstance = pbrMaterial
-                                )
-                            }
-                            ModelItem.SPATIAL_CARD -> {
-                                CubeNode(
-                                    size = Size(0.35f, 0.22f, 0.03f),
-                                    materialInstance = pbrMaterial
-                                )
+                    Node(rotation = Rotation(y = safeRotY)) {
+                        Node(rotation = Rotation(x = safeRotX)) {
+                            Node(rotation = Rotation(z = safeRotZ)) {
+                                if (customModelFile != null) {
+                                    customModelInstance?.let { instance ->
+                                        ModelNode(
+                                            modelInstance = instance,
+                                            scaleToUnits = 0.35f,
+                                            centerOrigin = Position(0f, 0f, 0f),
+                                            autoAnimate = true
+                                        )
+                                    }
+                                } else {
+                                    when (modelItem) {
+                                        ModelItem.VISION_HEADSET -> {
+                                            SphereNode(
+                                                radius = 0.16f,
+                                                materialInstance = visorGlassMaterial,
+                                                position = Position(0f, 0.04f, 0.08f)
+                                            )
+                                            CylinderNode(
+                                                radius = 0.18f,
+                                                height = 0.06f,
+                                                materialInstance = pbrMaterial,
+                                                position = Position(0f, 0.04f, -0.04f)
+                                            )
+                                        }
+                                        ModelItem.TOY_CAR -> {
+                                            toyCarModel?.let { instance ->
+                                                ModelNode(
+                                                    modelInstance = instance,
+                                                    scaleToUnits = 0.40f,
+                                                    centerOrigin = Position(0f, 0f, 0f)
+                                                )
+                                            } ?: CubeNode(
+                                                size = Size(0.25f, 0.25f, 0.25f),
+                                                materialInstance = pbrMaterial
+                                            )
+                                        }
+                                        ModelItem.HOLO_CUBE -> {
+                                            CubeNode(
+                                                size = Size(0.24f, 0.24f, 0.24f),
+                                                materialInstance = pbrMaterial
+                                            )
+                                        }
+                                        ModelItem.QUANTUM_ORB -> {
+                                            SphereNode(
+                                                radius = 0.18f,
+                                                materialInstance = pbrMaterial
+                                            )
+                                        }
+                                        ModelItem.SPATIAL_CARD -> {
+                                            CubeNode(
+                                                size = Size(0.35f, 0.22f, 0.03f),
+                                                materialInstance = pbrMaterial
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

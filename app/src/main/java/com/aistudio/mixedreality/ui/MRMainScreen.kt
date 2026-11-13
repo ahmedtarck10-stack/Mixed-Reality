@@ -21,7 +21,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FlashOff
+import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Tune
+import com.aistudio.mixedreality.util.FlashlightHelper
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,6 +39,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
@@ -43,15 +47,15 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.aistudio.mixedreality.ui.theme.*
 import com.aistudio.mixedreality.util.MediaManager
 import com.aistudio.mixedreality.util.ModelFormatConverter
 import com.aistudio.mixedreality.util.VideoSessionRecorder
 import io.github.sceneview.rememberEngine
-import io.github.sceneview.rememberEnvironmentLoader
-import io.github.sceneview.rememberMaterialLoader
-import io.github.sceneview.rememberModelLoader
 import io.github.sceneview.rememberSurfaceMirrorer
+import io.github.sceneview.utils.SurfaceMirrorer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,9 +78,6 @@ fun MRMainScreen(
     // Shared single Filament Engine & loaders across entire screen lifecycle
     // Prevents multi-engine EGL context crashes, shader errors, and GPU memory exhaustion
     val engine = rememberEngine()
-    val modelLoader = rememberModelLoader(engine)
-    val materialLoader = rememberMaterialLoader(engine)
-    val environmentLoader = rememberEnvironmentLoader(engine)
 
     // ARCore device support detection
     val isARCoreAvailable = remember(context) {
@@ -95,7 +96,10 @@ fun MRMainScreen(
     var modelColor by remember { mutableStateOf(Color(0xFF00E5FF)) }
     var metallic by remember { mutableFloatStateOf(0.25f) }
     var roughness by remember { mutableFloatStateOf(0.45f) }
-    var scaleFactor by remember { mutableFloatStateOf(1.0f) }
+    // Keep Studio Object scale and AR/MR world scale independent so zooming in Object mode
+    // never blows up a mesh around the physical AR camera on mode switch.
+    var objectScaleFactor by remember { mutableFloatStateOf(1.0f) }
+    var arScaleFactor by remember { mutableFloatStateOf(1.0f) }
     var isAutoRotating by remember { mutableStateOf(false) }
     var rotationY by remember { mutableFloatStateOf(0f) }
     var rotationX by remember { mutableFloatStateOf(0f) }
@@ -104,6 +108,52 @@ fun MRMainScreen(
 
     // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
     var showCloudLibrary by remember { mutableStateOf(false) }
+
+    // Flashlight / Torch toggle for low-light environments
+    val hasFlashHardware = remember(context) { FlashlightHelper.isFlashAvailable(context) }
+    var isFlashlightOn by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isAppResumed by remember {
+        mutableStateOf(
+            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        )
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> isAppResumed = true
+                Lifecycle.Event.ON_PAUSE -> {
+                    isAppResumed = false
+                    FlashlightHelper.setTorchMode(context, false)
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            FlashlightHelper.setTorchMode(context, false)
+        }
+    }
+
+    LaunchedEffect(isFlashlightOn, selectedMode, isAppResumed) {
+        if (!isAppResumed) {
+            FlashlightHelper.setTorchMode(context, false)
+        } else if (selectedMode == ViewportMode.OBJECT) {
+            if (isFlashlightOn) {
+                FlashlightHelper.setTorchModeWithRetry(context, true)
+            } else {
+                FlashlightHelper.setTorchMode(context, false)
+            }
+        } else {
+            // AR/MR owns the camera hardware via ARSession flashMode or CameraPassthrough;
+            // ensure CameraManager torch is released cleanly before ARCore acquires it.
+            if (FlashlightHelper.isTorchOn) {
+                FlashlightHelper.setTorchMode(context, false)
+            }
+        }
+    }
 
     // Handle incoming 3D model files from external apps / file manager on background thread
     LaunchedEffect(incomingModelUri) {
@@ -146,7 +196,8 @@ fun MRMainScreen(
     var isRecording by remember { mutableStateOf(false) }
     var recordingSeconds by remember { mutableIntStateOf(0) }
     val videoRecorder = remember(context) { VideoSessionRecorder(context) }
-    val surfaceMirrorer = rememberSurfaceMirrorer()
+    val fallbackSurfaceMirrorer = rememberSurfaceMirrorer()
+    var activeSurfaceMirrorer by remember { mutableStateOf<SurfaceMirrorer?>(null) }
 
     // Clear trigger counter for AR anchors
     var clearTrigger by remember { mutableIntStateOf(0) }
@@ -251,8 +302,8 @@ fun MRMainScreen(
                     color = modelColor,
                     metallic = metallic,
                     roughness = roughness,
-                    scale = scaleFactor,
-                    onScaleChange = { scaleFactor = it },
+                    scale = objectScaleFactor,
+                    onScaleChange = { objectScaleFactor = it },
                     rotationY = rotationY,
                     onRotationYChange = { rotationY = it },
                     rotationX = rotationX,
@@ -269,10 +320,7 @@ fun MRMainScreen(
                         filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*"))
                     },
                     engine = engine,
-                    modelLoader = modelLoader,
-                    materialLoader = materialLoader,
-                    environmentLoader = environmentLoader,
-                    surfaceMirrorer = surfaceMirrorer
+                    onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it }
                 )
             }
             ViewportMode.AR -> {
@@ -284,8 +332,8 @@ fun MRMainScreen(
                         color = modelColor,
                         metallic = metallic,
                         roughness = roughness,
-                        scale = scaleFactor,
-                        onScaleChange = { scaleFactor = it },
+                        scale = arScaleFactor,
+                        onScaleChange = { arScaleFactor = it },
                         rotationY = rotationY,
                         onRotationYChange = { rotationY = it },
                         rotationX = rotationX,
@@ -298,12 +346,10 @@ fun MRMainScreen(
                         activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
+                        isFlashlightOn = isFlashlightOn,
                         onStopAutoRotate = { isAutoRotating = false },
                         onFallbackToObject = { selectedMode = ViewportMode.OBJECT },
-                        engine = engine,
-                        modelLoader = modelLoader,
-                        materialLoader = materialLoader,
-                        environmentLoader = environmentLoader
+                        engine = engine
                     )
                 } else {
                     PermissionRequestPlaceholder(onGrant = {
@@ -321,8 +367,8 @@ fun MRMainScreen(
                         color = modelColor,
                         metallic = metallic,
                         roughness = roughness,
-                        scale = scaleFactor,
-                        onScaleChange = { scaleFactor = it },
+                        scale = arScaleFactor,
+                        onScaleChange = { arScaleFactor = it },
                         isAutoRotating = isAutoRotating,
                         rotationY = rotationY,
                         onRotationYChange = { rotationY = it },
@@ -332,10 +378,7 @@ fun MRMainScreen(
                         onRotationZChange = { rotationZ = it },
                         isRecording = isRecording,
                         engine = engine,
-                        modelLoader = modelLoader,
-                        materialLoader = materialLoader,
-                        environmentLoader = environmentLoader,
-                        surfaceMirrorer = surfaceMirrorer,
+                        onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it },
                         isARCoreAvailable = isARCoreAvailable,
                         clearTrigger = clearTrigger,
                         isMoveMode = isMoveMode,
@@ -343,6 +386,7 @@ fun MRMainScreen(
                         activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
+                        isFlashlightOn = isFlashlightOn,
                         onStopAutoRotate = { isAutoRotating = false },
                         onFallbackToObject = { selectedMode = ViewportMode.OBJECT }
                     )
@@ -354,7 +398,7 @@ fun MRMainScreen(
             }
         }
 
-        // --- 2. TOP FLOATING SEGMENTED PILL (MR | AR | Object) ---
+        // --- 2. TOP FLOATING SEGMENTED PILL (EXACT CENTER) & FLASHLIGHT (LEFT) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
         androidx.compose.animation.AnimatedVisibility(
             visible = !isFullScreen,
@@ -362,20 +406,44 @@ fun MRMainScreen(
             exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { -it }),
             modifier = Modifier
                 .align(Alignment.TopCenter)
+                .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(top = 16.dp)
+                .padding(top = 16.dp, start = 12.dp, end = 12.dp)
         ) {
-            TopModeSegmentedPill(
-                currentMode = selectedMode,
-                onModeSelected = { mode ->
-                    if (mode == ViewportMode.AR || mode == ViewportMode.MR) {
-                        if (!hasCameraPermission) {
-                            permissionLauncher.launch(Manifest.permission.CAMERA)
+            Box(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                FlashlightToggleButton(
+                    isOn = isFlashlightOn,
+                    onToggle = {
+                        if (!hasFlashHardware) {
+                            isFlashlightOn = false
+                            Toast.makeText(context, "لا يوجد فلاش في هذا الجهاز", Toast.LENGTH_SHORT).show()
+                        } else {
+                            isFlashlightOn = !isFlashlightOn
+                            val msg = if (isFlashlightOn) "كشاف الإضاءة: يعمل 💡" else "كشاف الإضاءة: متوقف"
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                         }
-                    }
-                    selectedMode = mode
-                }
-            )
+                    },
+                    modifier = Modifier.align(Alignment.CenterStart)
+                )
+
+                TopModeSegmentedPill(
+                    currentMode = selectedMode,
+                    onModeSelected = { mode ->
+                        if (mode != ViewportMode.OBJECT && FlashlightHelper.isTorchOn) {
+                            FlashlightHelper.setTorchMode(context, false)
+                        }
+                        if (mode == ViewportMode.AR || mode == ViewportMode.MR) {
+                            if (!hasCameraPermission) {
+                                permissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                        }
+                        selectedMode = mode
+                    },
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
         }
 
         // Full Screen Hint Overlay (Fades out automatically after 2.8s)
@@ -385,14 +453,37 @@ fun MRMainScreen(
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
                     .padding(top = 18.dp)
-                    .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(20.dp))
-                    .border(1.dp, NeonCyan.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
+                    .background(Color.Black.copy(alpha = 0.85f), RoundedCornerShape(20.dp))
+                    .border(1.dp, NeonCyan.copy(alpha = 0.7f), RoundedCornerShape(20.dp))
                     .padding(horizontal = 16.dp, vertical = 7.dp)
             ) {
                 Text(
-                    text = "Full Screen Mode 🥽 • Triple-tap to toggle bars",
+                    text = "شاشة كاملة 🥽 • اضغط 3 مرات (Triple-tap) للرجوع",
                     color = Color.White,
                     fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+
+        // Floating button to exit full screen mode
+        if (isFullScreen) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(top = 16.dp, end = 16.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0x99000000))
+                    .border(1.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(20.dp))
+                    .clickable { isFullScreen = false }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .testTag("exit_fullscreen_button")
+            ) {
+                Text(
+                    text = "✕ إظهار الأشرطة",
+                    color = Color.White,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Medium
                 )
             }
@@ -410,6 +501,30 @@ fun MRMainScreen(
         }
 
 
+
+        // --- 4. INDEPENDENT X/Y/Z 360° ROTATION CONTROLLER ---
+        // Hidden in Full Screen mode or when scene is cleared
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !isFullScreen && isModelVisible,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { it }),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { it }),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = 96.dp, start = 12.dp, end = 12.dp)
+        ) {
+            SpatialRotationController(
+                rotationX = rotationX,
+                onRotationXChange = { rotationX = it },
+                rotationY = rotationY,
+                onRotationYChange = { rotationY = it },
+                rotationZ = rotationZ,
+                onRotationZChange = { rotationZ = it },
+                activeAxis = activeRotationAxis,
+                onActiveAxisChange = { activeRotationAxis = it },
+                onStopAutoRotate = { isAutoRotating = false }
+            )
+        }
 
         // --- 5. BOTTOM FLOATING CONTROL PILL (PHOTO | ● REC | Open | Clear) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
@@ -446,7 +561,11 @@ fun MRMainScreen(
                     // Requirement 2: Start / Stop video recording and save to Gallery
                     if (!isRecording) {
                         isRecording = true
-                        videoRecorder.startRecording(activity, surfaceMirrorer, scope)
+                        videoRecorder.startRecording(
+                            activity,
+                            activeSurfaceMirrorer ?: fallbackSurfaceMirrorer,
+                            scope
+                        )
                         Toast.makeText(context, "Video recording started 🎥", Toast.LENGTH_SHORT).show()
                     } else {
                         isRecording = false
@@ -516,8 +635,14 @@ fun MRMainScreen(
                     onMetallicChange = { metallic = it },
                     roughness = roughness,
                     onRoughnessChange = { roughness = it },
-                    scale = scaleFactor,
-                    onScaleChange = { scaleFactor = it },
+                    scale = if (selectedMode == ViewportMode.OBJECT) objectScaleFactor else arScaleFactor,
+                    onScaleChange = { newScale ->
+                        if (selectedMode == ViewportMode.OBJECT) {
+                            objectScaleFactor = newScale
+                        } else {
+                            arScaleFactor = newScale
+                        }
+                    },
                     rotationX = rotationX,
                     onRotationXChange = { rotationX = it },
                     rotationY = rotationY,
@@ -615,10 +740,11 @@ fun queryDisplayName(context: Context, uri: Uri): String? {
 @Composable
 fun TopModeSegmentedPill(
     currentMode: ViewportMode,
-    onModeSelected: (ViewportMode) -> Unit
+    onModeSelected: (ViewportMode) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .wrapContentSize()
             .clip(RoundedCornerShape(percent = 50))
             .background(
@@ -686,7 +812,7 @@ fun TopModeSegmentedPill(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) { onModeSelected(mode) }
-                        .padding(horizontal = 20.dp)
+                        .padding(horizontal = 16.dp)
                         .testTag("mode_tab_${mode.name.lowercase(Locale.ROOT)}")
                 ) {
                     Text(
@@ -960,3 +1086,74 @@ fun RecordingStatusBadge(
         }
     }
 }
+
+/**
+ * Quick toggle button for camera flashlight / torch in low-light environments.
+ */
+@Composable
+fun FlashlightToggleButton(
+    isOn: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .size(48.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onToggle)
+            .testTag("flashlight_toggle_button")
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(
+                    if (isOn) {
+                        Brush.radialGradient(
+                            colors = listOf(
+                                Color(0xFFFFEA00),
+                                Color(0xFFFFB300),
+                                Color(0xFFFF8F00)
+                            )
+                        )
+                    } else {
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0x73202532),
+                                Color(0x8C10141D),
+                                Color(0xA60A0C13)
+                            )
+                        )
+                    }
+                )
+                .border(
+                    width = 1.2.dp,
+                    brush = if (isOn) {
+                        Brush.verticalGradient(
+                            listOf(Color(0xFFFFF9C4), Color(0xFFFFD54F))
+                        )
+                    } else {
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0x73FFFFFF),
+                                Color(0x2BFFFFFF),
+                                Color(0x1AFFFFFF),
+                                Color(0x4DFFFFFF)
+                            )
+                        )
+                    },
+                    shape = CircleShape
+                )
+        ) {
+            Icon(
+                imageVector = if (isOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
+                contentDescription = "Flashlight",
+                tint = if (isOn) Color.Black else Color.White,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+    }
+}
+

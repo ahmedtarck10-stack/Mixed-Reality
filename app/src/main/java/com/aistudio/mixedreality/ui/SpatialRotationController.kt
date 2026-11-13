@@ -59,16 +59,17 @@ fun applyRotationDelta(
 
     when (axis) {
         RotationAxis.ALL -> {
+            // Full 360-degree rotation on 1-finger:
+            // Horizontal drag (dx) rotates Y (Yaw) 360° seamlessly
+            // Vertical drag (dy) rotates X (Pitch) 360° seamlessly
+            val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
+            val newX = ((safeCurrentX - dy * sensitivity) % 360f + 360f) % 360f
+            onRotY(newY)
+            onRotX(newX)
             if (isEdgeDrag) {
-                // Dragging along screen edge turns Z (Roll) 360° directly with 1 finger
+                // Outer edge drag also applies Roll on Z
                 val newZ = ((safeCurrentZ + dy * sensitivity) % 360f + 360f) % 360f
                 onRotZ(newZ)
-            } else {
-                // Center drag: dx modifies Yaw (Y) 360°, dy modifies Pitch (X) 360°
-                val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
-                val newX = ((safeCurrentX - dy * sensitivity) % 360f + 360f) % 360f
-                onRotY(newY)
-                onRotX(newX)
             }
         }
         RotationAxis.X -> {
@@ -77,7 +78,8 @@ fun applyRotationDelta(
             onRotX(newX)
         }
         RotationAxis.Y -> {
-            val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
+            val delta = if (abs(dx) >= abs(dy)) dx else -dy
+            val newY = ((safeCurrentY + delta * sensitivity) % 360f + 360f) % 360f
             onRotY(newY)
         }
         RotationAxis.Z -> {
@@ -91,10 +93,9 @@ fun applyRotationDelta(
 /**
  * Floating 360-degree rotation controller HUD.
  * Allows users in Object, AR, and MR modes to:
- * - See current degrees for X, Y, and Z.
- * - Lock/select specific rotation axis (ALL, X Pitch, Y Yaw, Z Roll).
- * - Quickly rotate ±45°, 180° flip, or reset to 0°.
- * - Use a continuous slider for precise 0°..360° rotation.
+ * - Switch 1-finger 360° drag lock directly between ALL, X, Y, and Z independently.
+ * - Expand independent 0°..360° sliders for X, Y, and Z simultaneously.
+ * - Quickly rotate ±45°, 180° flip, or reset individual axes / all axes to 0°.
  */
 @Composable
 fun SpatialRotationController(
@@ -111,55 +112,25 @@ fun SpatialRotationController(
 ) {
     var isExpanded by remember { mutableStateOf(false) }
 
-    val safeX = ((rotationX % 360f) + 360f) % 360f
-    val safeY = ((rotationY % 360f) + 360f) % 360f
-    val safeZ = ((rotationZ % 360f) + 360f) % 360f
+    val safeX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
+    val safeY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
+    val safeZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
+
+    val targetStepperAxis = if (activeAxis == RotationAxis.ALL) RotationAxis.Z else activeAxis
+    val (currentStepAngle, onStepAngleChange, stepAxisLabel) = when (targetStepperAxis) {
+        RotationAxis.X -> Triple(safeX, onRotationXChange, "X")
+        RotationAxis.Y -> Triple(safeY, onRotationYChange, "Y")
+        RotationAxis.Z -> Triple(safeZ, onRotationZChange, "Z")
+        RotationAxis.ALL -> Triple(safeZ, onRotationZChange, "Z")
+    }
 
     Column(
         modifier = modifier
             .wrapContentSize()
             .testTag("spatial_rotation_controller"),
-        horizontalAlignment = Alignment.End
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Toggle pill button
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(20.dp))
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color(0x99202532),
-                            Color(0xB310141D)
-                        )
-                    )
-                )
-                .border(
-                    width = 1.dp,
-                    color = if (isExpanded) NeonCyan else Color.White.copy(alpha = 0.35f),
-                    shape = RoundedCornerShape(20.dp)
-                )
-                .clickable { isExpanded = !isExpanded }
-                .padding(horizontal = 12.dp, vertical = 6.dp)
-                .testTag("toggle_rotation_hud_button"),
-            contentAlignment = Alignment.Center
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "⟳ 360°",
-                    color = if (isExpanded) NeonCyan else Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "X:${safeX.toInt()}° Y:${safeY.toInt()}° Z:${safeZ.toInt()}°",
-                    color = Color.White.copy(alpha = 0.85f),
-                    fontSize = 11.sp
-                )
-            }
-        }
-
-        // Expanded Control Panel
+        // Expanded Independent 3-Axis Control Panel
         AnimatedVisibility(
             visible = isExpanded,
             enter = fadeIn() + expandVertically(),
@@ -167,8 +138,8 @@ fun SpatialRotationController(
         ) {
             Surface(
                 modifier = Modifier
-                    .padding(top = 8.dp)
-                    .widthIn(min = 280.dp, max = 340.dp),
+                    .padding(bottom = 8.dp)
+                    .widthIn(min = 290.dp, max = 356.dp),
                 shape = RoundedCornerShape(20.dp),
                 color = Color(0xEB10141D),
                 border = androidx.compose.foundation.BorderStroke(1.2.dp, NeonCyan.copy(alpha = 0.6f)),
@@ -178,14 +149,14 @@ fun SpatialRotationController(
                     modifier = Modifier.padding(14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Title and Close
+                    // Header + Reset All
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "360° Spatial Rotation (X, Y, Z)",
+                            text = "360° Independent Axes (X · Y · Z)",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
@@ -197,93 +168,60 @@ fun SpatialRotationController(
                                 onRotationYChange(0f)
                                 onRotationZChange(0f)
                             },
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier
+                                .size(36.dp)
+                                .testTag("reset_all_rotations_icon_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Refresh,
-                                contentDescription = "Reset",
+                                contentDescription = "Reset all rotations",
                                 tint = NeonCyan,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
-                    // Axis Selection Chips: [ALL] [X] [Y] [Z]
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        RotationAxis.values().forEach { axis ->
-                            val isSelected = activeAxis == axis
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(
-                                        if (isSelected) NeonCyan.copy(alpha = 0.25f)
-                                        else Color.White.copy(alpha = 0.08f)
-                                    )
-                                    .border(
-                                        1.dp,
-                                        if (isSelected) NeonCyan else Color.White.copy(alpha = 0.15f),
-                                        RoundedCornerShape(10.dp)
-                                    )
-                                    .clickable { onActiveAxisChange(axis) }
-                                    .padding(vertical = 6.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = axis.shortName,
-                                    fontSize = 11.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isSelected) NeonCyan else Color.White
-                                )
-                            }
+                    AxisAngleSliderRow(
+                        axisLabel = "X",
+                        angleDegrees = safeX,
+                        isHighlighted = activeAxis == RotationAxis.X,
+                        sliderTestTag = "slider_rotation_x",
+                        onAngleChange = {
+                            onStopAutoRotate()
+                            onActiveAxisChange(RotationAxis.X)
+                            onRotationXChange(it)
                         }
-                    }
+                    )
 
-                    Spacer(modifier = Modifier.height(12.dp))
+                    AxisAngleSliderRow(
+                        axisLabel = "Y",
+                        angleDegrees = safeY,
+                        isHighlighted = activeAxis == RotationAxis.Y,
+                        sliderTestTag = "slider_rotation_y",
+                        onAngleChange = {
+                            onStopAutoRotate()
+                            onActiveAxisChange(RotationAxis.Y)
+                            onRotationYChange(it)
+                        }
+                    )
 
-                    // Angle Slider for active axis
-                    val (currentAngle, onAngleChange, axisName) = when (activeAxis) {
-                        RotationAxis.X -> Triple(safeX, onRotationXChange, "X (Pitch)")
-                        RotationAxis.Y -> Triple(safeY, onRotationYChange, "Y (Yaw)")
-                        RotationAxis.Z -> Triple(safeZ, onRotationZChange, "Z (Roll)")
-                        RotationAxis.ALL -> Triple(safeY, onRotationYChange, "Y (Yaw)")
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "$axisName: ${currentAngle.toInt()}°",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = NeonCyan,
-                            modifier = Modifier.width(90.dp)
-                        )
-                        Slider(
-                            value = currentAngle,
-                            onValueChange = {
-                                onStopAutoRotate()
-                                onAngleChange(it)
-                            },
-                            valueRange = 0f..360f,
-                            modifier = Modifier.weight(1f),
-                            colors = SliderDefaults.colors(
-                                thumbColor = NeonCyan,
-                                activeTrackColor = NeonCyan,
-                                inactiveTrackColor = Color.White.copy(alpha = 0.2f)
-                            )
-                        )
-                    }
+                    AxisAngleSliderRow(
+                        axisLabel = "Z",
+                        angleDegrees = safeZ,
+                        isHighlighted = activeAxis == RotationAxis.Z,
+                        sliderTestTag = "slider_rotation_z",
+                        onAngleChange = {
+                            onStopAutoRotate()
+                            onActiveAxisChange(RotationAxis.Z)
+                            onRotationZChange(it)
+                        }
+                    )
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Quick Stepper Buttons: [-45°] [+45°] [180° Flip] [Reset 0°]
+                    // Quick Stepper Buttons for active axis + Reset All
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -291,43 +229,52 @@ fun SpatialRotationController(
                         Button(
                             onClick = {
                                 onStopAutoRotate()
-                                val newAngle = ((currentAngle - 45f) % 360f + 360f) % 360f
-                                onAngleChange(newAngle)
+                                val newAngle = ((currentStepAngle - 45f) % 360f + 360f) % 360f
+                                onStepAngleChange(newAngle)
                             },
-                            modifier = Modifier.weight(1f).height(32.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("step_minus_45_button"),
                             contentPadding = PaddingValues(0.dp),
-                            shape = RoundedCornerShape(8.dp),
+                            shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2638))
                         ) {
-                            Text("-45°", fontSize = 11.sp, color = Color.White)
+                            Text("$stepAxisLabel -45°", fontSize = 11.sp, color = Color.White)
                         }
 
                         Button(
                             onClick = {
                                 onStopAutoRotate()
-                                val newAngle = ((currentAngle + 45f) % 360f + 360f) % 360f
-                                onAngleChange(newAngle)
+                                val newAngle = ((currentStepAngle + 45f) % 360f + 360f) % 360f
+                                onStepAngleChange(newAngle)
                             },
-                            modifier = Modifier.weight(1f).height(32.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("step_plus_45_button"),
                             contentPadding = PaddingValues(0.dp),
-                            shape = RoundedCornerShape(8.dp),
+                            shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2638))
                         ) {
-                            Text("+45°", fontSize = 11.sp, color = Color.White)
+                            Text("$stepAxisLabel +45°", fontSize = 11.sp, color = Color.White)
                         }
 
                         Button(
                             onClick = {
                                 onStopAutoRotate()
-                                val newAngle = ((currentAngle + 180f) % 360f + 360f) % 360f
-                                onAngleChange(newAngle)
+                                val newAngle = ((currentStepAngle + 180f) % 360f + 360f) % 360f
+                                onStepAngleChange(newAngle)
                             },
-                            modifier = Modifier.weight(1f).height(32.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("step_180_button"),
                             contentPadding = PaddingValues(0.dp),
-                            shape = RoundedCornerShape(8.dp),
+                            shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2638))
                         ) {
-                            Text("180°", fontSize = 11.sp, color = Color.White)
+                            Text("$stepAxisLabel 180°", fontSize = 11.sp, color = Color.White)
                         }
 
                         Button(
@@ -337,9 +284,12 @@ fun SpatialRotationController(
                                 onRotationYChange(0f)
                                 onRotationZChange(0f)
                             },
-                            modifier = Modifier.weight(1f).height(32.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("reset_rotation_button"),
                             contentPadding = PaddingValues(0.dp),
-                            shape = RoundedCornerShape(8.dp),
+                            shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = NeonCyan.copy(alpha = 0.2f))
                         ) {
                             Text("Reset", fontSize = 11.sp, color = NeonCyan, fontWeight = FontWeight.Bold)
@@ -349,13 +299,120 @@ fun SpatialRotationController(
                     Spacer(modifier = Modifier.height(6.dp))
 
                     Text(
-                        text = "💡 اسحب بإصبع واحد للتدوير 360°. اسحب عند حافة الشاشة لتدوير Z (Roll)!",
+                        text = "اختر X أو Y أو Z للتدوير 360° بإصبع واحد لكل محور منفرداً",
                         fontSize = 10.sp,
-                        color = Color.White.copy(alpha = 0.6f),
+                        color = Color.White.copy(alpha = 0.65f),
                         textAlign = TextAlign.Center
                     )
                 }
             }
         }
+
+        // Compact 1-tap Axis Lock + 360° Expand Bar
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(24.dp))
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0x99202532),
+                            Color(0xB310141D)
+                        )
+                    )
+                )
+                .border(
+                    width = 1.dp,
+                    color = if (isExpanded) NeonCyan else Color.White.copy(alpha = 0.30f),
+                    shape = RoundedCornerShape(24.dp)
+                )
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            RotationAxis.values().forEach { axis ->
+                val isSelected = activeAxis == axis
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 36.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(
+                            if (isSelected) NeonCyan.copy(alpha = 0.25f)
+                            else Color.Transparent
+                        )
+                        .border(
+                            width = 1.dp,
+                            color = if (isSelected) NeonCyan else Color.White.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(18.dp)
+                        )
+                        .clickable { onActiveAxisChange(axis) }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .testTag("axis_chip_${axis.shortName.lowercase()}"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = axis.shortName,
+                        color = if (isSelected) NeonCyan else Color.White.copy(alpha = 0.85f),
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                        fontSize = 11.sp
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .heightIn(min = 36.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(
+                        if (isExpanded) NeonCyan.copy(alpha = 0.22f)
+                        else Color.White.copy(alpha = 0.08f)
+                    )
+                    .clickable { isExpanded = !isExpanded }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .testTag("toggle_rotation_hud_button"),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "⟳ ${safeX.toInt()}°·${safeY.toInt()}°·${safeZ.toInt()}°",
+                    color = if (isExpanded) NeonCyan else Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 11.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AxisAngleSliderRow(
+    axisLabel: String,
+    angleDegrees: Float,
+    isHighlighted: Boolean,
+    sliderTestTag: String,
+    onAngleChange: (Float) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "$axisLabel: ${angleDegrees.toInt()}°",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (isHighlighted) NeonCyan else Color.White.copy(alpha = 0.85f),
+            modifier = Modifier.width(56.dp)
+        )
+        Slider(
+            value = angleDegrees.coerceIn(0f, 360f),
+            onValueChange = onAngleChange,
+            valueRange = 0f..360f,
+            modifier = Modifier
+                .weight(1f)
+                .testTag(sliderTestTag),
+            colors = SliderDefaults.colors(
+                thumbColor = if (isHighlighted) NeonCyan else Color.White,
+                activeTrackColor = if (isHighlighted) NeonCyan else Color(0xFF70D6FF),
+                inactiveTrackColor = Color.White.copy(alpha = 0.2f)
+            )
+        )
     }
 }

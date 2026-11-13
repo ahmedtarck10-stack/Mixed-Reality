@@ -29,11 +29,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.aistudio.mixedreality.ui.theme.*
 import com.google.android.filament.Engine
+import android.util.Log
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
+import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
+import io.github.sceneview.ar.arcore.ARSession
 import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.ar.rememberARCameraStream
 import io.github.sceneview.loaders.EnvironmentLoader
 import io.github.sceneview.loaders.MaterialLoader
 import io.github.sceneview.loaders.ModelLoader
@@ -46,8 +50,16 @@ import io.github.sceneview.node.CylinderNode
 import io.github.sceneview.node.ModelNode
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
+import io.github.sceneview.rememberEnvironmentLoader
+import io.github.sceneview.rememberFillLightNode
+import io.github.sceneview.rememberMainLightNode
+import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberModelInstance
+import io.github.sceneview.rememberModelLoader
+import io.github.sceneview.rememberSurfaceMirrorer
 import io.github.sceneview.utils.SurfaceMirrorer
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 
@@ -71,10 +83,11 @@ fun MRStereoSplitView(
     onRotationZChange: (Float) -> Unit = {},
     isRecording: Boolean = false,
     engine: Engine,
-    modelLoader: ModelLoader,
-    materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader,
-    surfaceMirrorer: SurfaceMirrorer,
+    modelLoader: ModelLoader? = null,
+    materialLoader: MaterialLoader? = null,
+    environmentLoader: EnvironmentLoader? = null,
+    surfaceMirrorer: SurfaceMirrorer? = null,
+    onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {},
     isARCoreAvailable: Boolean = true,
     clearTrigger: Int = 0,
     isMoveMode: Boolean = false,
@@ -82,6 +95,7 @@ fun MRStereoSplitView(
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
     isFullScreen: Boolean = false,
     onToggleFullScreen: () -> Unit = {},
+    isFlashlightOn: Boolean = false,
     onStopAutoRotate: () -> Unit = {},
     onFallbackToObject: () -> Unit = {}
 ) {
@@ -103,16 +117,14 @@ fun MRStereoSplitView(
         onStopAutoRotate = onStopAutoRotate,
         onFallbackToObject = onFallbackToObject,
         engine = engine,
-        modelLoader = modelLoader,
-        materialLoader = materialLoader,
-        environmentLoader = environmentLoader,
-        surfaceMirrorer = surfaceMirrorer,
+        onSurfaceMirrorerChanged = onSurfaceMirrorerChanged,
         clearTrigger = clearTrigger,
         isMoveMode = isMoveMode,
         onToggleMoveMode = onToggleMoveMode,
         activeRotationAxis = activeRotationAxis,
         isFullScreen = isFullScreen,
         onToggleFullScreen = onToggleFullScreen,
+        isFlashlightOn = isFlashlightOn,
         modifier = modifier
     )
 }
@@ -136,16 +148,14 @@ private fun MRStereoARCoreView(
     onStopAutoRotate: () -> Unit,
     onFallbackToObject: () -> Unit = {},
     engine: Engine,
-    modelLoader: ModelLoader,
-    materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader,
-    surfaceMirrorer: SurfaceMirrorer,
+    onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {},
     clearTrigger: Int,
     isMoveMode: Boolean,
     onToggleMoveMode: () -> Unit,
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
     isFullScreen: Boolean,
     onToggleFullScreen: () -> Unit,
+    isFlashlightOn: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -303,6 +313,18 @@ private fun MRStereoARCoreView(
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
+    val localModelLoader = rememberModelLoader(engine)
+    val localMaterialLoader = rememberMaterialLoader(engine)
+    val localEnvironmentLoader = rememberEnvironmentLoader(engine)
+    val localSurfaceMirrorer = rememberSurfaceMirrorer()
+
+    DisposableEffect(localSurfaceMirrorer) {
+        onSurfaceMirrorerChanged(localSurfaceMirrorer)
+        onDispose {
+            onSurfaceMirrorerChanged(null)
+        }
+    }
+
     val trackingManager = rememberARTrackingManager(
         modeName = "MR",
         onHapticFeedback = {
@@ -337,7 +359,7 @@ private fun MRStereoARCoreView(
         val surface = activeRightSurfaceRef.getAndSet(null)
         if (surface != null) {
             runCatching {
-                surfaceMirrorer.stopMirroring(surface)
+                localSurfaceMirrorer.stopMirroring(surface)
             }
             runCatching {
                 surface.release()
@@ -361,20 +383,20 @@ private fun MRStereoARCoreView(
     }
 
     val pbrMaterial = remember(
-        materialLoader,
+        localMaterialLoader,
         color,
         metallic,
         roughness
     ) {
-        materialLoader.createColorInstance(
+        localMaterialLoader.createColorInstance(
             color = color,
             metallic = metallic.coerceIn(0.0f, 0.5f),
             roughness = roughness.coerceIn(0.2f, 0.85f)
         )
     }
 
-    val visorGlassMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
+    val visorGlassMaterial = remember(localMaterialLoader) {
+        localMaterialLoader.createColorInstance(
             color = Color(0xFF141923),
             metallic = 0.85f,
             roughness = 0.15f
@@ -384,7 +406,7 @@ private fun MRStereoARCoreView(
     // Lazy conditional loading: only load toyCarModel when actively displayed
     val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
         rememberModelInstance(
-            modelLoader = modelLoader,
+            modelLoader = localModelLoader,
             fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
         )
     } else {
@@ -394,7 +416,7 @@ private fun MRStereoARCoreView(
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
             rememberModelInstance(
-                modelLoader = modelLoader,
+                modelLoader = localModelLoader,
                 fileLocation = "file://${file.absolutePath}"
             )
         }
@@ -473,180 +495,246 @@ private fun MRStereoARCoreView(
                     }
                     .testTag("mr_left_eye")
             ) {
-                ARSceneView(
-                    modifier = Modifier.fillMaxSize(),
-                    engine = engine,
-                    modelLoader = modelLoader,
-                    materialLoader = materialLoader,
-                    environmentLoader = environmentLoader,
-                    surfaceMirrorer = surfaceMirrorer,
-                    planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
-                    updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
-                    instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
-                    focusMode = Config.FocusMode.AUTO,
-                    sessionConfiguration = { _, config ->
-                        config.planeFindingMode =
-                            Config.PlaneFindingMode.HORIZONTAL
-                        config.focusMode = Config.FocusMode.AUTO
-                        config.updateMode =
-                            Config.UpdateMode.LATEST_CAMERA_IMAGE
-                        config.instantPlacementMode =
-                            Config.InstantPlacementMode.LOCAL_Y_UP
-                        config.lightEstimationMode =
-                            Config.LightEstimationMode.DISABLED
-                        config.depthMode =
-                            Config.DepthMode.DISABLED
-                    },
-                    planeRenderer = (activeAnchor == null),
-                    permissionHandler = null,
-                    onGestureListener = null,
-                    onSessionUpdated = { session, frame ->
-                        trackingManager.onSessionUpdated(
-                            session = session,
-                            frame = frame,
-                            isModelVisible = isModelVisible,
-                            splitWidthPx = leftEyeWidthPx,
-                            onPlaced = {
-                                modelOffset = Position(0f, 0f, 0f)
-                                isAnchorLocked = true
-                            }
-                        )
+                var sessionRetryKey by remember { mutableIntStateOf(0) }
+                var sessionRetryCount by remember { mutableIntStateOf(0) }
+                var retryScheduled by remember(sessionRetryKey) { mutableStateOf(false) }
+                var activeSession by remember(sessionRetryKey) { mutableStateOf<Session?>(null) }
+
+                fun applyFlashToSession(session: Session?, enabled: Boolean) {
+                    if (session == null) return
+                    if ((session as? ARSession)?.isClosed == true) return
+                    runCatching {
+                        val targetFlash = if (enabled) Config.FlashMode.TORCH else Config.FlashMode.OFF
+                        val currentConfig = session.config
+                        if (currentConfig.flashMode != targetFlash) {
+                            currentConfig.flashMode = targetFlash
+                            session.configure(currentConfig)
+                        }
+                    }.onFailure { err ->
+                        Log.w("MRStereoSplitView", "Failed applying MR flash mode ($enabled): ${err.message}")
                     }
-                ) {
-                    activeAnchor?.let { anchor ->
-                        AnchorNode(
-                            anchor = anchor,
-                            // Keep real-world anchor pose tracking active regardless of gesture lock
-                            updateAnchorPose = true,
-                            visibleTrackingStates = setOf(
-                                TrackingState.TRACKING,
-                                TrackingState.PAUSED
-                            ),
-                            onTrackingStateChanged = { newState ->
-                                trackingManager.onAnchorTrackingStateChanged(newState)
+                }
+
+                LaunchedEffect(activeSession, isFlashlightOn) {
+                    applyFlashToSession(activeSession, isFlashlightOn)
+                }
+
+                DisposableEffect(sessionRetryKey) {
+                    onDispose {
+                        activeSession = null
+                    }
+                }
+
+                key(sessionRetryKey) {
+                    ARSceneView(
+                        modifier = Modifier.fillMaxSize(),
+                        engine = engine,
+                        modelLoader = localModelLoader,
+                        materialLoader = localMaterialLoader,
+                        environmentLoader = localEnvironmentLoader,
+                        cameraStream = rememberARCameraStream(localMaterialLoader),
+                        mainLightNode = rememberMainLightNode(engine) {
+                            intensity = 45_000.0f
+                        },
+                        fillLightNode = rememberFillLightNode(engine) {
+                            intensity = 18_000.0f
+                        },
+                        surfaceMirrorer = localSurfaceMirrorer,
+                        planeFindingMode = Config.PlaneFindingMode.HORIZONTAL,
+                        updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE,
+                        instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP,
+                        focusMode = Config.FocusMode.AUTO,
+                        flashMode = if (isFlashlightOn) Config.FlashMode.TORCH else Config.FlashMode.OFF,
+                        sessionConfiguration = { _, config ->
+                            config.planeFindingMode =
+                                Config.PlaneFindingMode.HORIZONTAL
+                            config.focusMode = Config.FocusMode.AUTO
+                            config.updateMode =
+                                Config.UpdateMode.LATEST_CAMERA_IMAGE
+                            config.instantPlacementMode =
+                                Config.InstantPlacementMode.LOCAL_Y_UP
+                            config.lightEstimationMode =
+                                Config.LightEstimationMode.AMBIENT_INTENSITY
+                            config.depthMode =
+                                Config.DepthMode.DISABLED
+                            config.flashMode =
+                                if (isFlashlightOn) Config.FlashMode.TORCH else Config.FlashMode.OFF
+                        },
+                        planeRenderer = (activeAnchor == null),
+                        permissionHandler = null,
+                        onGestureListener = null,
+                        onSessionCreated = { session ->
+                            activeSession = session
+                            applyFlashToSession(session, isFlashlightOn)
+                        },
+                        onSessionResumed = { session ->
+                            activeSession = session
+                            sessionRetryCount = 0
+                            applyFlashToSession(session, isFlashlightOn)
+                        },
+                        onSessionPaused = {
+                            activeSession = null
+                        },
+                        onSessionFailed = { exception ->
+                            Log.w("MRStereoSplitView", "MR ARCore session error: ${exception.message}")
+                            if (!retryScheduled && sessionRetryCount < 3) {
+                                retryScheduled = true
+                                sessionRetryCount++
+                                scope.launch {
+                                    delay(380L)
+                                    sessionRetryKey++
+                                }
                             }
-                        ) {
-                            val safeScale =
-                                if (scale.isFinite() && scale > 0f) {
-                                    scale.coerceIn(0.1f, 2500.0f)
-                                } else {
-                                    1.0f
+                        },
+                        onSessionUpdated = { session, frame ->
+                            trackingManager.onSessionUpdated(
+                                session = session,
+                                frame = frame,
+                                isModelVisible = isModelVisible,
+                                splitWidthPx = leftEyeWidthPx,
+                                onPlaced = {
+                                    modelOffset = Position(0f, 0f, 0f)
+                                    isAnchorLocked = true
                                 }
-
-                            val safeRotX =
-                                if (rotationX.isFinite()) {
-                                    ((rotationX % 360f) + 360f) % 360f
-                                } else {
-                                    0f
-                                }
-
-                            val safeRotY =
-                                if (rotationY.isFinite()) {
-                                    ((rotationY % 360f) + 360f) % 360f
-                                } else {
-                                    0f
-                                }
-
-                            val safeRotZ =
-                                if (rotationZ.isFinite()) {
-                                    ((rotationZ % 360f) + 360f) % 360f
-                                } else {
-                                    0f
-                                }
-
-                            val effectivePosition = Position(
-                                x = modelOffset.x + trackingManager.smoothedOffset.x,
-                                y = modelOffset.y + trackingManager.smoothedOffset.y,
-                                z = modelOffset.z + trackingManager.smoothedOffset.z
                             )
-
-                            Node(
-                                position = effectivePosition,
-                                rotation = Rotation(
-                                    x = safeRotX,
-                                    y = safeRotY,
-                                    z = safeRotZ
+                        }
+                    ) {
+                        activeAnchor?.let { anchor ->
+                            AnchorNode(
+                                anchor = anchor,
+                                // Keep real-world anchor pose tracking active regardless of gesture lock
+                                updateAnchorPose = true,
+                                visibleTrackingStates = setOf(
+                                    TrackingState.TRACKING,
+                                    TrackingState.PAUSED
                                 ),
-                                scale = Scale(safeScale)
+                                onTrackingStateChanged = { newState ->
+                                    trackingManager.onAnchorTrackingStateChanged(newState)
+                                }
                             ) {
-                                if (isModelVisible) {
-                                    if (customModelFile != null) {
-                                        customModelInstance?.let { instance ->
-                                            ModelNode(
-                                                modelInstance = instance,
-                                                scaleToUnits = 0.35f,
-                                                centerOrigin = Position(0f, 0f, 0f),
-                                                autoAnimate = true
-                                            )
-                                        }
+                                val safeScale =
+                                    if (scale.isFinite() && scale > 0f) {
+                                        scale.coerceIn(0.1f, 2500.0f)
                                     } else {
-                                        when (modelItem) {
-                                            ModelItem.VISION_HEADSET -> {
-                                                SphereNode(
-                                                    radius = 0.16f,
-                                                    materialInstance = visorGlassMaterial,
-                                                    position = Position(
-                                                        0f,
-                                                        0.04f,
-                                                        0.08f
-                                                    )
-                                                )
-                                                CylinderNode(
-                                                    radius = 0.18f,
-                                                    height = 0.06f,
-                                                    materialInstance = pbrMaterial,
-                                                    position = Position(
-                                                        0f,
-                                                        0.04f,
-                                                        -0.04f
-                                                    )
-                                                )
-                                            }
+                                        1.0f
+                                    }
 
-                                            ModelItem.TOY_CAR -> {
-                                                toyCarModel?.let { instance ->
-                                                    ModelNode(
-                                                        modelInstance = instance,
-                                                        scaleToUnits = 0.40f,
-                                                        centerOrigin = Position(0f, 0f, 0f)
-                                                    )
-                                                } ?: CubeNode(
-                                                    size = Size(
-                                                        0.25f,
-                                                        0.25f,
-                                                        0.25f
-                                                    ),
-                                                    materialInstance = pbrMaterial
-                                                )
-                                            }
+                                val safeRotX =
+                                    if (rotationX.isFinite()) {
+                                        ((rotationX % 360f) + 360f) % 360f
+                                    } else {
+                                        0f
+                                    }
 
-                                            ModelItem.HOLO_CUBE -> {
-                                                CubeNode(
-                                                    size = Size(
-                                                        0.24f,
-                                                        0.24f,
-                                                        0.24f
-                                                    ),
-                                                    materialInstance = pbrMaterial
-                                                )
-                                            }
+                                val safeRotY =
+                                    if (rotationY.isFinite()) {
+                                        ((rotationY % 360f) + 360f) % 360f
+                                    } else {
+                                        0f
+                                    }
 
-                                            ModelItem.QUANTUM_ORB -> {
-                                                SphereNode(
-                                                    radius = 0.18f,
-                                                    materialInstance = pbrMaterial
-                                                )
-                                            }
+                                val safeRotZ =
+                                    if (rotationZ.isFinite()) {
+                                        ((rotationZ % 360f) + 360f) % 360f
+                                    } else {
+                                        0f
+                                    }
 
-                                            ModelItem.SPATIAL_CARD -> {
-                                                CubeNode(
-                                                    size = Size(
-                                                        0.35f,
-                                                        0.22f,
-                                                        0.03f
-                                                    ),
-                                                    materialInstance = pbrMaterial
-                                                )
+                                val effectivePosition = Position(
+                                    x = modelOffset.x + trackingManager.smoothedOffset.x,
+                                    y = modelOffset.y + trackingManager.smoothedOffset.y,
+                                    z = modelOffset.z + trackingManager.smoothedOffset.z
+                                )
+
+                                Node(
+                                    position = effectivePosition,
+                                    scale = Scale(safeScale)
+                                ) {
+                                    Node(rotation = Rotation(y = safeRotY)) {
+                                        Node(rotation = Rotation(x = safeRotX)) {
+                                            Node(rotation = Rotation(z = safeRotZ)) {
+                                                if (isModelVisible) {
+                                                    if (customModelFile != null) {
+                                                        customModelInstance?.let { instance ->
+                                                            ModelNode(
+                                                                modelInstance = instance,
+                                                                scaleToUnits = 0.35f,
+                                                                centerOrigin = Position(0f, 0f, 0f),
+                                                                autoAnimate = true
+                                                            )
+                                                        }
+                                                    } else {
+                                                        when (modelItem) {
+                                                            ModelItem.VISION_HEADSET -> {
+                                                                SphereNode(
+                                                                    radius = 0.16f,
+                                                                    materialInstance = visorGlassMaterial,
+                                                                    position = Position(
+                                                                        0f,
+                                                                        0.04f,
+                                                                        0.08f
+                                                                    )
+                                                                )
+                                                                CylinderNode(
+                                                                    radius = 0.18f,
+                                                                    height = 0.06f,
+                                                                    materialInstance = pbrMaterial,
+                                                                    position = Position(
+                                                                        0f,
+                                                                        0.04f,
+                                                                        -0.04f
+                                                                    )
+                                                                )
+                                                            }
+
+                                                            ModelItem.TOY_CAR -> {
+                                                                toyCarModel?.let { instance ->
+                                                                    ModelNode(
+                                                                        modelInstance = instance,
+                                                                        scaleToUnits = 0.40f,
+                                                                        centerOrigin = Position(0f, 0f, 0f)
+                                                                    )
+                                                                } ?: CubeNode(
+                                                                    size = Size(
+                                                                        0.25f,
+                                                                        0.25f,
+                                                                        0.25f
+                                                                    ),
+                                                                    materialInstance = pbrMaterial
+                                                                )
+                                                            }
+
+                                                            ModelItem.HOLO_CUBE -> {
+                                                                CubeNode(
+                                                                    size = Size(
+                                                                        0.24f,
+                                                                        0.24f,
+                                                                        0.24f
+                                                                    ),
+                                                                    materialInstance = pbrMaterial
+                                                                )
+                                                            }
+
+                                                            ModelItem.QUANTUM_ORB -> {
+                                                                SphereNode(
+                                                                    radius = 0.18f,
+                                                                    materialInstance = pbrMaterial
+                                                                )
+                                                            }
+
+                                                            ModelItem.SPATIAL_CARD -> {
+                                                                CubeNode(
+                                                                    size = Size(
+                                                                        0.35f,
+                                                                        0.22f,
+                                                                        0.03f
+                                                                    ),
+                                                                    materialInstance = pbrMaterial
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -692,7 +780,7 @@ private fun MRStereoARCoreView(
 
                                         if (oldSurface != null) {
                                             runCatching {
-                                                surfaceMirrorer.stopMirroring(oldSurface)
+                                                localSurfaceMirrorer.stopMirroring(oldSurface)
                                             }
                                             runCatching {
                                                 oldSurface.release()
@@ -700,7 +788,7 @@ private fun MRStereoARCoreView(
                                         }
 
                                         runCatching {
-                                            surfaceMirrorer.startMirroring(
+                                            localSurfaceMirrorer.startMirroring(
                                                 newSurface,
                                                 width.coerceAtLeast(1),
                                                 height.coerceAtLeast(1)
@@ -716,10 +804,10 @@ private fun MRStereoARCoreView(
                                         val surface = activeRightSurfaceRef.get()
                                         if (surface != null) {
                                             runCatching {
-                                                surfaceMirrorer.stopMirroring(surface)
+                                                localSurfaceMirrorer.stopMirroring(surface)
                                             }
                                             runCatching {
-                                                surfaceMirrorer.startMirroring(
+                                                localSurfaceMirrorer.startMirroring(
                                                     surface,
                                                     width.coerceAtLeast(1),
                                                     height.coerceAtLeast(1)

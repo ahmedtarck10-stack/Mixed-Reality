@@ -45,6 +45,8 @@ import kotlinx.coroutines.launch
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.animation.*
 
+import io.github.sceneview.rememberSurfaceMirrorer
+
 /**
  * Single-viewport 3D inspection studio (Object Mode).
  * Supports custom gestures:
@@ -79,11 +81,24 @@ fun Studio3DView(
     onStopAutoRotate: () -> Unit = {},
     onOpenClick: () -> Unit,
     engine: Engine,
-    modelLoader: ModelLoader,
-    materialLoader: MaterialLoader,
-    environmentLoader: EnvironmentLoader,
-    surfaceMirrorer: SurfaceMirrorer? = null
+    modelLoader: ModelLoader? = null,
+    materialLoader: MaterialLoader? = null,
+    environmentLoader: EnvironmentLoader? = null,
+    surfaceMirrorer: SurfaceMirrorer? = null,
+    onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {}
 ) {
+    val localModelLoader = rememberModelLoader(engine)
+    val localMaterialLoader = rememberMaterialLoader(engine)
+    val localEnvironmentLoader = rememberEnvironmentLoader(engine)
+    val localSurfaceMirrorer = rememberSurfaceMirrorer()
+
+    DisposableEffect(localSurfaceMirrorer) {
+        onSurfaceMirrorerChanged(localSurfaceMirrorer)
+        onDispose {
+            onSurfaceMirrorerChanged(null)
+        }
+    }
+
     val windowManager = rememberViewNodeManager()
     val scope = rememberCoroutineScope()
     var modelPosition by remember { mutableStateOf(Position(0f, 0f, 0f)) }
@@ -100,16 +115,16 @@ fun Studio3DView(
         }
     }
 
-    val pbrMaterial = remember(materialLoader, color, metallic, roughness) {
-        materialLoader.createColorInstance(
+    val pbrMaterial = remember(localMaterialLoader, color, metallic, roughness) {
+        localMaterialLoader.createColorInstance(
             color = color,
             metallic = metallic.coerceIn(0.0f, 0.5f),
             roughness = roughness.coerceIn(0.2f, 0.85f)
         )
     }
 
-    val visorGlassMaterial = remember(materialLoader) {
-        materialLoader.createColorInstance(
+    val visorGlassMaterial = remember(localMaterialLoader) {
+        localMaterialLoader.createColorInstance(
             color = Color(0xFF161A22),
             metallic = 0.35f,
             roughness = 0.45f
@@ -118,7 +133,7 @@ fun Studio3DView(
 
     val toyCarModel = if (customModelFile == null && modelItem == ModelItem.TOY_CAR) {
         rememberModelInstance(
-            modelLoader = modelLoader,
+            modelLoader = localModelLoader,
             fileLocation = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/ToyCar/glTF-Binary/ToyCar.glb"
         )
     } else {
@@ -127,14 +142,14 @@ fun Studio3DView(
     val customModelInstance = key(customModelFile?.absolutePath) {
         customModelFile?.let { file ->
             rememberModelInstance(
-                modelLoader = modelLoader,
+                modelLoader = localModelLoader,
                 fileLocation = "file://${file.absolutePath}"
             )
         }
     }
 
-    val environment = rememberEnvironment(environmentLoader) {
-        createEnvironment(environmentLoader)
+    val environment = rememberEnvironment(localEnvironmentLoader) {
+        createEnvironment(localEnvironmentLoader)
     }
 
     var viewWidthPx by remember { mutableFloatStateOf(1080f) }
@@ -215,9 +230,9 @@ fun Studio3DView(
         SceneView(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
-            modelLoader = modelLoader,
-            materialLoader = materialLoader,
-            environmentLoader = environmentLoader,
+            modelLoader = localModelLoader,
+            materialLoader = localMaterialLoader,
+            environmentLoader = localEnvironmentLoader,
             environment = environment,
             viewNodeWindowManager = windowManager,
             cameraManipulator = null,
@@ -227,7 +242,7 @@ fun Studio3DView(
             },
             mainLightNode = rememberMainLightNode(engine),
             fillLightNode = rememberFillLightNode(engine),
-            surfaceMirrorer = surfaceMirrorer
+            surfaceMirrorer = localSurfaceMirrorer
         ) {
             if (isModelVisible) {
                 Render3DModel(

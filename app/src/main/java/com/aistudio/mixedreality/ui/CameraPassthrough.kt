@@ -34,7 +34,8 @@ private const val TAG = "CameraPassthrough"
  */
 @Composable
 fun CameraPassthroughBackground(
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isFlashlightOn: Boolean = false
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -76,7 +77,12 @@ fun CameraPassthroughBackground(
         if (hasCameraPermission && isResumed) {
             AndroidView(
                 factory = { ctx ->
-                    CameraPassthroughTextureView(ctx)
+                    CameraPassthroughTextureView(ctx).apply {
+                        setFlashlightEnabled(isFlashlightOn)
+                    }
+                },
+                update = { view ->
+                    view.setFlashlightEnabled(isFlashlightOn)
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -90,11 +96,34 @@ fun CameraPassthroughBackground(
 class CameraPassthroughTextureView(context: Context) : TextureView(context), TextureView.SurfaceTextureListener {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
+    private var activeRequestBuilder: CaptureRequest.Builder? = null
+    private var isFlashlightEnabled: Boolean = false
     private var backgroundThread: android.os.HandlerThread? = null
     private var backgroundHandler: Handler? = null
 
     init {
         surfaceTextureListener = this
+    }
+
+    fun setFlashlightEnabled(enabled: Boolean) {
+        if (isFlashlightEnabled == enabled) return
+        isFlashlightEnabled = enabled
+        applyFlashModeToSession()
+    }
+
+    private fun applyFlashModeToSession() {
+        val session = captureSession ?: return
+        val builder = activeRequestBuilder ?: return
+        try {
+            builder.set(
+                CaptureRequest.FLASH_MODE,
+                if (isFlashlightEnabled) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF
+            )
+            val handler = backgroundHandler ?: Handler(Looper.getMainLooper())
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed updating passthrough flash mode: ${e.message}")
+        }
     }
 
     private fun startBackgroundThread() {
@@ -179,7 +208,13 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
             val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(previewSurface)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(
+                    CaptureRequest.FLASH_MODE,
+                    if (isFlashlightEnabled) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF
+                )
             }
+            activeRequestBuilder = requestBuilder
 
             val handler = backgroundHandler ?: Handler(Looper.getMainLooper())
 
@@ -209,6 +244,7 @@ class CameraPassthroughTextureView(context: Context) : TextureView(context), Tex
 
     private fun stopCamera() {
         try {
+            activeRequestBuilder = null
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
