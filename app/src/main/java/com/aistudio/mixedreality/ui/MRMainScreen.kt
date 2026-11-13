@@ -21,8 +21,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.FlashOff
-import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Tune
 import com.aistudio.mixedreality.util.FlashlightHelper
 import androidx.compose.material3.*
@@ -109,9 +107,9 @@ fun MRMainScreen(
     // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
     var showCloudLibrary by remember { mutableStateOf(false) }
 
-    // Flashlight / Torch toggle for low-light environments
+    // Flashlight / Torch runs silently in the background for low-light environments (button hidden)
     val hasFlashHardware = remember(context) { FlashlightHelper.isFlashAvailable(context) }
-    var isFlashlightOn by remember { mutableStateOf(false) }
+    val isFlashlightOn = hasFlashHardware
     val lifecycleOwner = LocalLifecycleOwner.current
     var isAppResumed by remember {
         mutableStateOf(
@@ -205,19 +203,8 @@ fun MRMainScreen(
     // Full Screen Mode (Triple-Tap toggles upper part & lower part)
     var isFullScreen by remember { mutableStateOf(false) }
 
-    // Move Mode (Double-Tap toggles moving mode)
+    // Move Mode (Double-Tap switches between 2-finger Move and 2-finger Scale)
     var isMoveMode by remember { mutableStateOf(false) }
-
-    // Temporary hint banner when entering full screen
-    var showFullScreenHint by remember { mutableStateOf(false) }
-
-    LaunchedEffect(isFullScreen) {
-        if (isFullScreen) {
-            showFullScreenHint = true
-            delay(2800L)
-            showFullScreenHint = false
-        }
-    }
 
     // Camera permission launcher
     var hasCameraPermission by remember {
@@ -398,7 +385,7 @@ fun MRMainScreen(
             }
         }
 
-        // --- 2. TOP FLOATING SEGMENTED PILL (EXACT CENTER) & FLASHLIGHT (LEFT) ---
+        // --- 2. TOP FLOATING SEGMENTED PILL (EXACT CENTER) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
         androidx.compose.animation.AnimatedVisibility(
             visible = !isFullScreen,
@@ -413,21 +400,6 @@ fun MRMainScreen(
             Box(
                 modifier = Modifier.fillMaxWidth()
             ) {
-                FlashlightToggleButton(
-                    isOn = isFlashlightOn,
-                    onToggle = {
-                        if (!hasFlashHardware) {
-                            isFlashlightOn = false
-                            Toast.makeText(context, "لا يوجد فلاش في هذا الجهاز", Toast.LENGTH_SHORT).show()
-                        } else {
-                            isFlashlightOn = !isFlashlightOn
-                            val msg = if (isFlashlightOn) "كشاف الإضاءة: يعمل 💡" else "كشاف الإضاءة: متوقف"
-                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    modifier = Modifier.align(Alignment.CenterStart)
-                )
-
                 TopModeSegmentedPill(
                     currentMode = selectedMode,
                     onModeSelected = { mode ->
@@ -446,49 +418,6 @@ fun MRMainScreen(
             }
         }
 
-        // Full Screen Hint Overlay (Fades out automatically after 2.8s)
-        if (isFullScreen && showFullScreenHint) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = 18.dp)
-                    .background(Color.Black.copy(alpha = 0.85f), RoundedCornerShape(20.dp))
-                    .border(1.dp, NeonCyan.copy(alpha = 0.7f), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 16.dp, vertical = 7.dp)
-            ) {
-                Text(
-                    text = "شاشة كاملة 🥽 • اضغط 3 مرات (Triple-tap) للرجوع",
-                    color = Color.White,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-        }
-
-        // Floating button to exit full screen mode
-        if (isFullScreen) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(top = 16.dp, end = 16.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color(0x99000000))
-                    .border(1.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(20.dp))
-                    .clickable { isFullScreen = false }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                    .testTag("exit_fullscreen_button")
-            ) {
-                Text(
-                    text = "✕ إظهار الأشرطة",
-                    color = Color.White,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-        }
-
         // --- 3. ACTIVE RECORDING BADGE (Top-right indicator) ---
         if (isRecording) {
             RecordingStatusBadge(
@@ -502,29 +431,7 @@ fun MRMainScreen(
 
 
 
-        // --- 4. INDEPENDENT X/Y/Z 360° ROTATION CONTROLLER ---
-        // Hidden in Full Screen mode or when scene is cleared
-        androidx.compose.animation.AnimatedVisibility(
-            visible = !isFullScreen && isModelVisible,
-            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { it }),
-            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { it }),
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(bottom = 96.dp, start = 12.dp, end = 12.dp)
-        ) {
-            SpatialRotationController(
-                rotationX = rotationX,
-                onRotationXChange = { rotationX = it },
-                rotationY = rotationY,
-                onRotationYChange = { rotationY = it },
-                rotationZ = rotationZ,
-                onRotationZChange = { rotationZ = it },
-                activeAxis = activeRotationAxis,
-                onActiveAxisChange = { activeRotationAxis = it },
-                onStopAutoRotate = { isAutoRotating = false }
-            )
-        }
+        // Rotation bar hidden; 1-finger drag handles full 360° X, Y, and Z rotation directly
 
         // --- 5. BOTTOM FLOATING CONTROL PILL (PHOTO | ● REC | Open | Clear) ---
         // Hidden in Full Screen mode (Triple-Tap toggles)
@@ -1082,76 +989,6 @@ fun RecordingStatusBadge(
                 color = Color.White,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-/**
- * Quick toggle button for camera flashlight / torch in low-light environments.
- */
-@Composable
-fun FlashlightToggleButton(
-    isOn: Boolean,
-    onToggle: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = modifier
-            .size(48.dp)
-            .clip(CircleShape)
-            .clickable(onClick = onToggle)
-            .testTag("flashlight_toggle_button")
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(40.dp)
-                .clip(CircleShape)
-                .background(
-                    if (isOn) {
-                        Brush.radialGradient(
-                            colors = listOf(
-                                Color(0xFFFFEA00),
-                                Color(0xFFFFB300),
-                                Color(0xFFFF8F00)
-                            )
-                        )
-                    } else {
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                Color(0x73202532),
-                                Color(0x8C10141D),
-                                Color(0xA60A0C13)
-                            )
-                        )
-                    }
-                )
-                .border(
-                    width = 1.2.dp,
-                    brush = if (isOn) {
-                        Brush.verticalGradient(
-                            listOf(Color(0xFFFFF9C4), Color(0xFFFFD54F))
-                        )
-                    } else {
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                Color(0x73FFFFFF),
-                                Color(0x2BFFFFFF),
-                                Color(0x1AFFFFFF),
-                                Color(0x4DFFFFFF)
-                            )
-                        )
-                    },
-                    shape = CircleShape
-                )
-        ) {
-            Icon(
-                imageVector = if (isOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
-                contentDescription = "Flashlight",
-                tint = if (isOn) Color.Black else Color.White,
-                modifier = Modifier.size(20.dp)
             )
         }
     }

@@ -1,11 +1,13 @@
 package com.aistudio.mixedreality
 
+import androidx.compose.ui.geometry.Offset
 import com.aistudio.mixedreality.ui.AnchorRecoveryGate
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.RotationAxis
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
 import com.aistudio.mixedreality.ui.applyRotationDelta
+import com.aistudio.mixedreality.ui.calculateOneFingerZRollDelta
 import com.aistudio.mixedreality.ui.filterPoseWithLegacyDamping
 import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
 import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
@@ -280,5 +282,33 @@ class SpatialMathAndGesturesTest {
         assertEquals(12.5f, rx, 0.01f)
         assertEquals(347.5f, ry, 0.01f)
         assertEquals(20f, rz, 0.01f)
+    }
+
+    @Test
+    fun oneFingerZRollCalculatesFull360Sweep() {
+        val center = Offset(500f, 500f)
+        // Quarter-turn clockwise around center: right -> bottom (+90 deg)
+        val cw = calculateOneFingerZRollDelta(
+            prev = Offset(800f, 500f),
+            curr = Offset(500f, 800f),
+            center = center
+        )
+        assertEquals(90f, cw, 0.01f)
+
+        // Crossing +-180 seam: bottom-left -> top-left remains smooth positive delta
+        val seamCross = calculateOneFingerZRollDelta(
+            prev = Offset(200f, 520f),
+            curr = Offset(200f, 480f),
+            center = center
+        )
+        assertTrue(seamCross > 0f && seamCross < 20f)
+
+        // Near dead-center guarded against angular spikes
+        val nearCenter = calculateOneFingerZRollDelta(
+            prev = Offset(505f, 500f),
+            curr = Offset(495f, 500f),
+            center = center
+        )
+        assertEquals(0f, nearCenter, 0.001f)
     }
 }

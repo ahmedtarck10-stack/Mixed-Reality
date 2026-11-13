@@ -458,7 +458,8 @@ private fun MRStereoARCoreView(
                         sensitivity = 0.45f
                     )
                 },
-                onTwoFingerRotateZ = { dAngle ->
+                onOneFingerRotateZ = { dAngle ->
+                    onStopAutoRotate()
                     val newRotZ =
                         ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
@@ -469,13 +470,11 @@ private fun MRStereoARCoreView(
                     onScaleChange(newScale)
                 },
                 onMove = { panX, panY ->
-                    if (!isAnchorLocked) {
-                        modelOffset = Position(
-                            x = modelOffset.x + panX * 0.0025f,
-                            y = modelOffset.y,
-                            z = modelOffset.z + panY * 0.0025f
-                        )
-                    }
+                    modelOffset = Position(
+                        x = modelOffset.x + panX * 0.0025f,
+                        y = modelOffset.y,
+                        z = modelOffset.z + panY * 0.0025f
+                    )
                 }
             )
     ) {
@@ -836,134 +835,6 @@ private fun MRStereoARCoreView(
             }
         }
 
-        if (isMoveMode) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = if (isFullScreen) 16.dp else 70.dp)
-                    .background(
-                        Color(0xFF00E5FF).copy(alpha = 0.9f),
-                        RoundedCornerShape(20.dp)
-                    )
-                    .padding(horizontal = 14.dp, vertical = 6.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("✋", fontSize = 13.sp)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Move mode active • Double-tap to return to rotate",
-                        color = Color.Black,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        } else if (isModelVisible && activeAnchor != null) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = if (isFullScreen) 16.dp else 68.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                        androidx.compose.material3.Surface(
-                            onClick = {
-                                isAnchorLocked = !isAnchorLocked
-                                haptic.performHapticFeedback(
-                                    HapticFeedbackType.LongPress
-                                )
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (isAnchorLocked) {
-                                NeonGreen.copy(alpha = 0.25f)
-                            } else {
-                                Color.White.copy(alpha = 0.12f)
-                            },
-                            border = BorderStroke(
-                                1.dp,
-                                if (isAnchorLocked) {
-                                    NeonGreen
-                                } else {
-                                    Color.White.copy(alpha = 0.3f)
-                                }
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(
-                                    horizontal = 8.dp,
-                                    vertical = 4.dp
-                                ),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (isAnchorLocked) {
-                                        "🔒 Locked (Drift Shield ON)"
-                                    } else {
-                                        "🔓 Lock Position"
-                                    },
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (isAnchorLocked) {
-                                        NeonGreen
-                                    } else {
-                                        Color.White
-                                    }
-                                )
-                            }
-                        }
-
-                        androidx.compose.material3.Surface(
-                            onClick = {
-                                isFixedFocusEnabled = !isFixedFocusEnabled
-                                haptic.performHapticFeedback(
-                                    HapticFeedbackType.TextHandleMove
-                                )
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            color = if (isFixedFocusEnabled) {
-                                NeonCyan.copy(alpha = 0.2f)
-                            } else {
-                                Color.White.copy(alpha = 0.12f)
-                            },
-                            border = BorderStroke(
-                                1.dp,
-                                if (isFixedFocusEnabled) {
-                                    NeonCyan
-                                } else {
-                                    Color.White.copy(alpha = 0.3f)
-                                }
-                            )
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(
-                                    horizontal = 8.dp,
-                                    vertical = 4.dp
-                                ),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (isFixedFocusEnabled) {
-                                        "🎯 Fixed Focus"
-                                    } else {
-                                        "🔍 Auto Focus"
-                                    },
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Normal,
-                                    color = if (isFixedFocusEnabled) {
-                                        NeonCyan
-                                    } else {
-                                        Color.White.copy(alpha = 0.85f)
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Move mode, Lock Position, and Fixed Focus banners intentionally hidden for a distraction-free viewport
     }
+}

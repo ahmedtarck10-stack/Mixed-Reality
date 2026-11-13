@@ -102,18 +102,6 @@ fun Studio3DView(
     val windowManager = rememberViewNodeManager()
     val scope = rememberCoroutineScope()
     var modelPosition by remember { mutableStateOf(Position(0f, 0f, 0f)) }
-    var showModeBadge by remember { mutableStateOf(false) }
-
-    var isFirstLaunch by remember { mutableStateOf(true) }
-    LaunchedEffect(isMoveMode) {
-        if (isFirstLaunch) {
-            isFirstLaunch = false
-        } else {
-            showModeBadge = true
-            delay(2200L)
-            showModeBadge = false
-        }
-    }
 
     val pbrMaterial = remember(localMaterialLoader, color, metallic, roughness) {
         localMaterialLoader.createColorInstance(
@@ -204,7 +192,8 @@ fun Studio3DView(
                         sensitivity = 0.45f
                     )
                 },
-                onTwoFingerRotateZ = { dAngle ->
+                onOneFingerRotateZ = { dAngle ->
+                    onStopAutoRotate()
                     val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
                 },
@@ -259,38 +248,6 @@ fun Studio3DView(
                     rotationZ = rotationZ,
                     position = modelPosition
                 )
-            }
-        }
-
-        // Mode switch feedback pill (Double-Tap)
-        androidx.compose.animation.AnimatedVisibility(
-            visible = showModeBadge,
-            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.scaleIn(),
-            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.scaleOut(),
-            modifier = Modifier
-                .align(Alignment.Center)
-                .padding(bottom = 160.dp)
-        ) {
-            Surface(
-                shape = RoundedCornerShape(22.dp),
-                color = Color(0xDD121620),
-                border = BorderStroke(
-                    1.5.dp,
-                    if (isMoveMode) NeonCyan else Color(0xFFFFD54F)
-                ),
-                shadowElevation = 8.dp
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (isMoveMode) "🖐️ Move Mode: Drag with two fingers" else "🔍 Zoom Mode (0.1x – 2500x)",
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
             }
         }
 

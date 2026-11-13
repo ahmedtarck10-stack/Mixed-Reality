@@ -464,7 +464,8 @@ fun ARMixedRealityView(
                         sensitivity = 0.45f
                     )
                 },
-                onTwoFingerRotateZ = { dAngle ->
+                onOneFingerRotateZ = { dAngle ->
+                    onStopAutoRotate()
                     val newRotZ =
                         ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
@@ -475,13 +476,11 @@ fun ARMixedRealityView(
                     onScaleChange(newScale)
                 },
                 onMove = { panX, panY ->
-                    if (!isAnchorLocked) {
-                        modelOffset = Position(
-                            x = modelOffset.x + (panX * 0.0025f),
-                            y = modelOffset.y,
-                            z = modelOffset.z + (panY * 0.0025f)
-                        )
-                    }
+                    modelOffset = Position(
+                        x = modelOffset.x + (panX * 0.0025f),
+                        y = modelOffset.y,
+                        z = modelOffset.z + (panY * 0.0025f)
+                    )
                 }
             )
     ) {
@@ -712,82 +711,7 @@ fun ARMixedRealityView(
 
         // --- OVERLAYS ---
 
-        // 1. Move Mode Active Banner
-        if (isMoveMode) {
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = NeonCyan,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = if (isFullScreen) 16.dp else 68.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("✋", fontSize = 13.sp)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Move mode active • Double-tap to return to rotate",
-                        color = Color.Black,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        } else if (isModelVisible && activeAnchor != null) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .padding(top = if (isFullScreen) 16.dp else 68.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Surface(
-                        onClick = {
-                            isAnchorLocked = !isAnchorLocked
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        },
-                        shape = RoundedCornerShape(16.dp),
-                        color = if (isAnchorLocked) Color(0x99000000) else Color(0xCC00E5FF),
-                        border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.7f))
-                    ) {
-                        Text(
-                            text = if (isAnchorLocked) "🔒 Anchor Locked" else "🔓 Anchor Unlocked",
-                            color = if (isAnchorLocked) NeonCyan else Color.Black,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                        )
-                    }
-
-                    Surface(
-                        onClick = {
-                            trackingManager.clear()
-                            modelOffset = Position(0f, 0f, 0f)
-                            isAnchorLocked = false
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        },
-                        shape = RoundedCornerShape(16.dp),
-                        color = Color(0x99000000),
-                        border = BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.7f))
-                    ) {
-                        Text(
-                            text = "↺ Reset Anchor",
-                            color = Color(0xFFFF5252),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-            }
-        }
+        // Anchor Lock, Reset Anchor, and Move mode banners intentionally hidden for a distraction-free viewport
 
         // 4. Diagnostics Dialog
         if (showDiagnosticsDialog) {

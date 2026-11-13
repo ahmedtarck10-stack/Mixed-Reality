@@ -18,25 +18,42 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.hypot
 
+
 /**
- * Calculates angle in degrees between two touch pointers.
+ * Computes tangential 360-degree roll delta around the viewport center for outer-ring 1-finger Z rotation.
  */
-private fun angleDegrees(p1: Offset, p2: Offset): Float {
-    val rad = atan2((p2.y - p1.y).toDouble(), (p2.x - p1.x).toDouble())
-    return Math.toDegrees(rad).toFloat()
+fun calculateOneFingerZRollDelta(
+    prev: Offset,
+    curr: Offset,
+    center: Offset,
+    minRadiusPx: Float = 24f
+): Float {
+    val prevDx = prev.x - center.x
+    val prevDy = prev.y - center.y
+    val currDx = curr.x - center.x
+    val currDy = curr.y - center.y
+    val prevR = hypot(prevDx, prevDy)
+    val currR = hypot(currDx, currDy)
+    if (prevR < minRadiusPx || currR < minRadiusPx) return 0f
+
+    val prevAngle = atan2(prevDy.toDouble(), prevDx.toDouble())
+    val currAngle = atan2(currDy.toDouble(), currDx.toDouble())
+    var delta = Math.toDegrees(currAngle - prevAngle).toFloat()
+    while (delta < -180f) delta += 360f
+    while (delta > 180f) delta -= 360f
+    return if (delta.isFinite()) delta else 0f
 }
 
 /**
  * Spatial Gesture Modifier for MR / 3D / AR operations:
  * - One tap: Anchor / place model onto the real floor or scene.
- * - One finger drag: 360-degree rotation across X, Y, and Z axes.
- *     • Center drag: 360° rotation on X (pitch) and Y (yaw).
- *     • Screen edge drag (outer 15% width): Direct 1-finger 360° roll on Z-axis!
- * - Two fingers:
- *     • Zoom (scale 0.1x to 2500x) when in Zoom mode.
+ * - One finger drag ONLY for rotation across X, Y, and Z axes (full 360°):
+ *     • Inner zone drag: 360° rotation on X (pitch) and Y (yaw).
+ *     • Outer ring drag (above/below/sides/corners around center): Direct 1-finger 360° roll on Z-axis.
+ * - Two fingers ONLY for Move or Scale:
+ *     • Zoom (scale 0.1x to 2500x) when in Scale mode.
  *     • Move (translate 3D position) when in Move mode.
- *     • Twist / rotate around Z-axis (roll) 360 degrees.
- * - Double tap: Toggle between Zoom Mode and Move Mode.
+ * - Double tap: Switch between Move mode and Scale mode.
  * - Triple tap: Toggle Full Screen (hide/show upper and lower bars).
  */
 @Composable
@@ -48,6 +65,7 @@ fun Modifier.spatialMRGestures(
     onDoubleTap: () -> Unit,
     onTripleTap: () -> Unit,
     onOneFingerRotate: (dx: Float, dy: Float, isEdgeDrag: Boolean) -> Unit,
+    onOneFingerRotateZ: (deltaAngle: Float) -> Unit = {},
     onTwoFingerZoom: (zoomMultiplier: Float) -> Unit,
     onTwoFingerRotateZ: (deltaAngle: Float) -> Unit = {},
     onMove: (panX: Float, panY: Float) -> Unit
@@ -58,8 +76,8 @@ fun Modifier.spatialMRGestures(
     val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
     val currentOnTripleTap by rememberUpdatedState(onTripleTap)
     val currentOnOneFingerRotate by rememberUpdatedState(onOneFingerRotate)
+    val currentOnOneFingerRotateZ by rememberUpdatedState(onOneFingerRotateZ)
     val currentOnTwoFingerZoom by rememberUpdatedState(onTwoFingerZoom)
-    val currentOnTwoFingerRotateZ by rememberUpdatedState(onTwoFingerRotateZ)
     val currentOnMove by rememberUpdatedState(onMove)
 
     return this.pointerInput(Unit) {
@@ -77,12 +95,14 @@ fun Modifier.spatialMRGestures(
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val downTime = System.currentTimeMillis()
             val downOffset = down.position
-            val isEdgeStart = (downOffset.x < size.width * 0.12f || downOffset.x > size.width * 0.88f)
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val innerZoneRadius = (minOf(size.width, size.height) * 0.30f).coerceAtLeast(1f)
+            val distFromCenter = hypot(downOffset.x - center.x, downOffset.y - center.y)
+            val isOuterRingStart = distFromCenter > innerZoneRadius
             var isGestureDrag = false
             var lastPointerPosition = downOffset
             var prevCentroid = downOffset
             var prevSpan = 0f
-            var prevAngle = 0f
             var lastPointerCount = 1
             maxPointersSeen = 1
             skipNextRotationDelta = false
@@ -129,7 +149,7 @@ fun Modifier.spatialMRGestures(
                                 }
                             }
                             else -> {
-                                // Triple tap (3 clicks): Toggle full screen mode!
+                                // Triple tap (3 clicks): Toggle full screen mode
                                 tapTimeoutJob?.cancel()
                                 tapCount = 0
                                 currentOnTripleTap()
@@ -149,7 +169,6 @@ fun Modifier.spatialMRGestures(
                         val p2 = pressedChanges[1].position
                         prevCentroid = Offset((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
                         prevSpan = hypot(p1.x - p2.x, p1.y - p2.y)
-                        prevAngle = angleDegrees(p1, p2)
                     }
                     continue
                 }
@@ -169,7 +188,18 @@ fun Modifier.spatialMRGestures(
                         val dx = currentPos.x - lastPointerPosition.x
                         val dy = currentPos.y - lastPointerPosition.y
                         if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
-                            currentOnOneFingerRotate(dx, dy, isEdgeStart)
+                            if (currentActiveAxis == RotationAxis.ALL && isOuterRingStart) {
+                                val dRoll = calculateOneFingerZRollDelta(
+                                    prev = lastPointerPosition,
+                                    curr = currentPos,
+                                    center = center
+                                )
+                                if (abs(dRoll) > 0.05f) {
+                                    currentOnOneFingerRotateZ(dRoll)
+                                }
+                            } else {
+                                currentOnOneFingerRotate(dx, dy, false)
+                            }
                         }
                         pressedChanges[0].consume()
                     }
@@ -182,7 +212,6 @@ fun Modifier.spatialMRGestures(
                     val p2 = pressedChanges[1].position
                     val currentCentroid = Offset((p1.x + p2.x) / 2f, (p1.y + p2.y) / 2f)
                     val currentSpan = hypot(p1.x - p2.x, p1.y - p2.y)
-                    val currentAngle = angleDegrees(p1, p2)
 
                     if (currentIsMoveMode) {
                         val panX = currentCentroid.x - prevCentroid.x
@@ -191,7 +220,7 @@ fun Modifier.spatialMRGestures(
                             currentOnMove(panX, panY)
                         }
                     } else {
-                        // Pinch to Zoom
+                        // Pinch to Zoom (Scale mode)
                         if (prevSpan > 15f && currentSpan > 15f) {
                             val zoomFactor = currentSpan / prevSpan
                             if (zoomFactor.isFinite() && zoomFactor in 0.5f..2f && abs(zoomFactor - 1f) > 0.0001f) {
@@ -208,16 +237,8 @@ fun Modifier.spatialMRGestures(
                         }
                     }
 
-                    // Twist with two fingers to rotate 360° around Z-axis (roll)
-                    var angleDiff = currentAngle - prevAngle
-                    while (angleDiff < -180f) angleDiff += 360f
-                    while (angleDiff > 180f) angleDiff -= 360f
-                    if (abs(angleDiff) > 0.08f && abs(angleDiff) < 90f) {
-                        currentOnTwoFingerRotateZ(angleDiff)
-                    }
                     prevCentroid = currentCentroid
                     prevSpan = currentSpan
-                    prevAngle = currentAngle
                     pressedChanges.forEach { it.consume() }
                 } else if (currentCount >= 3) {
                     isGestureDrag = true
