@@ -135,6 +135,9 @@ fun CloudLibrarySheet(
                 val safeExt = if (currentUrl.contains(".usdz", ignoreCase = true)) "usdz"
                 else if (currentUrl.contains(".obj", ignoreCase = true)) "obj"
                 else if (currentUrl.contains(".gltf", ignoreCase = true)) "gltf"
+                else if (currentUrl.contains(".3mf", ignoreCase = true)) "3mf"
+                else if (currentUrl.contains(".stl", ignoreCase = true)) "stl"
+                else if (currentUrl.contains(".ply", ignoreCase = true)) "ply"
                 else "glb"
 
                 val fileName = "${name.replace("\\s+".toRegex(), "_")}_${System.currentTimeMillis()}.$safeExt"
@@ -144,8 +147,16 @@ fun CloudLibrarySheet(
                     downloadStatusText = "Downloading 3D geometry and textures..."
                 }
 
-                destFile.outputStream().use { output ->
-                    input.copyTo(output)
+                java.io.BufferedInputStream(input, 131_072).use { bufferedIn ->
+                    java.io.BufferedOutputStream(destFile.outputStream(), 262_144).use { bufferedOut ->
+                        val buffer = ByteArray(131_072)
+                        while (true) {
+                            val read = bufferedIn.read(buffer)
+                            if (read <= 0) break
+                            bufferedOut.write(buffer, 0, read)
+                        }
+                        bufferedOut.flush()
+                    }
                 }
                 finalConnection.disconnect()
 

@@ -11,47 +11,38 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aistudio.mixedreality.ui.theme.*
+import com.google.android.filament.Engine
+import io.github.sceneview.RenderQuality
 import io.github.sceneview.SceneView
+import io.github.sceneview.createEnvironment
+import io.github.sceneview.loaders.EnvironmentLoader
+import io.github.sceneview.loaders.MaterialLoader
+import io.github.sceneview.loaders.ModelLoader
 import io.github.sceneview.math.Position
-import io.github.sceneview.node.CubeNode
-import io.github.sceneview.rememberCameraManipulator
 import io.github.sceneview.rememberCameraNode
-import io.github.sceneview.rememberEngine
+import io.github.sceneview.rememberEnvironment
 import io.github.sceneview.rememberEnvironmentLoader
 import io.github.sceneview.rememberFillLightNode
 import io.github.sceneview.rememberMainLightNode
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberModelInstance
 import io.github.sceneview.rememberModelLoader
+import io.github.sceneview.rememberSurfaceMirrorer
 import io.github.sceneview.rememberViewNodeManager
 import io.github.sceneview.utils.SurfaceMirrorer
 import java.io.File
-
-import com.google.android.filament.Engine
-import io.github.sceneview.loaders.EnvironmentLoader
-import io.github.sceneview.loaders.MaterialLoader
-import io.github.sceneview.loaders.ModelLoader
-import io.github.sceneview.createEnvironment
-import io.github.sceneview.rememberEnvironment
-
-import androidx.compose.ui.layout.onSizeChanged
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.animation.*
-
-import io.github.sceneview.rememberSurfaceMirrorer
 
 /**
  * Single-viewport 3D inspection studio (Object Mode).
  * Supports custom gestures:
  * - 1 Tap: Place model at tapped screen location
- * - 1 Finger Drag: 360-degree rotation
+ * - 1 Finger Drag: Isolated 360-degree X, Y, and Z rotation (gimbal-free quaternion)
  * - 2 Fingers Drag/Pinch: Scale (0.1x to 2500x) or Move depending on mode
  * - Double Tap: Toggle between Move Mode and Scale Mode (no scaling)
  * - Triple Tap: Toggle Full Screen (hide/show upper and down bars)
@@ -73,6 +64,8 @@ fun Studio3DView(
     onRotationXChange: (Float) -> Unit = {},
     rotationZ: Float = 0f,
     onRotationZChange: (Float) -> Unit = {},
+    orientation: SpatialQuaternion? = null,
+    onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
@@ -87,9 +80,9 @@ fun Studio3DView(
     surfaceMirrorer: SurfaceMirrorer? = null,
     onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {}
 ) {
-    val localModelLoader = rememberModelLoader(engine)
-    val localMaterialLoader = rememberMaterialLoader(engine)
-    val localEnvironmentLoader = rememberEnvironmentLoader(engine)
+    val localModelLoader = modelLoader ?: rememberModelLoader(engine)
+    val localMaterialLoader = materialLoader ?: rememberMaterialLoader(engine)
+    val localEnvironmentLoader = environmentLoader ?: rememberEnvironmentLoader(engine)
     val localSurfaceMirrorer = rememberSurfaceMirrorer()
 
     DisposableEffect(localSurfaceMirrorer) {
@@ -99,7 +92,9 @@ fun Studio3DView(
         }
     }
 
-    val windowManager = rememberViewNodeManager()
+    // Allocate offscreen ViewNode WindowManager only when Spatial Interface card is active
+    val needsViewNodeManager = customModelFile == null && modelItem == ModelItem.SPATIAL_CARD
+    val windowManager = if (needsViewNodeManager) rememberViewNodeManager() else null
     val scope = rememberCoroutineScope()
     var modelPosition by remember { mutableStateOf(Position(0f, 0f, 0f)) }
 
@@ -127,17 +122,22 @@ fun Studio3DView(
     } else {
         null
     }
-    val customModelInstance = key(customModelFile?.absolutePath) {
-        customModelFile?.let { file ->
-            rememberModelInstance(
-                modelLoader = localModelLoader,
-                fileLocation = "file://${file.absolutePath}"
-            )
-        }
-    }
+    val customModelInstance = rememberOptimizedModelInstance(
+        modelLoader = localModelLoader,
+        customModelFile = customModelFile
+    )
 
     val environment = rememberEnvironment(localEnvironmentLoader) {
         createEnvironment(localEnvironmentLoader)
+    }
+
+    val currentOrientation by rememberUpdatedState(orientation)
+    val renderQuality = remember(customModelFile?.absolutePath) {
+        if (customModelFile != null && customModelFile.length() > 4L * 1024L * 1024L) {
+            RenderQuality.Performance
+        } else {
+            RenderQuality.Default
+        }
     }
 
     var viewWidthPx by remember { mutableFloatStateOf(1080f) }
@@ -178,6 +178,13 @@ fun Studio3DView(
                 },
                 onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
+                    val baseQuat = currentOrientation
+                    if (activeRotationAxis == RotationAxis.ALL && onOrientationChange != null && baseQuat != null) {
+                        var updated = baseQuat
+                        if (dx != 0f) updated = updated.rotateWorldY(dx * 0.45f)
+                        if (dy != 0f) updated = updated.rotateWorldX(-dy * 0.45f)
+                        onOrientationChange(updated)
+                    }
                     applyRotationDelta(
                         axis = activeRotationAxis,
                         dx = dx,
@@ -194,6 +201,10 @@ fun Studio3DView(
                 },
                 onOneFingerRotateZ = { dAngle ->
                     onStopAutoRotate()
+                    val baseQuat = currentOrientation
+                    if (onOrientationChange != null && baseQuat != null) {
+                        onOrientationChange(baseQuat.rotateWorldZ(-dAngle))
+                    }
                     val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
                 },
@@ -223,6 +234,7 @@ fun Studio3DView(
             materialLoader = localMaterialLoader,
             environmentLoader = localEnvironmentLoader,
             environment = environment,
+            renderQuality = renderQuality,
             viewNodeWindowManager = windowManager,
             cameraManipulator = null,
             autoCenterContent = false,
@@ -246,7 +258,9 @@ fun Studio3DView(
                     rotationY = rotationY,
                     rotationX = rotationX,
                     rotationZ = rotationZ,
-                    position = modelPosition
+                    position = modelPosition,
+                    orientation = orientation,
+                    disableShadows = (renderQuality == RenderQuality.Performance)
                 )
             }
         }

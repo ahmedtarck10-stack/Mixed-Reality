@@ -25,6 +25,9 @@ import com.aistudio.mixedreality.ui.theme.NeonCyan
 import com.aistudio.mixedreality.ui.theme.TextPrimary
 import com.aistudio.mixedreality.ui.theme.TextSecondary
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * Available rotation axes for 360-degree spatial manipulation.
@@ -34,6 +37,75 @@ enum class RotationAxis(val label: String, val shortName: String, val icon: Stri
     X("Pitch (X)", "X", "↕"),
     Y("Yaw (Y)", "Y", "↔"),
     Z("Roll (Z)", "Z", "🔄")
+}
+
+/**
+ * Gimbal-lock-free quaternion representation for screen/world-aligned 360° X, Y, Z rotations.
+ * Pre-multiplying incremental world-axis rotations ensures:
+ * - Horizontal swipes always rotate cleanly around screen Up (Y)
+ * - Vertical swipes always pitch cleanly around screen Right (X)
+ * - Outer-ring drags always roll cleanly around screen Forward (Z)
+ * regardless of current model orientation.
+ */
+data class SpatialQuaternion(
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val z: Float = 0f,
+    val w: Float = 1f
+) {
+    fun normalized(): SpatialQuaternion {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite() || !w.isFinite()) return IDENTITY
+        val norm = sqrt(x * x + y * y + z * z + w * w)
+        if (norm < 1e-6f) return IDENTITY
+        val inv = 1f / norm
+        return SpatialQuaternion(x * inv, y * inv, z * inv, w * inv)
+    }
+
+    operator fun times(other: SpatialQuaternion): SpatialQuaternion {
+        val nx = w * other.x + x * other.w + y * other.z - z * other.y
+        val ny = w * other.y - x * other.z + y * other.w + z * other.x
+        val nz = w * other.z + x * other.y - y * other.x + z * other.w
+        val nw = w * other.w - x * other.x - y * other.y - z * other.z
+        return SpatialQuaternion(nx, ny, nz, nw).normalized()
+    }
+
+    fun rotateWorldX(angleDegrees: Float): SpatialQuaternion {
+        if (!angleDegrees.isFinite() || angleDegrees == 0f) return this
+        return (fromAxisAngle(1f, 0f, 0f, angleDegrees) * this).normalized()
+    }
+
+    fun rotateWorldY(angleDegrees: Float): SpatialQuaternion {
+        if (!angleDegrees.isFinite() || angleDegrees == 0f) return this
+        return (fromAxisAngle(0f, 1f, 0f, angleDegrees) * this).normalized()
+    }
+
+    fun rotateWorldZ(angleDegrees: Float): SpatialQuaternion {
+        if (!angleDegrees.isFinite() || angleDegrees == 0f) return this
+        return (fromAxisAngle(0f, 0f, 1f, angleDegrees) * this).normalized()
+    }
+
+    companion object {
+        val IDENTITY = SpatialQuaternion(0f, 0f, 0f, 1f)
+
+        fun fromAxisAngle(ax: Float, ay: Float, az: Float, angleDegrees: Float): SpatialQuaternion {
+            if (!ax.isFinite() || !ay.isFinite() || !az.isFinite() || !angleDegrees.isFinite()) {
+                return IDENTITY
+            }
+            val len = sqrt(ax * ax + ay * ay + az * az)
+            if (len < 1e-6f) return IDENTITY
+            val halfRad = Math.toRadians(angleDegrees.toDouble()) * 0.5
+            val s = (sin(halfRad) / len).toFloat()
+            val c = cos(halfRad).toFloat()
+            return SpatialQuaternion(ax * s, ay * s, az * s, c).normalized()
+        }
+
+        fun fromEulerZYX(rotXDeg: Float, rotYDeg: Float, rotZDeg: Float): SpatialQuaternion {
+            val qz = fromAxisAngle(0f, 0f, 1f, rotZDeg)
+            val qy = fromAxisAngle(0f, 1f, 0f, rotYDeg)
+            val qx = fromAxisAngle(1f, 0f, 0f, rotXDeg)
+            return (qz * qy * qx).normalized()
+        }
+    }
 }
 
 /**
@@ -62,11 +134,15 @@ fun applyRotationDelta(
             // Full 360-degree rotation on 1-finger:
             // Horizontal drag (dx) rotates Y (Yaw) 360° seamlessly
             // Vertical drag (dy) rotates X (Pitch) 360° seamlessly
-            val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
-            val newX = ((safeCurrentX - dy * sensitivity) % 360f + 360f) % 360f
-            onRotY(newY)
-            onRotX(newX)
-            if (isEdgeDrag) {
+            if (dx != 0f) {
+                val newY = ((safeCurrentY + dx * sensitivity) % 360f + 360f) % 360f
+                onRotY(newY)
+            }
+            if (dy != 0f) {
+                val newX = ((safeCurrentX - dy * sensitivity) % 360f + 360f) % 360f
+                onRotX(newX)
+            }
+            if (isEdgeDrag && dy != 0f) {
                 // Outer edge drag also applies Roll on Z
                 val newZ = ((safeCurrentZ + dy * sensitivity) % 360f + 360f) % 360f
                 onRotZ(newZ)

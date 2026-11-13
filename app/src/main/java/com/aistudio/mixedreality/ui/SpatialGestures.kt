@@ -18,6 +18,50 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.hypot
 
+/**
+ * Locked single-finger rotation axis chosen once per gesture stroke so X, Y, and Z never overlap.
+ */
+enum class OneFingerStrokeAxis {
+    UNDECIDED,
+    Y_YAW,
+    X_PITCH,
+    Z_ROLL
+}
+
+/**
+ * Picks either pure Y (horizontal swipe) or pure X (vertical swipe) once finger travel crosses [thresholdPx].
+ */
+fun decideOneFingerStrokeAxis(
+    totalDx: Float,
+    totalDy: Float,
+    thresholdPx: Float = 16f
+): OneFingerStrokeAxis {
+    if (!totalDx.isFinite() || !totalDy.isFinite()) return OneFingerStrokeAxis.UNDECIDED
+    val dist = hypot(totalDx, totalDy)
+    if (dist < thresholdPx.coerceAtLeast(1f)) return OneFingerStrokeAxis.UNDECIDED
+    return if (abs(totalDx) >= abs(totalDy) * 1.05f) {
+        OneFingerStrokeAxis.Y_YAW
+    } else {
+        OneFingerStrokeAxis.X_PITCH
+    }
+}
+
+/**
+ * Returns true if the touch started inside the outer viewport border ring used for 360° Z roll.
+ */
+fun isOuterZRingTouch(
+    touch: Offset,
+    viewportWidthPx: Float,
+    viewportHeightPx: Float
+): Boolean {
+    if (viewportWidthPx <= 1f || viewportHeightPx <= 1f) return false
+    val cx = viewportWidthPx * 0.5f
+    val cy = viewportHeightPx * 0.5f
+    val rx = (cx * 0.84f).coerceAtLeast(1f)
+    val ry = (cy * 0.84f).coerceAtLeast(1f)
+    val normDist = hypot((touch.x - cx) / rx, (touch.y - cy) / ry)
+    return normDist > 1.0f
+}
 
 /**
  * Computes tangential 360-degree roll delta around the viewport center for outer-ring 1-finger Z rotation.
@@ -47,9 +91,10 @@ fun calculateOneFingerZRollDelta(
 /**
  * Spatial Gesture Modifier for MR / 3D / AR operations:
  * - One tap: Anchor / place model onto the real floor or scene.
- * - One finger drag ONLY for rotation across X, Y, and Z axes (full 360°):
- *     • Inner zone drag: 360° rotation on X (pitch) and Y (yaw).
- *     • Outer ring drag (above/below/sides/corners around center): Direct 1-finger 360° roll on Z-axis.
+ * - One finger drag ONLY for isolated, gimbal-free 360° rotation across X, Y, and Z axes:
+ *     • Inner zone horizontal drag -> pure Y (Yaw) 360° rotation (no X wobble).
+ *     • Inner zone vertical drag   -> pure X (Pitch) 360° rotation (no Y twist).
+ *     • Outer perimeter ring drag  -> pure Z (Roll) 360° rotation.
  * - Two fingers ONLY for Move or Scale:
  *     • Zoom (scale 0.1x to 2500x) when in Scale mode.
  *     • Move (translate 3D position) when in Move mode.
@@ -88,20 +133,26 @@ fun Modifier.spatialMRGestures(
         var zoomFlushJob: Job? = null
         val zoomAccumulator = ZoomGestureAccumulator()
         val touchSlop = viewConfiguration.touchSlop
+        val axisLockThreshold = maxOf(touchSlop * 1.35f, 16f)
         var maxPointersSeen = 1
         var skipNextRotationDelta = false
 
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             val downTime = System.currentTimeMillis()
-            val downOffset = down.position
+            var strokeStartOffset = down.position
             val center = Offset(size.width / 2f, size.height / 2f)
-            val innerZoneRadius = (minOf(size.width, size.height) * 0.30f).coerceAtLeast(1f)
-            val distFromCenter = hypot(downOffset.x - center.x, downOffset.y - center.y)
-            val isOuterRingStart = distFromCenter > innerZoneRadius
+            var strokeAxisLock = if (
+                currentActiveAxis == RotationAxis.ALL &&
+                isOuterZRingTouch(down.position, size.width.toFloat(), size.height.toFloat())
+            ) {
+                OneFingerStrokeAxis.Z_ROLL
+            } else {
+                OneFingerStrokeAxis.UNDECIDED
+            }
             var isGestureDrag = false
-            var lastPointerPosition = downOffset
-            var prevCentroid = downOffset
+            var lastPointerPosition = down.position
+            var prevCentroid = down.position
             var prevSpan = 0f
             var lastPointerCount = 1
             maxPointersSeen = 1
@@ -120,14 +171,14 @@ fun Modifier.spatialMRGestures(
 
                 if (currentCount == 0) {
                     val totalDuration = System.currentTimeMillis() - downTime
-                    val totalDistance = (lastPointerPosition - downOffset).getDistance()
+                    val totalDistance = (lastPointerPosition - strokeStartOffset).getDistance()
                     if (maxPointersSeen == 1 && !isGestureDrag && totalDuration < 450L && totalDistance < touchSlop * 2.5f) {
                         val tapTime = System.currentTimeMillis()
                         val diffTime = tapTime - lastTapTime
-                        val diffDist = (downOffset - lastTapOffset).getDistance()
+                        val diffDist = (down.position - lastTapOffset).getDistance()
                         tapCount = if (diffTime < 450L && diffDist < 160f) tapCount + 1 else 1
                         lastTapTime = tapTime
-                        lastTapOffset = downOffset
+                        lastTapOffset = down.position
                         tapTimeoutJob?.cancel()
                         when (tapCount) {
                             1 -> {
@@ -163,7 +214,17 @@ fun Modifier.spatialMRGestures(
                     lastPointerCount = currentCount
                     skipNextRotationDelta = true
                     if (currentCount == 1) {
-                        lastPointerPosition = pressedChanges[0].position
+                        val pos = pressedChanges[0].position
+                        lastPointerPosition = pos
+                        strokeStartOffset = pos
+                        strokeAxisLock = if (
+                            currentActiveAxis == RotationAxis.ALL &&
+                            isOuterZRingTouch(pos, size.width.toFloat(), size.height.toFloat())
+                        ) {
+                            OneFingerStrokeAxis.Z_ROLL
+                        } else {
+                            OneFingerStrokeAxis.UNDECIDED
+                        }
                     } else if (currentCount == 2) {
                         val p1 = pressedChanges[0].position
                         val p2 = pressedChanges[1].position
@@ -175,29 +236,63 @@ fun Modifier.spatialMRGestures(
 
                 if (currentCount == 1) {
                     val currentPos = pressedChanges[0].position
-                    val distFromDown = (currentPos - downOffset).getDistance()
+                    val distFromDown = (currentPos - strokeStartOffset).getDistance()
                     if (skipNextRotationDelta) {
                         skipNextRotationDelta = false
                         lastPointerPosition = currentPos
                         continue
                     }
+
                     if (isGestureDrag || distFromDown > touchSlop) {
-                        isGestureDrag = true
-                        tapTimeoutJob?.cancel()
-                        tapCount = 0
-                        val dx = currentPos.x - lastPointerPosition.x
-                        val dy = currentPos.y - lastPointerPosition.y
-                        if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
-                            if (currentActiveAxis == RotationAxis.ALL && isOuterRingStart) {
-                                val dRoll = calculateOneFingerZRollDelta(
-                                    prev = lastPointerPosition,
-                                    curr = currentPos,
-                                    center = center
+                        if (!isGestureDrag) {
+                            isGestureDrag = true
+                            tapTimeoutJob?.cancel()
+                            tapCount = 0
+                        }
+
+                        if (currentActiveAxis == RotationAxis.ALL) {
+                            if (strokeAxisLock == OneFingerStrokeAxis.UNDECIDED) {
+                                strokeAxisLock = decideOneFingerStrokeAxis(
+                                    totalDx = currentPos.x - strokeStartOffset.x,
+                                    totalDy = currentPos.y - strokeStartOffset.y,
+                                    thresholdPx = axisLockThreshold
                                 )
-                                if (abs(dRoll) > 0.05f) {
-                                    currentOnOneFingerRotateZ(dRoll)
+                                if (strokeAxisLock == OneFingerStrokeAxis.UNDECIDED) {
+                                    lastPointerPosition = currentPos
+                                    pressedChanges[0].consume()
+                                    continue
                                 }
-                            } else {
+                            }
+
+                            val dx = currentPos.x - lastPointerPosition.x
+                            val dy = currentPos.y - lastPointerPosition.y
+                            when (strokeAxisLock) {
+                                OneFingerStrokeAxis.Z_ROLL -> {
+                                    val dRoll = calculateOneFingerZRollDelta(
+                                        prev = lastPointerPosition,
+                                        curr = currentPos,
+                                        center = center
+                                    )
+                                    if (abs(dRoll) > 0.05f) {
+                                        currentOnOneFingerRotateZ(dRoll)
+                                    }
+                                }
+                                OneFingerStrokeAxis.Y_YAW -> {
+                                    if (abs(dx) > 0.35f) {
+                                        currentOnOneFingerRotate(dx, 0f, false)
+                                    }
+                                }
+                                OneFingerStrokeAxis.X_PITCH -> {
+                                    if (abs(dy) > 0.35f) {
+                                        currentOnOneFingerRotate(0f, dy, false)
+                                    }
+                                }
+                                OneFingerStrokeAxis.UNDECIDED -> Unit
+                            }
+                        } else {
+                            val dx = currentPos.x - lastPointerPosition.x
+                            val dy = currentPos.y - lastPointerPosition.y
+                            if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
                                 currentOnOneFingerRotate(dx, dy, false)
                             }
                         }

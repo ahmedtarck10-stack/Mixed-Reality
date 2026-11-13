@@ -1,7 +1,7 @@
 package com.aistudio.mixedreality.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
@@ -9,6 +9,12 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -16,22 +22,125 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.aistudio.mixedreality.R
 import com.aistudio.mixedreality.ui.theme.*
 import com.google.android.filament.MaterialInstance
+import dev.romainguy.kotlin.math.Quaternion
 import io.github.sceneview.SceneScope
+import io.github.sceneview.loaders.ModelLoader
 import io.github.sceneview.math.Position
 import io.github.sceneview.math.Rotation
 import io.github.sceneview.math.Scale
 import io.github.sceneview.math.Size
 import io.github.sceneview.model.ModelInstance
 import io.github.sceneview.node.CubeNode
-import io.github.sceneview.node.CylinderNode
 import io.github.sceneview.node.ModelNode
-import com.aistudio.mixedreality.R
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
 import io.github.sceneview.node.ViewNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+
+private const val MMAP_GLB_THRESHOLD_BYTES = 12L * 1024L * 1024L
+private const val HEAVY_MESH_SHADOW_THRESHOLD_BYTES = 2L * 1024L * 1024L
+
+private fun glbHeaderContainsWebp(file: File): Boolean {
+    return runCatching {
+        val inspectLen = minOf(file.length(), 2L * 1024L * 1024L).toInt()
+        if (inspectLen < 20) return@runCatching false
+        RandomAccessFile(file, "r").use { raf ->
+            val header = ByteArray(12)
+            raf.readFully(header)
+            if (header[0] != 'g'.code.toByte() || header[1] != 'l'.code.toByte() ||
+                header[2] != 'T'.code.toByte() || header[3] != 'F'.code.toByte()
+            ) {
+                return@runCatching false
+            }
+            val chunkLen = ByteBuffer.wrap(ByteArray(4).also { raf.readFully(it) })
+                .order(ByteOrder.LITTLE_ENDIAN).int
+            val jsonReadLen = chunkLen.coerceIn(0, inspectLen - 20)
+            if (jsonReadLen <= 0) return@runCatching false
+            raf.seek(20L)
+            val jsonBytes = ByteArray(jsonReadLen)
+            raf.readFully(jsonBytes)
+            val jsonStr = String(jsonBytes, Charsets.UTF_8)
+            jsonStr.contains("image/webp", ignoreCase = true)
+        }
+    }.getOrDefault(false)
+}
+
+/**
+ * Loads large local .glb models via zero-copy read-only FileChannel memory mapping so Android's
+ * Java heap is never duplicated, and cleanly frees replaced/cleared GPU FilamentAssets.
+ */
+@Composable
+fun rememberOptimizedModelInstance(
+    modelLoader: ModelLoader,
+    customModelFile: File?
+): ModelInstance? {
+    val filePath = customModelFile?.absolutePath
+    val instance by produceState<ModelInstance?>(
+        initialValue = null,
+        key1 = modelLoader,
+        key2 = filePath
+    ) {
+        val file = customModelFile
+        if (file == null || !file.exists() || file.length() <= 0L) {
+            value = null
+            return@produceState
+        }
+
+        val useZeroCopyMmap = file.extension.equals("glb", ignoreCase = true) &&
+            file.length() >= MMAP_GLB_THRESHOLD_BYTES &&
+            !glbHeaderContainsWebp(file)
+
+        if (useZeroCopyMmap) {
+            val mappedBuffer = withContext(Dispatchers.IO) {
+                runCatching {
+                    RandomAccessFile(file, "r").channel.use { channel ->
+                        channel.map(FileChannel.MapMode.READ_ONLY, 0L, file.length())
+                    }
+                }.getOrNull()
+            }
+            if (mappedBuffer != null) {
+                val created = runCatching {
+                    val asset = modelLoader.createModel(
+                        buffer = mappedBuffer,
+                        releaseSourceData = true
+                    )
+                    modelLoader.createInstance(asset)
+                }.getOrNull()
+                if (created != null) {
+                    value = created
+                    return@produceState
+                }
+            }
+        }
+
+        value = runCatching {
+            modelLoader.loadModelInstance("file://${file.absolutePath}")
+        }.getOrNull()
+    }
+
+    val cleanupHandler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(modelLoader, instance) {
+        val activeInstance = instance
+        onDispose {
+            if (activeInstance != null) {
+                cleanupHandler.post {
+                    runCatching { modelLoader.destroyModel(activeInstance.asset) }
+                }
+            }
+        }
+    }
+
+    return instance
+}
 
 enum class ViewportMode(val title: String, val titleRes: Int = 0) {
     MR("MR", R.string.mode_ar),
@@ -62,7 +171,7 @@ val RecButtonColor = Color(0xFFFF263E)
 
 /**
  * Common 3D model node rendering inside a SceneScope.
- * Handles custom imported .glb/.gltf models, preset models, and procedural geometry.
+ * Handles custom imported .glb/.gltf/.obj/.usdz/.3mf/.stl/.ply models, preset models, and procedural geometry.
  */
 @Composable
 fun SceneScope.Render3DModel(
@@ -77,32 +186,55 @@ fun SceneScope.Render3DModel(
     rotationY: Float,
     rotationX: Float = 0f,
     rotationZ: Float = 0f,
-    position: Position = Position(0f, 0f, 0f)
+    position: Position = Position(0f, 0f, 0f),
+    orientation: SpatialQuaternion? = null,
+    disableShadows: Boolean = false
 ) {
     val safeScale = if (scale.isFinite() && scale > 0f) scale.coerceIn(0.1f, 2500.0f) else 1.0f
     val safeRotX = if (rotationX.isFinite()) ((rotationX % 360f) + 360f) % 360f else 0f
     val safeRotY = if (rotationY.isFinite()) ((rotationY % 360f) + 360f) % 360f else 0f
     val safeRotZ = if (rotationZ.isFinite()) ((rotationZ % 360f) + 360f) % 360f else 0f
 
-    // Parent Node receives position and uniform scale; nested per-axis nodes give clean independent 360° X, Y, Z rotation
+    val targetQuat = remember(orientation, safeRotX, safeRotY, safeRotZ) {
+        (orientation ?: SpatialQuaternion.fromEulerZYX(safeRotX, safeRotY, safeRotZ)).normalized()
+    }
+    var rotNode by remember { mutableStateOf<Node?>(null) }
+    DisposableEffect(rotNode, targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w) {
+        rotNode?.quaternion = Quaternion(targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w)
+        onDispose {}
+    }
+
+    // Parent Node receives position and uniform scale; single quaternion child node gives gimbal-free 360° X, Y, Z rotation
     Node(
         position = position,
         scale = Scale(safeScale)
     ) {
-        Node(rotation = Rotation(y = safeRotY)) {
-            Node(rotation = Rotation(x = safeRotX)) {
-                Node(rotation = Rotation(z = safeRotZ)) {
-                    // If user loaded a custom file and instance is ready, render it
-                    if (customModelFile != null) {
-                        if (customModelInstance != null) {
-                            ModelNode(
-                                modelInstance = customModelInstance,
-                                scaleToUnits = 1.0f,
-                                centerOrigin = Position(0f, 0f, 0f),
-                                autoAnimate = true
-                            )
+        Node(
+            apply = {
+                rotNode = this
+                quaternion = Quaternion(targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w)
+            }
+        ) {
+            // If user loaded a custom file and instance is ready, render it
+            if (customModelFile != null) {
+                if (customModelInstance != null) {
+                    val isHeavyMesh = remember(customModelFile.absolutePath, disableShadows) {
+                        disableShadows || customModelFile.length() > HEAVY_MESH_SHADOW_THRESHOLD_BYTES
+                    }
+                    ModelNode(
+                        modelInstance = customModelInstance,
+                        scaleToUnits = 1.0f,
+                        centerOrigin = Position(0f, 0f, 0f),
+                        autoAnimate = true,
+                        apply = {
+                            if (isHeavyMesh) {
+                                isShadowCaster = false
+                                isShadowReceiver = false
+                            }
                         }
-                    } else {
+                    )
+                }
+            } else {
                         // Otherwise render selected preset model with canonical dimensions
                         when (modelItem) {
             ModelItem.VISION_HEADSET -> {
@@ -212,10 +344,9 @@ fun SceneScope.Render3DModel(
                 }
             }
         }
-                    }
-                }
             }
         }
     }
 }
+
 

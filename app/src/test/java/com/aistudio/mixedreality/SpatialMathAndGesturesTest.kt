@@ -2,18 +2,23 @@ package com.aistudio.mixedreality
 
 import androidx.compose.ui.geometry.Offset
 import com.aistudio.mixedreality.ui.AnchorRecoveryGate
+import com.aistudio.mixedreality.ui.OneFingerStrokeAxis
 import com.aistudio.mixedreality.ui.PlacementTapDecision
 import com.aistudio.mixedreality.ui.RotationAxis
+import com.aistudio.mixedreality.ui.SpatialQuaternion
 import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
 import com.aistudio.mixedreality.ui.applyRotationDelta
 import com.aistudio.mixedreality.ui.calculateOneFingerZRollDelta
+import com.aistudio.mixedreality.ui.decideOneFingerStrokeAxis
 import com.aistudio.mixedreality.ui.filterPoseWithLegacyDamping
+import com.aistudio.mixedreality.ui.isOuterZRingTouch
 import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
 import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
+import com.aistudio.mixedreality.util.ModelFormatConverter
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Pose
@@ -22,6 +27,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.io.path.createTempDirectory
 import kotlin.math.abs
 
 /** Unit tests for production interaction policies used by AR placement and zoom gestures. */
@@ -310,5 +319,77 @@ class SpatialMathAndGesturesTest {
             center = center
         )
         assertEquals(0f, nearCenter, 0.001f)
+    }
+
+    @Test
+    fun spatialQuaternionPreservesScreenAlignedAxesWithoutGimbalLock() {
+        // Rotating Y by 90 deg, then X by 90 deg around world axes must stay normalized
+        // and rotate full 360 without collapsing to degenerate values
+        val qY90 = SpatialQuaternion.IDENTITY.rotateWorldY(90f)
+        val qY90X90 = qY90.rotateWorldX(90f)
+        val normSq = qY90X90.x * qY90X90.x + qY90X90.y * qY90X90.y +
+            qY90X90.z * qY90X90.z + qY90X90.w * qY90X90.w
+        assertEquals(1.0f, normSq, 0.0001f)
+
+        // Four consecutive 90-degree world rotations on any axis return cleanly to identity (|w| == 1)
+        var fullX = SpatialQuaternion.IDENTITY
+        repeat(4) { fullX = fullX.rotateWorldX(90f) }
+        assertEquals(1.0f, abs(fullX.w), 0.001f)
+
+        var fullZ = SpatialQuaternion.IDENTITY
+        repeat(4) { fullZ = fullZ.rotateWorldZ(-90f) }
+        assertEquals(1.0f, abs(fullZ.w), 0.001f)
+
+        // NaN inputs degrade safely to IDENTITY
+        val invalid = SpatialQuaternion(Float.NaN, 0f, 0f, 1f).normalized()
+        assertEquals(SpatialQuaternion.IDENTITY, invalid)
+    }
+
+    @Test
+    fun oneFingerStrokeAxisLocksCleanlyWithoutAxisOverlap() {
+        assertEquals(OneFingerStrokeAxis.UNDECIDED, decideOneFingerStrokeAxis(4f, 4f, thresholdPx = 16f))
+        assertEquals(OneFingerStrokeAxis.Y_YAW, decideOneFingerStrokeAxis(32f, 8f, thresholdPx = 16f))
+        assertEquals(OneFingerStrokeAxis.X_PITCH, decideOneFingerStrokeAxis(6f, 34f, thresholdPx = 16f))
+
+        // Portrait 1080x2400 interior center stays in X/Y zone; outer ~16% rim activates Z Roll
+        assertFalse(isOuterZRingTouch(Offset(540f, 1200f), 1080f, 2400f))
+        assertFalse(isOuterZRingTouch(Offset(250f, 1900f), 1080f, 2400f))
+        assertTrue(isOuterZRingTouch(Offset(35f, 1200f), 1080f, 2400f))
+        assertTrue(isOuterZRingTouch(Offset(540f, 60f), 1080f, 2400f))
+    }
+
+    @Test
+    fun streamingObjToGlbDeduplicatesVerticesComputesNormalsAndWritesValidGlbHeader() {
+        val tempDir = createTempDirectory("obj_conv_test").toFile()
+        try {
+            val objFile = File(tempDir, "quad.obj")
+            // Shared vertices between two triangles making a quad, intentionally omitting vn so flat normals are synthesized
+            objFile.writeText(
+                """
+                # Quad test mesh
+                v 0.0 0.0 0.0
+                v 1.0 0.0 0.0
+                v 1.0 1.0 0.0
+                v 0.0 1.0 0.0
+                vt 0.0 0.0
+                vt 1.0 0.0
+                vt 1.0 1.0
+                vt 0.0 1.0
+                f 1/1 2/2 3/3 4/4
+                """.trimIndent()
+            )
+            val result = ModelFormatConverter.convertObjToGlb(cacheDir = tempDir, objFile = objFile)
+            assertEquals("OBJ", result.originalFormat)
+            assertEquals(2, result.triangleCount)
+            assertTrue(result.glbFile.exists())
+
+            val bytes = result.glbFile.readBytes()
+            val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            assertEquals(0x46546C67, bb.int) // "glTF" magic
+            assertEquals(2, bb.int)          // glTF v2
+            assertEquals(bytes.size, bb.int) // Exact total byte length
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 }

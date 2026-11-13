@@ -3,12 +3,15 @@ package com.aistudio.mixedreality.util
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 
 import kotlinx.coroutines.delay
 
 /**
  * Manages device flashlight (torch) for low-light mixed reality and 3D object inspection.
+ * Supports observing external Control Center / Quick Settings torch toggles via TorchCallback.
  */
 object FlashlightHelper {
     private const val TAG = "FlashlightHelper"
@@ -33,6 +36,43 @@ object FlashlightHelper {
             findTorchCameraId(cameraManager) != null
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    /**
+     * Observes system Control Center / Quick Settings torch changes for the back flash camera.
+     * Ignores onTorchModeUnavailable so holding the camera in AR/MR preserves the active torch state.
+     * Returns an unregister callback that safely cleans up the TorchCallback.
+     */
+    fun observeTorchState(
+        context: Context,
+        onTorchChanged: (Boolean) -> Unit
+    ): () -> Unit {
+        return try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+                ?: return {}
+            val targetCameraId = findTorchCameraId(cameraManager) ?: return {}
+            val callback = object : CameraManager.TorchCallback() {
+                override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                    if (cameraId == targetCameraId) {
+                        isTorchOn = enabled
+                        onTorchChanged(enabled)
+                    }
+                }
+
+                override fun onTorchModeUnavailable(cameraId: String) {
+                    // Do not turn off external state when AR/MR camera hardware claims the camera.
+                }
+            }
+            cameraManager.registerTorchCallback(callback, Handler(Looper.getMainLooper()))
+            val unregister: () -> Unit = {
+                runCatching { cameraManager.unregisterTorchCallback(callback) }
+            }
+            unregister
+        } catch (e: Throwable) {
+            Log.w(TAG, "Unable to register torch observer: ${e.message}")
+            val noop: () -> Unit = {}
+            noop
         }
     }
 

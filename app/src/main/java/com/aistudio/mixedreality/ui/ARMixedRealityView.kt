@@ -34,14 +34,16 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import dev.romainguy.kotlin.math.Quaternion
+import io.github.sceneview.RenderQuality
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.arcore.ARSession
 import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.ar.rememberARCameraStream
 import io.github.sceneview.loaders.EnvironmentLoader
 import io.github.sceneview.loaders.MaterialLoader
 import io.github.sceneview.loaders.ModelLoader
 import io.github.sceneview.math.Position
-import io.github.sceneview.math.Rotation
 import io.github.sceneview.math.Scale
 import io.github.sceneview.math.Size
 import io.github.sceneview.node.CubeNode
@@ -55,7 +57,6 @@ import io.github.sceneview.rememberMainLightNode
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberModelInstance
 import io.github.sceneview.rememberModelLoader
-import io.github.sceneview.ar.rememberARCameraStream
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -138,6 +139,8 @@ fun ARMixedRealityView(
     onRotationXChange: (Float) -> Unit = {},
     rotationZ: Float = 0f,
     onRotationZChange: (Float) -> Unit = {},
+    orientation: SpatialQuaternion? = null,
+    onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
     clearTrigger: Int = 0,
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
@@ -152,9 +155,10 @@ fun ARMixedRealityView(
     materialLoader: MaterialLoader? = null,
     environmentLoader: EnvironmentLoader? = null
 ) {
-    val localModelLoader = rememberModelLoader(engine)
-    val localMaterialLoader = rememberMaterialLoader(engine)
-    val localEnvironmentLoader = rememberEnvironmentLoader(engine)
+    val localModelLoader = modelLoader ?: rememberModelLoader(engine)
+    val localMaterialLoader = materialLoader ?: rememberMaterialLoader(engine)
+    val localEnvironmentLoader = environmentLoader ?: rememberEnvironmentLoader(engine)
+    val currentOrientation by rememberUpdatedState(orientation)
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
@@ -212,14 +216,10 @@ fun ARMixedRealityView(
         null
     }
 
-    val customModelInstance = key(customModelFile?.absolutePath) {
-        customModelFile?.let { file ->
-            rememberModelInstance(
-                modelLoader = localModelLoader,
-                fileLocation = "file://${file.absolutePath}"
-            )
-        }
-    }
+    val customModelInstance = rememberOptimizedModelInstance(
+        modelLoader = localModelLoader,
+        customModelFile = customModelFile
+    )
 
     val context = LocalContext.current
     val activity = context as? Activity
@@ -243,6 +243,8 @@ fun ARMixedRealityView(
             onRotationXChange = onRotationXChange,
             rotationZ = rotationZ,
             onRotationZChange = onRotationZChange,
+            orientation = orientation,
+            onOrientationChange = onOrientationChange,
             clearTrigger = clearTrigger,
             isMoveMode = isMoveMode,
             onToggleMoveMode = onToggleMoveMode,
@@ -253,6 +255,9 @@ fun ARMixedRealityView(
             onStopAutoRotate = onStopAutoRotate,
             onFallbackToObject = onFallbackToObject,
             engine = engine,
+            modelLoader = localModelLoader,
+            materialLoader = localMaterialLoader,
+            environmentLoader = localEnvironmentLoader,
             modifier = modifier
         )
         return
@@ -450,6 +455,13 @@ fun ARMixedRealityView(
                 },
                 onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
+                    val baseQuat = currentOrientation
+                    if (activeRotationAxis == RotationAxis.ALL && onOrientationChange != null && baseQuat != null) {
+                        var updated = baseQuat
+                        if (dx != 0f) updated = updated.rotateWorldY(dx * 0.45f)
+                        if (dy != 0f) updated = updated.rotateWorldX(-dy * 0.45f)
+                        onOrientationChange(updated)
+                    }
                     applyRotationDelta(
                         axis = activeRotationAxis,
                         dx = dx,
@@ -466,6 +478,10 @@ fun ARMixedRealityView(
                 },
                 onOneFingerRotateZ = { dAngle ->
                     onStopAutoRotate()
+                    val baseQuat = currentOrientation
+                    if (onOrientationChange != null && baseQuat != null) {
+                        onOrientationChange(baseQuat.rotateWorldZ(-dAngle))
+                    }
                     val newRotZ =
                         ((rotationZ + dAngle) % 360f + 360f) % 360f
                     onRotationZChange(newRotZ)
@@ -523,6 +539,7 @@ fun ARMixedRealityView(
                 modelLoader = localModelLoader,
                 materialLoader = localMaterialLoader,
                 environmentLoader = localEnvironmentLoader,
+                renderQuality = RenderQuality.Performance,
                 cameraStream = rememberARCameraStream(localMaterialLoader),
                 mainLightNode = rememberMainLightNode(engine) {
                     intensity = 45_000.0f
@@ -631,73 +648,92 @@ fun ARMixedRealityView(
                             z = modelOffset.z + trackingManager.smoothedOffset.z
                         )
 
+                        val targetQuat = remember(orientation, safeRotX, safeRotY, safeRotZ) {
+                            (orientation ?: SpatialQuaternion.fromEulerZYX(safeRotX, safeRotY, safeRotZ)).normalized()
+                        }
+                        var rotNode by remember { mutableStateOf<Node?>(null) }
+                        DisposableEffect(rotNode, targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w) {
+                            rotNode?.quaternion = Quaternion(targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w)
+                            onDispose {}
+                        }
+
                         Node(
                             position = effectivePosition,
                             scale = Scale(safeScale)
                         ) {
-                            Node(rotation = Rotation(y = safeRotY)) {
-                                Node(rotation = Rotation(x = safeRotX)) {
-                                    Node(rotation = Rotation(z = safeRotZ)) {
-                                        if (isModelVisible) {
-                                            if (customModelFile != null) {
-                                                customModelInstance?.let { instance ->
+                            Node(
+                                apply = {
+                                    rotNode = this
+                                    quaternion = Quaternion(targetQuat.x, targetQuat.y, targetQuat.z, targetQuat.w)
+                                }
+                            ) {
+                                if (isModelVisible) {
+                                    if (customModelFile != null) {
+                                        customModelInstance?.let { instance ->
+                                            val isHeavyMesh = remember(customModelFile.absolutePath) {
+                                                customModelFile.length() > 2L * 1024L * 1024L
+                                            }
+                                            ModelNode(
+                                                modelInstance = instance,
+                                                scaleToUnits = 0.35f,
+                                                centerOrigin = Position(0f, 0f, 0f),
+                                                autoAnimate = true,
+                                                apply = {
+                                                    if (isHeavyMesh) {
+                                                        isShadowCaster = false
+                                                        isShadowReceiver = false
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        when (modelItem) {
+                                            ModelItem.VISION_HEADSET -> {
+                                                SphereNode(
+                                                    radius = 0.16f,
+                                                    materialInstance = visorGlassMaterial,
+                                                    position = Position(0f, 0.04f, 0.08f)
+                                                )
+                                                CylinderNode(
+                                                    radius = 0.18f,
+                                                    height = 0.06f,
+                                                    materialInstance = pbrMaterial,
+                                                    position = Position(0f, 0.04f, -0.04f)
+                                                )
+                                            }
+
+                                            ModelItem.TOY_CAR -> {
+                                                toyCarModel?.let { instance ->
                                                     ModelNode(
                                                         modelInstance = instance,
-                                                        scaleToUnits = 0.35f,
-                                                        centerOrigin = Position(0f, 0f, 0f),
-                                                        autoAnimate = true
+                                                        scaleToUnits = 0.40f,
+                                                        centerOrigin = Position(0f, 0f, 0f)
                                                     )
-                                                }
-                                            } else {
-                                                when (modelItem) {
-                                                    ModelItem.VISION_HEADSET -> {
-                                                        SphereNode(
-                                                            radius = 0.16f,
-                                                            materialInstance = visorGlassMaterial,
-                                                            position = Position(0f, 0.04f, 0.08f)
-                                                        )
-                                                        CylinderNode(
-                                                            radius = 0.18f,
-                                                            height = 0.06f,
-                                                            materialInstance = pbrMaterial,
-                                                            position = Position(0f, 0.04f, -0.04f)
-                                                        )
-                                                    }
+                                                } ?: CubeNode(
+                                                    size = Size(0.25f, 0.25f, 0.25f),
+                                                    materialInstance = pbrMaterial
+                                                )
+                                            }
 
-                                                    ModelItem.TOY_CAR -> {
-                                                        toyCarModel?.let { instance ->
-                                                            ModelNode(
-                                                                modelInstance = instance,
-                                                                scaleToUnits = 0.40f,
-                                                                centerOrigin = Position(0f, 0f, 0f)
-                                                            )
-                                                        } ?: CubeNode(
-                                                            size = Size(0.25f, 0.25f, 0.25f),
-                                                            materialInstance = pbrMaterial
-                                                        )
-                                                    }
+                                            ModelItem.HOLO_CUBE -> {
+                                                CubeNode(
+                                                    size = Size(0.24f, 0.24f, 0.24f),
+                                                    materialInstance = pbrMaterial
+                                                )
+                                            }
 
-                                                    ModelItem.HOLO_CUBE -> {
-                                                        CubeNode(
-                                                            size = Size(0.24f, 0.24f, 0.24f),
-                                                            materialInstance = pbrMaterial
-                                                        )
-                                                    }
+                                            ModelItem.QUANTUM_ORB -> {
+                                                SphereNode(
+                                                    radius = 0.18f,
+                                                    materialInstance = pbrMaterial
+                                                )
+                                            }
 
-                                                    ModelItem.QUANTUM_ORB -> {
-                                                        SphereNode(
-                                                            radius = 0.18f,
-                                                            materialInstance = pbrMaterial
-                                                        )
-                                                    }
-
-                                                    ModelItem.SPATIAL_CARD -> {
-                                                        CubeNode(
-                                                            size = Size(0.35f, 0.22f, 0.03f),
-                                                            materialInstance = pbrMaterial
-                                                        )
-                                                    }
-                                                }
+                                            ModelItem.SPATIAL_CARD -> {
+                                                CubeNode(
+                                                    size = Size(0.35f, 0.22f, 0.03f),
+                                                    materialInstance = pbrMaterial
+                                                )
                                             }
                                         }
                                     }

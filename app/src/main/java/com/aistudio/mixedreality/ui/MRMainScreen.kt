@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -20,8 +21,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Tune
 import com.aistudio.mixedreality.util.FlashlightHelper
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,30 +33,28 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import com.aistudio.mixedreality.ui.theme.*
 import com.aistudio.mixedreality.util.MediaManager
 import com.aistudio.mixedreality.util.ModelFormatConverter
 import com.aistudio.mixedreality.util.VideoSessionRecorder
 import io.github.sceneview.rememberEngine
+import io.github.sceneview.rememberEnvironmentLoader
+import io.github.sceneview.rememberMaterialLoader
+import io.github.sceneview.rememberModelLoader
 import io.github.sceneview.rememberSurfaceMirrorer
 import io.github.sceneview.utils.SurfaceMirrorer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
 import java.util.Locale
 
@@ -74,8 +71,11 @@ fun MRMainScreen(
     val scope = rememberCoroutineScope()
 
     // Shared single Filament Engine & loaders across entire screen lifecycle
-    // Prevents multi-engine EGL context crashes, shader errors, and GPU memory exhaustion
+    // Prevents multi-engine EGL context crashes, redundant model reloads, and GPU memory exhaustion
     val engine = rememberEngine()
+    val sharedModelLoader = rememberModelLoader(engine)
+    val sharedMaterialLoader = rememberMaterialLoader(engine)
+    val sharedEnvironmentLoader = rememberEnvironmentLoader(engine)
 
     // ARCore device support detection
     val isARCoreAvailable = remember(context) {
@@ -89,6 +89,7 @@ fun MRMainScreen(
     var selectedModel by remember { mutableStateOf(ModelItem.VISION_HEADSET) }
     var customModelFile by remember { mutableStateOf<File?>(null) }
     var isModelVisible by remember { mutableStateOf(true) }
+    var isPreparingModelFile by remember { mutableStateOf(false) }
 
     // Visual attributes: realistic default PBR values for natural color representation
     var modelColor by remember { mutableStateOf(Color(0xFF00E5FF)) }
@@ -102,65 +103,57 @@ fun MRMainScreen(
     var rotationY by remember { mutableFloatStateOf(0f) }
     var rotationX by remember { mutableFloatStateOf(0f) }
     var rotationZ by remember { mutableFloatStateOf(0f) }
+    var modelQuaternion by remember { mutableStateOf(SpatialQuaternion.IDENTITY) }
     var activeRotationAxis by remember { mutableStateOf(RotationAxis.ALL) }
 
     // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
     var showCloudLibrary by remember { mutableStateOf(false) }
 
-    // Flashlight / Torch runs silently in the background for low-light environments (button hidden)
-    val hasFlashHardware = remember(context) { FlashlightHelper.isFlashAvailable(context) }
-    val isFlashlightOn = hasFlashHardware
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var isAppResumed by remember {
-        mutableStateOf(
-            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
-        )
-    }
+    // Flashlight starts OFF and follows the user's external Control Center / Quick Settings toggle.
+    // The app never turns the torch on or off automatically on launch, pause, or dispose.
+    var isExternalTorchOn by remember { mutableStateOf(false) }
+    val ignoreTorchCallbacksUntilMs = remember { mutableLongStateOf(0L) }
+    val currentModeState by rememberUpdatedState(selectedMode)
+    var previousMode by remember { mutableStateOf(ViewportMode.OBJECT) }
 
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_RESUME -> isAppResumed = true
-                Lifecycle.Event.ON_PAUSE -> {
-                    isAppResumed = false
-                    FlashlightHelper.setTorchMode(context, false)
-                }
-                else -> Unit
+    DisposableEffect(context) {
+        val unregisterTorchObserver = FlashlightHelper.observeTorchState(context) { enabled ->
+            if (currentModeState == ViewportMode.OBJECT &&
+                SystemClock.elapsedRealtime() >= ignoreTorchCallbacksUntilMs.longValue
+            ) {
+                isExternalTorchOn = enabled
             }
         }
-        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            FlashlightHelper.setTorchMode(context, false)
+            unregisterTorchObserver()
         }
     }
 
-    LaunchedEffect(isFlashlightOn, selectedMode, isAppResumed) {
-        if (!isAppResumed) {
-            FlashlightHelper.setTorchMode(context, false)
-        } else if (selectedMode == ViewportMode.OBJECT) {
-            if (isFlashlightOn) {
-                FlashlightHelper.setTorchModeWithRetry(context, true)
-            } else {
-                FlashlightHelper.setTorchMode(context, false)
-            }
-        } else {
-            // AR/MR owns the camera hardware via ARSession flashMode or CameraPassthrough;
-            // ensure CameraManager torch is released cleanly before ARCore acquires it.
-            if (FlashlightHelper.isTorchOn) {
-                FlashlightHelper.setTorchMode(context, false)
-            }
+    LaunchedEffect(selectedMode) {
+        val fromMode = previousMode
+        previousMode = selectedMode
+        if (selectedMode == ViewportMode.OBJECT && fromMode != ViewportMode.OBJECT && isExternalTorchOn) {
+            // ARCore turns hardware LED off while tearing down ARSession; re-engage only if user had it ON externally.
+            ignoreTorchCallbacksUntilMs.longValue = SystemClock.elapsedRealtime() + 1400L
+            delay(180L)
+            FlashlightHelper.setTorchModeWithRetry(context, true)
         }
     }
 
     // Handle incoming 3D model files from external apps / file manager on background thread
     LaunchedEffect(incomingModelUri) {
         val uri = incomingModelUri ?: return@LaunchedEffect
+        isPreparingModelFile = true
         val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
+        isPreparingModelFile = false
         if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
             customModelFile = copiedFile
             isModelVisible = true
             selectedMode = ViewportMode.OBJECT
+            modelQuaternion = SpatialQuaternion.IDENTITY
+            rotationX = 0f
+            rotationY = 0f
+            rotationZ = 0f
             Toast.makeText(context, "Opened 3D model: ${copiedFile.name}", Toast.LENGTH_SHORT).show()
         } else {
             Toast.makeText(context, "Failed to load 3D model from file", Toast.LENGTH_SHORT).show()
@@ -226,16 +219,22 @@ fun MRMainScreen(
         }
     }
 
-    // Requirement 4: System Document / File Picker for 3D models (.glb, .gltf)
+    // System Document / File Picker for 3D models (.glb, .gltf, .usdz, .obj, .3mf, .stl, .ply)
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
+                isPreparingModelFile = true
                 val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
+                isPreparingModelFile = false
                 if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
                     customModelFile = copiedFile
                     isModelVisible = true
+                    modelQuaternion = SpatialQuaternion.IDENTITY
+                    rotationX = 0f
+                    rotationY = 0f
+                    rotationZ = 0f
                     val fileName = copiedFile.name
                     Toast.makeText(context, "Model loaded successfully: $fileName", Toast.LENGTH_SHORT).show()
                 } else {
@@ -251,6 +250,7 @@ fun MRMainScreen(
             while (isAutoRotating) {
                 delay(33L)
                 rotationY = (rotationY + 0.5f) % 360f
+                modelQuaternion = modelQuaternion.rotateWorldY(0.5f)
             }
         }
     }
@@ -297,6 +297,8 @@ fun MRMainScreen(
                     onRotationXChange = { rotationX = it },
                     rotationZ = rotationZ,
                     onRotationZChange = { rotationZ = it },
+                    orientation = modelQuaternion,
+                    onOrientationChange = { modelQuaternion = it },
                     isMoveMode = isMoveMode,
                     onToggleMoveMode = { isMoveMode = !isMoveMode },
                     activeRotationAxis = activeRotationAxis,
@@ -307,6 +309,9 @@ fun MRMainScreen(
                         filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*"))
                     },
                     engine = engine,
+                    modelLoader = sharedModelLoader,
+                    materialLoader = sharedMaterialLoader,
+                    environmentLoader = sharedEnvironmentLoader,
                     onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it }
                 )
             }
@@ -327,16 +332,21 @@ fun MRMainScreen(
                         onRotationXChange = { rotationX = it },
                         rotationZ = rotationZ,
                         onRotationZChange = { rotationZ = it },
+                        orientation = modelQuaternion,
+                        onOrientationChange = { modelQuaternion = it },
                         clearTrigger = clearTrigger,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
                         activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
-                        isFlashlightOn = isFlashlightOn,
+                        isFlashlightOn = isExternalTorchOn,
                         onStopAutoRotate = { isAutoRotating = false },
                         onFallbackToObject = { selectedMode = ViewportMode.OBJECT },
-                        engine = engine
+                        engine = engine,
+                        modelLoader = sharedModelLoader,
+                        materialLoader = sharedMaterialLoader,
+                        environmentLoader = sharedEnvironmentLoader
                     )
                 } else {
                     PermissionRequestPlaceholder(onGrant = {
@@ -363,8 +373,13 @@ fun MRMainScreen(
                         onRotationXChange = { rotationX = it },
                         rotationZ = rotationZ,
                         onRotationZChange = { rotationZ = it },
+                        orientation = modelQuaternion,
+                        onOrientationChange = { modelQuaternion = it },
                         isRecording = isRecording,
                         engine = engine,
+                        modelLoader = sharedModelLoader,
+                        materialLoader = sharedMaterialLoader,
+                        environmentLoader = sharedEnvironmentLoader,
                         onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it },
                         isARCoreAvailable = isARCoreAvailable,
                         clearTrigger = clearTrigger,
@@ -373,7 +388,7 @@ fun MRMainScreen(
                         activeRotationAxis = activeRotationAxis,
                         isFullScreen = isFullScreen,
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
-                        isFlashlightOn = isFlashlightOn,
+                        isFlashlightOn = isExternalTorchOn,
                         onStopAutoRotate = { isAutoRotating = false },
                         onFallbackToObject = { selectedMode = ViewportMode.OBJECT }
                     )
@@ -403,8 +418,12 @@ fun MRMainScreen(
                 TopModeSegmentedPill(
                     currentMode = selectedMode,
                     onModeSelected = { mode ->
-                        if (mode != ViewportMode.OBJECT && FlashlightHelper.isTorchOn) {
-                            FlashlightHelper.setTorchMode(context, false)
+                        if (mode != ViewportMode.OBJECT && selectedMode == ViewportMode.OBJECT) {
+                            ignoreTorchCallbacksUntilMs.longValue = SystemClock.elapsedRealtime() + 1500L
+                            if (FlashlightHelper.isTorchOn) {
+                                // Hand off hardware camera torch cleanly to ARCore's TORCH config
+                                FlashlightHelper.setTorchMode(context, false)
+                            }
                         }
                         if (mode == ViewportMode.AR || mode == ViewportMode.MR) {
                             if (!hasCameraPermission) {
@@ -498,10 +517,17 @@ fun MRMainScreen(
                     showCloudLibrary = true
                 },
                 onClearClick = {
-                    // Requirement 3: Clear button deletes / removes the model
+                    // Remove model & prune old cached model folders to keep RAM & storage clean
                     isModelVisible = false
                     customModelFile = null
+                    modelQuaternion = SpatialQuaternion.IDENTITY
+                    rotationX = 0f
+                    rotationY = 0f
+                    rotationZ = 0f
                     clearTrigger++
+                    scope.launch(Dispatchers.IO) {
+                        pruneStaleModelCache(context.cacheDir)
+                    }
                     Toast.makeText(context, "Model removed from scene 🗑️", Toast.LENGTH_SHORT).show()
                 }
             )
@@ -514,6 +540,32 @@ fun MRMainScreen(
                     .fillMaxSize()
                     .background(Color.White.copy(alpha = 0.85f))
             )
+        }
+
+        // --- 6B. LARGE FILE STREAMING / CONVERSION INDICATOR ---
+        if (isPreparingModelFile) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(16.dp))
+                    .border(1.dp, NeonCyan.copy(alpha = 0.55f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 20.dp, vertical = 14.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = NeonCyan,
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        text = "Optimizing & loading 3D file...",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
 
         // --- 7. MODEL CUSTOMIZATION & PRESETS SHEET (TUNE / PRESETS) ---
@@ -551,19 +603,26 @@ fun MRMainScreen(
                         }
                     },
                     rotationX = rotationX,
-                    onRotationXChange = { rotationX = it },
+                    onRotationXChange = { newX ->
+                        rotationX = newX
+                        modelQuaternion = SpatialQuaternion.fromEulerZYX(newX, rotationY, rotationZ)
+                    },
                     rotationY = rotationY,
-                    onRotationYChange = { rotationY = it },
+                    onRotationYChange = { newY ->
+                        rotationY = newY
+                        modelQuaternion = SpatialQuaternion.fromEulerZYX(rotationX, newY, rotationZ)
+                    },
                     rotationZ = rotationZ,
-                    onRotationZChange = { rotationZ = it },
+                    onRotationZChange = { newZ ->
+                        rotationZ = newZ
+                        modelQuaternion = SpatialQuaternion.fromEulerZYX(rotationX, rotationY, newZ)
+                    },
                     isAutoRotating = isAutoRotating,
                     onToggleAutoRotate = { isAutoRotating = !isAutoRotating },
                     onClose = { showTuneDrawer = false }
                 )
             }
         }
-
-
 
         // --- 9. CLOUD 3D MODEL LIBRARY SHEET ---
         if (showCloudLibrary) {
@@ -572,46 +631,143 @@ fun MRMainScreen(
                 onModelDownloaded = { downloadedFile, title ->
                     showCloudLibrary = false
                     scope.launch {
-                        val converted = ModelFormatConverter.processIncomingModel(context, downloadedFile)
+                        isPreparingModelFile = true
+                        val converted = withContext(Dispatchers.IO) {
+                            pruneStaleModelCache(context.cacheDir, keepFile = downloadedFile)
+                            ModelFormatConverter.processIncomingModel(context, downloadedFile)
+                        }
+                        isPreparingModelFile = false
                         customModelFile = converted.glbFile
                         isModelVisible = true
                         selectedMode = ViewportMode.OBJECT
+                        modelQuaternion = SpatialQuaternion.IDENTITY
+                        rotationX = 0f
+                        rotationY = 0f
+                        rotationZ = 0f
                         Toast.makeText(context, "Loaded from Cloud: $title", Toast.LENGTH_SHORT).show()
                     }
                 }
             )
         }
+    }
+}
 
+internal fun pruneStaleModelCache(cacheDir: File, keepFile: File? = null) {
+    val keepPath = runCatching { keepFile?.canonicalPath }.getOrNull()
+    cacheDir.listFiles()?.forEach { child ->
+        val name = child.name
+        val isModelArtifact = name.startsWith("model_") ||
+            name.startsWith("usdz_") ||
+            name.startsWith("Cloud_Model_") ||
+            (child.isFile && child.extension.lowercase(Locale.US) in setOf(
+                "glb", "gltf", "obj", "usdz", "usda", "usdc", "3mf", "stl", "ply", "zip"
+            ))
+        if (isModelArtifact) {
+            val childPath = runCatching { child.canonicalPath }.getOrNull()
+            if (keepPath == null || childPath != keepPath) {
+                runCatching {
+                    if (child.isDirectory) child.deleteRecursively() else child.delete()
+                }
+            }
+        }
+    }
+}
 
+private fun sniffModelExtensionFromHeader(header: ByteArray, length: Int): String? {
+    if (length >= 4) {
+        // Binary glTF ('glTF')
+        if (header[0] == 'g'.code.toByte() && header[1] == 'l'.code.toByte() &&
+            header[2] == 'T'.code.toByte() && header[3] == 'F'.code.toByte()
+        ) {
+            return "glb"
+        }
+        // ZIP container (USDZ, 3MF, or zipped glTF/OBJ)
+        if (header[0] == 'P'.code.toByte() && header[1] == 'K'.code.toByte() &&
+            header[2] == 0x03.toByte() && header[3] == 0x04.toByte()
+        ) {
+            return "zip"
+        }
+    }
+    val text = String(header, 0, length.coerceAtMost(256), Charsets.UTF_8).trimStart()
+    return when {
+        text.startsWith("{") -> "gltf"
+        text.startsWith("ply\n", ignoreCase = true) || text.startsWith("ply\r", ignoreCase = true) -> "ply"
+        text.startsWith("solid ", ignoreCase = true) -> "stl"
+        text.startsWith("v ") || text.startsWith("#") || text.startsWith("mtllib") || text.startsWith("o ") -> "obj"
+        else -> null
     }
 }
 
 /**
- * Copies a selected Content Uri to app's private cache directory and processes USDZ/OBJ/GLB formats.
+ * Streams a selected Content Uri to app's private cache directory using 256 KB buffered IO,
+ * sniffs extensionless magic bytes, and delegates conversion to USDZ/OBJ/ZIP/GLTF/GLB.
  */
 fun copyUriToLocalCache(context: Context, uri: Uri): File? {
     return try {
+        pruneStaleModelCache(context.cacheDir)
+
         val rawName = queryDisplayName(context, uri) ?: "model_${System.currentTimeMillis()}.glb"
         val cleanName = rawName.substringAfterLast('/').substringAfterLast('\\').trim()
-        val extension = cleanName.substringAfterLast('.', "").lowercase()
-        val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj")
-        val baseName = if (cleanName.contains('.')) cleanName.substringBeforeLast('.') else cleanName
-        val safeExt = if (isRecognized3D) ".$extension" else ".glb"
+            .ifEmpty { "model_${System.currentTimeMillis()}.glb" }
+        val extension = cleanName.substringAfterLast('.', "").lowercase(Locale.US)
+        val isRecognized3D = extension in setOf("glb", "gltf", "usdz", "usda", "usdc", "obj", "3mf", "stl", "ply", "zip")
+        val baseName = (if (cleanName.contains('.')) cleanName.substringBeforeLast('.') else cleanName)
+            .ifEmpty { "model" }
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+
         val modelFolder = File(context.cacheDir, "model_${System.currentTimeMillis()}").apply { mkdirs() }
-        val cacheFile = File(modelFolder, "$baseName$safeExt")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            cacheFile.outputStream().use { output ->
-                input.copyTo(output)
+        val tempOutFile = File(modelFolder, "$baseName.${if (isRecognized3D) extension else "tmp"}")
+
+        val headerPeek = ByteArray(256)
+        var headerLen = 0
+
+        context.contentResolver.openInputStream(uri)?.use { rawInput ->
+            BufferedInputStream(rawInput, 262_144).use { bufferedIn ->
+                BufferedOutputStream(tempOutFile.outputStream(), 262_144).use { bufferedOut ->
+                    val chunk = ByteArray(262_144)
+                    var firstChunk = true
+                    while (true) {
+                        val read = bufferedIn.read(chunk)
+                        if (read <= 0) break
+                        if (firstChunk) {
+                            headerLen = read.coerceAtMost(headerPeek.size)
+                            System.arraycopy(chunk, 0, headerPeek, 0, headerLen)
+                            firstChunk = false
+                        }
+                        bufferedOut.write(chunk, 0, read)
+                    }
+                    bufferedOut.flush()
+                }
             }
         } ?: return null
 
-        if (!cacheFile.exists() || cacheFile.length() == 0L) {
+        if (!tempOutFile.exists() || tempOutFile.length() == 0L) {
+            tempOutFile.delete()
             return null
+        }
+
+        val finalExt = if (isRecognized3D) {
+            extension
+        } else {
+            sniffModelExtensionFromHeader(headerPeek, headerLen) ?: "glb"
+        }
+
+        val cacheFile = if (tempOutFile.extension.equals(finalExt, ignoreCase = true)) {
+            tempOutFile
+        } else {
+            File(modelFolder, "$baseName.$finalExt").also { target ->
+                if (!tempOutFile.renameTo(target)) {
+                    tempOutFile.copyTo(target, overwrite = true)
+                    tempOutFile.delete()
+                }
+            }
         }
 
         val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile)
         conversion.glbFile
-    } catch (e: Exception) {
+    } catch (_: OutOfMemoryError) {
+        null
+    } catch (_: Exception) {
         null
     }
 }
