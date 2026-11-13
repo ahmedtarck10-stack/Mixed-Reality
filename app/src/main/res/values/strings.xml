@@ -11,4 +11,10 @@
     <string name="shortcut_ar_scan_short">AR View</string>
     <string name="shortcut_ar_scan_long">Launch AR Scanner</string>
     <string name="quick_settings_tile_label">Mixed Reality</string>
+    <string name="notification_channel_session_name">Mixed Reality Active Session</string>
+    <string name="notification_channel_session_desc">Quick-access controls and active 3D/AR session status in your notification shade.</string>
+    <string name="notification_channel_events_name">3D Models &amp; Media Alerts</string>
+    <string name="notification_channel_events_desc">Notifications for loaded 3D models, optimization status, photos, and recorded videos.</string>
+    <string name="notification_action_ar">AR View</string>
+    <string name="notification_action_open">Open 3D</string>
 </resources>

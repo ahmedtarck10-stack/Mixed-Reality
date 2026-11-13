@@ -177,26 +177,51 @@ object ModelFormatConverter {
         val extension = sourceFile.extension.lowercase()
         return when (extension) {
             "glb" -> {
+                val info = StreamingMeshProcessor.inspectGlbMetadata(sourceFile)
+                val finalFile: File
+                val outVerts: Int
+                val outTris: Int
+                val msg: String
+
+                if (info.isValidGlb && info.hasUncompressedAccessors &&
+                    info.triangleCount > StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT.toLong()
+                ) {
+                    val optimized = StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, sourceFile)
+                    if (optimized != null && optimized.exists() && optimized.length() > 0L) {
+                        val optInfo = StreamingMeshProcessor.inspectGlbMetadata(optimized)
+                        finalFile = optimized
+                        outVerts = optInfo.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                        outTris = optInfo.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                        msg = "Dense GLB (${formatModelCount(info.triangleCount)} tris) optimized to ${formatModelCount(optInfo.triangleCount)} tris for GPU"
+                    } else {
+                        finalFile = sourceFile
+                        outVerts = info.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                        outTris = info.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                        msg = "Native GLB (${formatModelCount(info.triangleCount)} tris)"
+                    }
+                } else {
+                    finalFile = sourceFile
+                    outVerts = info.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    outTris = info.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    msg = if (info.isValidGlb && info.triangleCount > 0L) {
+                        "Native GLB (${formatModelCount(info.triangleCount)} tris)"
+                    } else {
+                        "Native GLB Model Loaded"
+                    }
+                }
+
                 ConversionResult(
-                    glbFile = sourceFile,
+                    glbFile = finalFile,
                     originalFormat = "GLB",
-                    triangleCount = 0,
-                    vertexCount = 0,
-                    message = "Native GLB Model Loaded",
+                    triangleCount = outTris,
+                    vertexCount = outVerts,
+                    message = msg,
                     isSuccess = true
                 )
             }
-            "3mf", "stl", "ply" -> {
-                // SceneView 4.63 ModelLoader decodes 3MF, STL, PLY natively on background IO
-                ConversionResult(
-                    glbFile = sourceFile,
-                    originalFormat = extension.uppercase(),
-                    triangleCount = 0,
-                    vertexCount = 0,
-                    message = "Native ${extension.uppercase()} Model Ready",
-                    isSuccess = true
-                )
-            }
+            "stl" -> StreamingMeshProcessor.convertStlToGlb(cacheDir, sourceFile)
+            "ply" -> StreamingMeshProcessor.convertPlyToGlb(cacheDir, sourceFile)
+            "3mf" -> StreamingMeshProcessor.convertThreeMfToGlb(cacheDir, sourceFile)
             "gltf" -> {
                 var binWarning: String? = null
                 var hasMissingBuffer = false
@@ -292,13 +317,23 @@ object ModelFormatConverter {
         }
     }
 
+    private fun formatModelCount(n: Long): String = when {
+        n >= 1_000_000L -> String.format(java.util.Locale.US, "%.1fM", n / 1_000_000.0)
+        n >= 1_000L -> String.format(java.util.Locale.US, "%.0fK", n / 1_000.0)
+        else -> n.toString()
+    }
+
     fun convertObjToGlb(context: Context, objFile: File): ConversionResult =
         convertObjToGlb(context.cacheDir, objFile)
 
     /**
-     * Converts large Wavefront .obj files into compliant binary glTF 2.0 (.glb) with minimal RAM/CPU overhead.
+     * Converts Wavefront .obj files into compliant binary glTF 2.0 (.glb).
+     * Files >= 8 MB (or dense multi-million vertex/polygon meshes up to 30M+) use disk-paged streaming + clustering.
      */
     fun convertObjToGlb(cacheDir: File, objFile: File): ConversionResult {
+        if (objFile.length() >= 8L * 1024L * 1024L) {
+            return StreamingMeshProcessor.convertObjToGlbStreaming(cacheDir, objFile)
+        }
         val approxVertEstimate = (objFile.length() / 48L).toInt().coerceIn(512, 262_144)
         val rawPositions = FloatArrayBuilder(approxVertEstimate * 3)
         val rawNormals = FloatArrayBuilder(approxVertEstimate * 3)
@@ -624,6 +659,8 @@ object ModelFormatConverter {
         var extractedGltf: File? = null
         var extractedObj: File? = null
         var extracted3mf: File? = null
+        var extractedStl: File? = null
+        var extractedPly: File? = null
         val extractedDir = File(cacheDir, "usdz_${System.currentTimeMillis()}")
         extractedDir.mkdirs()
         val canonicalRoot = extractedDir.canonicalPath + File.separator
@@ -650,6 +687,8 @@ object ModelFormatConverter {
                                 name.endsWith(".gltf", ignoreCase = true) && extractedGltf == null -> extractedGltf = outFile
                                 name.endsWith(".obj", ignoreCase = true) && extractedObj == null -> extractedObj = outFile
                                 name.endsWith(".3mf", ignoreCase = true) && extracted3mf == null -> extracted3mf = outFile
+                                name.endsWith(".stl", ignoreCase = true) && extractedStl == null -> extractedStl = outFile
+                                name.endsWith(".ply", ignoreCase = true) && extractedPly == null -> extractedPly = outFile
                             }
                         }
                     }
@@ -663,24 +702,27 @@ object ModelFormatConverter {
 
         val glb = extractedGlb
         if (glb != null && glb.exists() && glb.length() > 0) {
-            return ConversionResult(
-                glbFile = glb,
-                originalFormat = "USDZ",
-                triangleCount = 0,
-                vertexCount = 0,
-                message = "Extracted native GLB from archive",
-                isSuccess = true
-            )
+            return processIncomingModel(extractedDir, glb).copy(originalFormat = "USDZ")
         }
 
         val gltf = extractedGltf
         if (gltf != null && gltf.exists() && gltf.length() > 0) {
-            return processIncomingModel(extractedDir, gltf)
+            return processIncomingModel(extractedDir, gltf).copy(originalFormat = "USDZ")
         }
 
         val threeMf = extracted3mf
         if (threeMf != null && threeMf.exists() && threeMf.length() > 0) {
-            return processIncomingModel(extractedDir, threeMf)
+            return processIncomingModel(extractedDir, threeMf).copy(originalFormat = "USDZ")
+        }
+
+        val stl = extractedStl
+        if (stl != null && stl.exists() && stl.length() > 0) {
+            return processIncomingModel(extractedDir, stl).copy(originalFormat = "USDZ")
+        }
+
+        val ply = extractedPly
+        if (ply != null && ply.exists() && ply.length() > 0) {
+            return processIncomingModel(extractedDir, ply).copy(originalFormat = "USDZ")
         }
 
         val obj = extractedObj

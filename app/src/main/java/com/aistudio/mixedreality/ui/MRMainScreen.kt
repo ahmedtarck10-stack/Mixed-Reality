@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import com.aistudio.mixedreality.util.FlashlightHelper
+import com.aistudio.mixedreality.util.MRNotificationManager
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -90,6 +92,8 @@ fun MRMainScreen(
     var customModelFile by remember { mutableStateOf<File?>(null) }
     var isModelVisible by remember { mutableStateOf(true) }
     var isPreparingModelFile by remember { mutableStateOf(false) }
+    var preparingStatusMessage by remember { mutableStateOf("Streaming & optimizing 3D file...") }
+    var modelStatsSummary by remember { mutableStateOf<String?>(null) }
 
     // Visual attributes: realistic default PBR values for natural color representation
     var modelColor by remember { mutableStateOf(Color(0xFF00E5FF)) }
@@ -108,6 +112,22 @@ fun MRMainScreen(
 
     // Cloud 3D Library Sheet (Google Drive Models - Long press on Open)
     var showCloudLibrary by remember { mutableStateOf(false) }
+
+    // Notification permission & Android system shade sync
+    var hasNotificationPermission by remember {
+        mutableStateOf(MRNotificationManager.hasNotificationPermission(context))
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasNotificationPermission = isGranted
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     // Flashlight starts OFF and follows the user's external Control Center / Quick Settings toggle.
     // The app never turns the torch on or off automatically on launch, pause, or dispose.
@@ -140,45 +160,8 @@ fun MRMainScreen(
         }
     }
 
-    // Handle incoming 3D model files from external apps / file manager on background thread
-    LaunchedEffect(incomingModelUri) {
-        val uri = incomingModelUri ?: return@LaunchedEffect
-        isPreparingModelFile = true
-        val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
-        isPreparingModelFile = false
-        if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
-            customModelFile = copiedFile
-            isModelVisible = true
-            selectedMode = ViewportMode.OBJECT
-            modelQuaternion = SpatialQuaternion.IDENTITY
-            rotationX = 0f
-            rotationY = 0f
-            rotationZ = 0f
-            Toast.makeText(context, "Opened 3D model: ${copiedFile.name}", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(context, "Failed to load 3D model from file", Toast.LENGTH_SHORT).show()
-        }
-        onModelHandled()
-    }
-
-    // Handle App Shortcuts and Quick Settings tile launches
-    LaunchedEffect(shortcutAction) {
-        val action = shortcutAction ?: return@LaunchedEffect
-        when (action) {
-            "cloud_library" -> {
-                showCloudLibrary = true
-            }
-            "launch_ar" -> {
-                selectedMode = ViewportMode.AR
-            }
-        }
-        onShortcutHandled()
-    }
-
     // Bottom sheet for model tuning / presets
     var showTuneDrawer by remember { mutableStateOf(false) }
-
-
 
     // Shutter flash animation
     var showFlash by remember { mutableStateOf(false) }
@@ -219,6 +202,48 @@ fun MRMainScreen(
         }
     }
 
+    fun applyImportedModelOutcome(outcome: ModelImportOutcome, resetModeToObject: Boolean) {
+        val copiedFile = outcome.file
+        if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0L) {
+            customModelFile = copiedFile
+            isModelVisible = true
+            if (resetModeToObject) {
+                selectedMode = ViewportMode.OBJECT
+            }
+            modelQuaternion = SpatialQuaternion.IDENTITY
+            rotationX = 0f
+            rotationY = 0f
+            rotationZ = 0f
+            modelStatsSummary = outcome.statsLabel
+            Toast.makeText(context, outcome.message, Toast.LENGTH_SHORT).show()
+            MRNotificationManager.showEventNotification(
+                context = context,
+                title = "3D Model Ready • ${copiedFile.name}",
+                message = outcome.message,
+                isError = false
+            )
+        } else {
+            Toast.makeText(context, outcome.message, Toast.LENGTH_LONG).show()
+            MRNotificationManager.showEventNotification(
+                context = context,
+                title = "3D Model Failed to Load",
+                message = outcome.message,
+                isError = true
+            )
+        }
+    }
+
+    // Handle incoming 3D model files from external apps / file manager on background thread
+    LaunchedEffect(incomingModelUri) {
+        val uri = incomingModelUri ?: return@LaunchedEffect
+        isPreparingModelFile = true
+        preparingStatusMessage = "Streaming & optimizing 3D file..."
+        val outcome = withContext(Dispatchers.IO) { copyUriAndConvertModel(context, uri) }
+        isPreparingModelFile = false
+        applyImportedModelOutcome(outcome, resetModeToObject = true)
+        onModelHandled()
+    }
+
     // System Document / File Picker for 3D models (.glb, .gltf, .usdz, .obj, .3mf, .stl, .ply)
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -226,21 +251,57 @@ fun MRMainScreen(
         if (uri != null) {
             scope.launch {
                 isPreparingModelFile = true
-                val copiedFile = withContext(Dispatchers.IO) { copyUriToLocalCache(context, uri) }
+                preparingStatusMessage = "Streaming & optimizing 3D file..."
+                val outcome = withContext(Dispatchers.IO) { copyUriAndConvertModel(context, uri) }
                 isPreparingModelFile = false
-                if (copiedFile != null && copiedFile.exists() && copiedFile.length() > 0) {
-                    customModelFile = copiedFile
-                    isModelVisible = true
-                    modelQuaternion = SpatialQuaternion.IDENTITY
-                    rotationX = 0f
-                    rotationY = 0f
-                    rotationZ = 0f
-                    val fileName = copiedFile.name
-                    Toast.makeText(context, "Model loaded successfully: $fileName", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(context, "Unable to read 3D model file", Toast.LENGTH_SHORT).show()
-                }
+                applyImportedModelOutcome(outcome, resetModeToObject = false)
             }
+        }
+    }
+
+    // Handle App Shortcuts, Quick Settings tile, and System Notification quick actions
+    LaunchedEffect(shortcutAction) {
+        val action = shortcutAction ?: return@LaunchedEffect
+        when (action) {
+            MRNotificationManager.ACTION_CLOUD_LIBRARY -> {
+                showCloudLibrary = true
+            }
+            MRNotificationManager.ACTION_LAUNCH_AR -> {
+                if (!hasCameraPermission) {
+                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                }
+                selectedMode = ViewportMode.AR
+            }
+            MRNotificationManager.ACTION_OPEN_PICKER -> {
+                filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
+            }
+        }
+        onShortcutHandled()
+    }
+
+    // Keep persistent notification in Android's top pull-down shade / control center synced
+    LaunchedEffect(
+        hasNotificationPermission,
+        selectedMode,
+        customModelFile?.absolutePath,
+        selectedModel,
+        isModelVisible,
+        modelStatsSummary,
+        isRecording
+    ) {
+        if (hasNotificationPermission) {
+            val activeModelName = when {
+                !isModelVisible -> "Empty Scene"
+                customModelFile != null -> customModelFile!!.name
+                else -> selectedModel.title
+            }
+            MRNotificationManager.showSessionNotification(
+                context = context,
+                modeLabel = selectedMode.title,
+                modelLabel = activeModelName,
+                statsSummary = if (isModelVisible) modelStatsSummary else null,
+                isRecording = isRecording
+            )
         }
     }
 
@@ -312,7 +373,15 @@ fun MRMainScreen(
                     modelLoader = sharedModelLoader,
                     materialLoader = sharedMaterialLoader,
                     environmentLoader = sharedEnvironmentLoader,
-                    onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it }
+                    onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it },
+                    onModelError = { reason ->
+                        MRNotificationManager.showEventNotification(
+                            context = context,
+                            title = "3D Render Issue",
+                            message = reason,
+                            isError = true
+                        )
+                    }
                 )
             }
             ViewportMode.AR -> {
@@ -346,7 +415,15 @@ fun MRMainScreen(
                         engine = engine,
                         modelLoader = sharedModelLoader,
                         materialLoader = sharedMaterialLoader,
-                        environmentLoader = sharedEnvironmentLoader
+                        environmentLoader = sharedEnvironmentLoader,
+                        onModelError = { reason ->
+                            MRNotificationManager.showEventNotification(
+                                context = context,
+                                title = "AR Model Render Issue",
+                                message = reason,
+                                isError = true
+                            )
+                        }
                     )
                 } else {
                     PermissionRequestPlaceholder(onGrant = {
@@ -390,7 +467,15 @@ fun MRMainScreen(
                         onToggleFullScreen = { isFullScreen = !isFullScreen },
                         isFlashlightOn = isExternalTorchOn,
                         onStopAutoRotate = { isAutoRotating = false },
-                        onFallbackToObject = { selectedMode = ViewportMode.OBJECT }
+                        onFallbackToObject = { selectedMode = ViewportMode.OBJECT },
+                        onModelError = { reason ->
+                            MRNotificationManager.showEventNotification(
+                                context = context,
+                                title = "MR Model Render Issue",
+                                message = reason,
+                                isError = true
+                            )
+                        }
                     )
                 } else {
                     PermissionRequestPlaceholder(onGrant = {
@@ -474,6 +559,11 @@ fun MRMainScreen(
                                 val uri = MediaManager.saveBitmapToGallery(context, bitmap)
                                 if (uri != null) {
                                     Toast.makeText(context, "Photo saved to Gallery 📸", Toast.LENGTH_SHORT).show()
+                                    MRNotificationManager.showEventNotification(
+                                        context = context,
+                                        title = "Snapshot Saved",
+                                        message = "3D / AR screenshot saved to your Gallery."
+                                    )
                                 } else {
                                     Toast.makeText(context, "Photo captured", Toast.LENGTH_SHORT).show()
                                 }
@@ -500,6 +590,11 @@ fun MRMainScreen(
                             val uri = videoRecorder.stopRecording()
                             if (uri != null) {
                                 Toast.makeText(context, "Video saved to Gallery 🎥", Toast.LENGTH_LONG).show()
+                                MRNotificationManager.showEventNotification(
+                                    context = context,
+                                    title = "Video Recording Saved",
+                                    message = "Mixed Reality video clip saved to your Gallery."
+                                )
                             } else {
                                 Toast.makeText(context, "Recording finished", Toast.LENGTH_SHORT).show()
                             }
@@ -520,6 +615,7 @@ fun MRMainScreen(
                     // Remove model & prune old cached model folders to keep RAM & storage clean
                     isModelVisible = false
                     customModelFile = null
+                    modelStatsSummary = null
                     modelQuaternion = SpatialQuaternion.IDENTITY
                     rotationX = 0f
                     rotationY = 0f
@@ -559,7 +655,7 @@ fun MRMainScreen(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        text = "Optimizing & loading 3D file...",
+                        text = preparingStatusMessage,
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
@@ -632,24 +728,40 @@ fun MRMainScreen(
                     showCloudLibrary = false
                     scope.launch {
                         isPreparingModelFile = true
+                        preparingStatusMessage = "Processing $title..."
                         val converted = withContext(Dispatchers.IO) {
                             pruneStaleModelCache(context.cacheDir, keepFile = downloadedFile)
                             ModelFormatConverter.processIncomingModel(context, downloadedFile)
                         }
                         isPreparingModelFile = false
-                        customModelFile = converted.glbFile
-                        isModelVisible = true
-                        selectedMode = ViewportMode.OBJECT
-                        modelQuaternion = SpatialQuaternion.IDENTITY
-                        rotationX = 0f
-                        rotationY = 0f
-                        rotationZ = 0f
-                        Toast.makeText(context, "Loaded from Cloud: $title", Toast.LENGTH_SHORT).show()
+                        val statsLabel = if (converted.triangleCount > 0 || converted.vertexCount > 0) {
+                            "${formatCompactCount(converted.vertexCount)} verts • ${formatCompactCount(converted.triangleCount)} tris"
+                        } else null
+                        applyImportedModelOutcome(
+                            ModelImportOutcome(
+                                file = converted.glbFile,
+                                message = "Loaded from Cloud: $title (${converted.message})",
+                                statsLabel = statsLabel
+                            ),
+                            resetModeToObject = true
+                        )
                     }
                 }
             )
         }
     }
+}
+
+data class ModelImportOutcome(
+    val file: File?,
+    val message: String,
+    val statsLabel: String? = null
+)
+
+internal fun formatCompactCount(count: Int): String = when {
+    count >= 1_000_000 -> String.format(Locale.US, "%.1fM", count / 1_000_000.0)
+    count >= 1_000 -> String.format(Locale.US, "%.0fK", count / 1_000.0)
+    else -> count.toString()
 }
 
 internal fun pruneStaleModelCache(cacheDir: File, keepFile: File? = null) {
@@ -699,10 +811,11 @@ private fun sniffModelExtensionFromHeader(header: ByteArray, length: Int): Strin
 }
 
 /**
- * Streams a selected Content Uri to app's private cache directory using 256 KB buffered IO,
- * sniffs extensionless magic bytes, and delegates conversion to USDZ/OBJ/ZIP/GLTF/GLB.
+ * Streams a selected Content Uri to app's private cache directory using 512 KB buffered IO,
+ * sniffs extensionless magic bytes, delegates to StreamingMeshProcessor / ModelFormatConverter,
+ * and returns explicit success stats or exact failure diagnostics.
  */
-fun copyUriToLocalCache(context: Context, uri: Uri): File? {
+fun copyUriAndConvertModel(context: Context, uri: Uri): ModelImportOutcome {
     return try {
         pruneStaleModelCache(context.cacheDir)
 
@@ -720,11 +833,12 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
 
         val headerPeek = ByteArray(256)
         var headerLen = 0
+        val streamBufferBytes = 524_288
 
         context.contentResolver.openInputStream(uri)?.use { rawInput ->
-            BufferedInputStream(rawInput, 262_144).use { bufferedIn ->
-                BufferedOutputStream(tempOutFile.outputStream(), 262_144).use { bufferedOut ->
-                    val chunk = ByteArray(262_144)
+            BufferedInputStream(rawInput, streamBufferBytes).use { bufferedIn ->
+                BufferedOutputStream(tempOutFile.outputStream(), streamBufferBytes).use { bufferedOut ->
+                    val chunk = ByteArray(streamBufferBytes)
                     var firstChunk = true
                     while (true) {
                         val read = bufferedIn.read(chunk)
@@ -739,11 +853,11 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
                     bufferedOut.flush()
                 }
             }
-        } ?: return null
+        } ?: return ModelImportOutcome(null, "Storage provider returned no data stream for $cleanName")
 
         if (!tempOutFile.exists() || tempOutFile.length() == 0L) {
             tempOutFile.delete()
-            return null
+            return ModelImportOutcome(null, "Selected file is empty: $cleanName")
         }
 
         val finalExt = if (isRecognized3D) {
@@ -764,13 +878,26 @@ fun copyUriToLocalCache(context: Context, uri: Uri): File? {
         }
 
         val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile)
-        conversion.glbFile
-    } catch (_: OutOfMemoryError) {
-        null
-    } catch (_: Exception) {
-        null
+        val statsLabel = if (conversion.triangleCount > 0 || conversion.vertexCount > 0) {
+            "${formatCompactCount(conversion.vertexCount)} verts • ${formatCompactCount(conversion.triangleCount)} tris"
+        } else {
+            "${(conversion.glbFile.length() / (1024 * 1024).coerceAtLeast(1)).coerceAtLeast(1)} MB"
+        }
+        ModelImportOutcome(
+            file = conversion.glbFile,
+            message = conversion.message,
+            statsLabel = statsLabel
+        )
+    } catch (oom: OutOfMemoryError) {
+        System.gc()
+        ModelImportOutcome(null, "Not enough memory for model file: ${oom.message ?: "Out of memory"}")
+    } catch (t: Throwable) {
+        ModelImportOutcome(null, "Could not process 3D file: ${t.message ?: t::class.java.simpleName}")
     }
 }
+
+fun copyUriToLocalCache(context: Context, uri: Uri): File? =
+    copyUriAndConvertModel(context, uri).file
 
 /**
  * Extracts display filename from a Content Uri.

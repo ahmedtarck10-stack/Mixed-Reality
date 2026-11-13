@@ -41,6 +41,7 @@ class MainActivity : ComponentActivity() {
 
         incomingModelUri = extractModelUri(intent)
         shortcutAction = intent?.getStringExtra("shortcut_action")
+        com.aistudio.mixedreality.util.MRNotificationManager.ensureChannels(this)
 
         setContent {
             MixedRealityTheme {
@@ -97,6 +98,13 @@ class MainActivity : ComponentActivity() {
         intent.getStringExtra("shortcut_action")?.let { action ->
             shortcutAction = action
         }
+    }
+
+    override fun onDestroy() {
+        if (isFinishing) {
+            com.aistudio.mixedreality.util.MRNotificationManager.cancelSessionNotification(this)
+        }
+        super.onDestroy()
     }
 
     override fun onResume() {

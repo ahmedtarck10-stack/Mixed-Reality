@@ -89,7 +89,8 @@ fun ARTrackingSimulationView(
     engine: Engine,
     modelLoader: ModelLoader? = null,
     materialLoader: MaterialLoader? = null,
-    environmentLoader: EnvironmentLoader? = null
+    environmentLoader: EnvironmentLoader? = null,
+    onModelError: (String) -> Unit = {}
 ) {
     val localModelLoader = modelLoader ?: rememberModelLoader(engine)
     val localMaterialLoader = materialLoader ?: rememberMaterialLoader(engine)
@@ -163,10 +164,12 @@ fun ARTrackingSimulationView(
         null
     }
 
-    val customModelInstance = rememberOptimizedModelInstance(
+    val customModelState = rememberOptimizedModelState(
         modelLoader = localModelLoader,
-        customModelFile = customModelFile
+        customModelFile = customModelFile,
+        onModelError = onModelError
     )
+    val customModelInstance = (customModelState as? ModelLoadState.Ready)?.instance
 
     Box(
         modifier = modifier

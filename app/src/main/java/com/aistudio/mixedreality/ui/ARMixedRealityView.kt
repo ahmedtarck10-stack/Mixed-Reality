@@ -153,7 +153,8 @@ fun ARMixedRealityView(
     engine: Engine,
     modelLoader: ModelLoader? = null,
     materialLoader: MaterialLoader? = null,
-    environmentLoader: EnvironmentLoader? = null
+    environmentLoader: EnvironmentLoader? = null,
+    onModelError: (String) -> Unit = {}
 ) {
     val localModelLoader = modelLoader ?: rememberModelLoader(engine)
     val localMaterialLoader = materialLoader ?: rememberMaterialLoader(engine)
@@ -216,10 +217,12 @@ fun ARMixedRealityView(
         null
     }
 
-    val customModelInstance = rememberOptimizedModelInstance(
+    val customModelState = rememberOptimizedModelState(
         modelLoader = localModelLoader,
-        customModelFile = customModelFile
+        customModelFile = customModelFile,
+        onModelError = onModelError
     )
+    val customModelInstance = (customModelState as? ModelLoadState.Ready)?.instance
 
     val context = LocalContext.current
     val activity = context as? Activity
@@ -258,6 +261,7 @@ fun ARMixedRealityView(
             modelLoader = localModelLoader,
             materialLoader = localMaterialLoader,
             environmentLoader = localEnvironmentLoader,
+            onModelError = onModelError,
             modifier = modifier
         )
         return
@@ -746,6 +750,49 @@ fun ARMixedRealityView(
         }
 
         // --- OVERLAYS ---
+        if (customModelFile != null && isModelVisible) {
+            if (customModelState is ModelLoadState.Loading) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color.Black.copy(alpha = 0.78f), RoundedCornerShape(16.dp))
+                        .border(1.dp, NeonCyan.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 20.dp, vertical = 14.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = NeonCyan,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = customModelState.status,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            } else if (customModelState is ModelLoadState.Error) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(24.dp)
+                        .background(Color(0xE61F0D12), RoundedCornerShape(16.dp))
+                        .border(1.dp, RecButtonColor.copy(alpha = 0.7f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 20.dp, vertical = 14.dp)
+                ) {
+                    Text(
+                        text = customModelState.reason,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        }
 
         // Anchor Lock, Reset Anchor, and Move mode banners intentionally hidden for a distraction-free viewport
 
