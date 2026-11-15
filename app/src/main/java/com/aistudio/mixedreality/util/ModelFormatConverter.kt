@@ -31,7 +31,9 @@ object ModelFormatConverter {
         val triangleCount: Int,
         val vertexCount: Int,
         val message: String,
-        val isSuccess: Boolean = true
+        val isSuccess: Boolean = true,
+        val rawTriangleCount: Long = triangleCount.toLong(),
+        val rawVertexCount: Long = vertexCount.toLong()
     )
 
     /**
@@ -179,6 +181,8 @@ object ModelFormatConverter {
             "glb" -> {
                 val info = StreamingMeshProcessor.inspectGlbMetadata(sourceFile)
                 val finalFile: File
+                val rawVerts: Long
+                val rawTris: Long
                 val outVerts: Int
                 val outTris: Int
                 val msg: String
@@ -190,23 +194,35 @@ object ModelFormatConverter {
                     if (optimized != null && optimized.exists() && optimized.length() > 0L) {
                         val optInfo = StreamingMeshProcessor.inspectGlbMetadata(optimized)
                         finalFile = optimized
+                        rawVerts = info.vertexCount
+                        rawTris = info.triangleCount
                         outVerts = optInfo.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                         outTris = optInfo.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                         msg = "Dense GLB (${formatModelCount(info.triangleCount)} tris) optimized to ${formatModelCount(optInfo.triangleCount)} tris for GPU"
                     } else {
                         finalFile = sourceFile
+                        rawVerts = info.vertexCount
+                        rawTris = info.triangleCount
                         outVerts = info.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                         outTris = info.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                         msg = "Native GLB (${formatModelCount(info.triangleCount)} tris)"
                     }
                 } else {
                     finalFile = sourceFile
+                    rawVerts = info.vertexCount
+                    rawTris = info.triangleCount
                     outVerts = info.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                     outTris = info.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    val compressionNote = when {
+                        info.hasDraco && info.hasMeshopt -> " [Draco+Meshopt]"
+                        info.hasDraco -> " [Draco]"
+                        info.hasMeshopt -> " [Meshopt]"
+                        else -> ""
+                    }
                     msg = if (info.isValidGlb && info.triangleCount > 0L) {
-                        "Native GLB (${formatModelCount(info.triangleCount)} tris)"
+                        "Native GLB (${formatModelCount(info.triangleCount)} tris)$compressionNote"
                     } else {
-                        "Native GLB Model Loaded"
+                        "Native GLB Model Loaded$compressionNote"
                     }
                 }
 
@@ -216,7 +232,9 @@ object ModelFormatConverter {
                     triangleCount = outTris,
                     vertexCount = outVerts,
                     message = msg,
-                    isSuccess = true
+                    isSuccess = true,
+                    rawTriangleCount = rawTris,
+                    rawVertexCount = rawVerts
                 )
             }
             "stl" -> StreamingMeshProcessor.convertStlToGlb(cacheDir, sourceFile)
@@ -280,30 +298,8 @@ object ModelFormatConverter {
             }
             "obj" -> convertObjToGlb(cacheDir, sourceFile)
             "usdz", "zip" -> convertUsdzToGlb(cacheDir, sourceFile)
-            "usda" -> {
-                val proxyGlb = File(cacheDir, "${sourceFile.nameWithoutExtension}_usda.glb")
-                generateUsdzSpatialProxy(proxyGlb)
-                ConversionResult(
-                    glbFile = proxyGlb,
-                    originalFormat = "USDZ (Apple)",
-                    triangleCount = 12,
-                    vertexCount = 24,
-                    message = "USDA text format contains no compiled binary geometry. A bounding box proxy is shown.",
-                    isSuccess = false
-                )
-            }
-            "usdc" -> {
-                val proxyGlb = File(cacheDir, "${sourceFile.nameWithoutExtension}_usdc.glb")
-                generateUsdzSpatialProxy(proxyGlb)
-                ConversionResult(
-                    glbFile = proxyGlb,
-                    originalFormat = "USDZ (Apple)",
-                    triangleCount = 12,
-                    vertexCount = 24,
-                    message = "USDC binary Crate format contains proprietary Apple geometry. A bounding box proxy is shown.",
-                    isSuccess = false
-                )
-            }
+            "usda" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false)
+            "usdc", "usd" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false)
             else -> {
                 ConversionResult(
                     glbFile = sourceFile,
@@ -317,11 +313,7 @@ object ModelFormatConverter {
         }
     }
 
-    private fun formatModelCount(n: Long): String = when {
-        n >= 1_000_000L -> String.format(java.util.Locale.US, "%.1fM", n / 1_000_000.0)
-        n >= 1_000L -> String.format(java.util.Locale.US, "%.0fK", n / 1_000.0)
-        else -> n.toString()
-    }
+    private fun formatModelCount(n: Long): String = StreamingMeshProcessor.formatCompact(n)
 
     fun convertObjToGlb(context: Context, objFile: File): ConversionResult =
         convertObjToGlb(context.cacheDir, objFile)
@@ -661,7 +653,9 @@ object ModelFormatConverter {
         var extracted3mf: File? = null
         var extractedStl: File? = null
         var extractedPly: File? = null
-        val extractedDir = File(cacheDir, "usdz_${System.currentTimeMillis()}")
+        var hasUsdFiles = false
+        val allExtractedFiles = mutableListOf<File>()
+        val extractedDir = File(cacheDir, "usdz_${System.currentTimeMillis()}_${System.nanoTime()}")
         extractedDir.mkdirs()
         val canonicalRoot = extractedDir.canonicalPath + File.separator
 
@@ -682,6 +676,7 @@ object ModelFormatConverter {
                                     read = zis.read(copyBuffer)
                                 }
                             }
+                            allExtractedFiles.add(outFile)
                             when {
                                 name.endsWith(".glb", ignoreCase = true) && extractedGlb == null -> extractedGlb = outFile
                                 name.endsWith(".gltf", ignoreCase = true) && extractedGltf == null -> extractedGltf = outFile
@@ -689,6 +684,9 @@ object ModelFormatConverter {
                                 name.endsWith(".3mf", ignoreCase = true) && extracted3mf == null -> extracted3mf = outFile
                                 name.endsWith(".stl", ignoreCase = true) && extractedStl == null -> extractedStl = outFile
                                 name.endsWith(".ply", ignoreCase = true) && extractedPly == null -> extractedPly = outFile
+                                name.endsWith(".usdc", ignoreCase = true) ||
+                                    name.endsWith(".usda", ignoreCase = true) ||
+                                    name.endsWith(".usd", ignoreCase = true) -> hasUsdFiles = true
                             }
                         }
                     }
@@ -703,6 +701,19 @@ object ModelFormatConverter {
         val glb = extractedGlb
         if (glb != null && glb.exists() && glb.length() > 0) {
             return processIncomingModel(extractedDir, glb).copy(originalFormat = "USDZ")
+        }
+
+        if (hasUsdFiles) {
+            val usdResult = UsdMeshConverter.convertExtractedUsd(
+                cacheDir = cacheDir,
+                usdFile = usdzFile,
+                extractDir = extractedDir,
+                rootFiles = allExtractedFiles
+            )
+            if (usdResult.isSuccess) {
+                runCatching { extractedDir.deleteRecursively() }
+                return usdResult
+            }
         }
 
         val gltf = extractedGltf
@@ -734,10 +745,13 @@ object ModelFormatConverter {
                 triangleCount = converted.triangleCount,
                 vertexCount = converted.vertexCount,
                 message = "Extracted & Converted Archive OBJ Model",
-                isSuccess = converted.isSuccess
+                isSuccess = converted.isSuccess,
+                rawTriangleCount = converted.rawTriangleCount,
+                rawVertexCount = converted.rawVertexCount
             )
         }
 
+        runCatching { extractedDir.deleteRecursively() }
         val proxyGlb = File(cacheDir, "${usdzFile.nameWithoutExtension}_usdz.glb")
         generateUsdzSpatialProxy(proxyGlb)
         return ConversionResult(
@@ -745,8 +759,10 @@ object ModelFormatConverter {
             originalFormat = "USDZ (Apple)",
             triangleCount = 12,
             vertexCount = 24,
-            message = "Apple USDZ contains proprietary binary USDC/USDA. A spatial bounding proxy is shown; convert to GLB for full fidelity.",
-            isSuccess = false
+            message = "USDZ archive is corrupted or contains no 3D mesh geometry.",
+            isSuccess = false,
+            rawTriangleCount = 12L,
+            rawVertexCount = 24L
         )
     }
 

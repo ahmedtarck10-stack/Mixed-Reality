@@ -734,8 +734,8 @@ fun MRMainScreen(
                             ModelFormatConverter.processIncomingModel(context, downloadedFile)
                         }
                         isPreparingModelFile = false
-                        val statsLabel = if (converted.triangleCount > 0 || converted.vertexCount > 0) {
-                            "${formatCompactCount(converted.vertexCount)} verts • ${formatCompactCount(converted.triangleCount)} tris"
+                        val statsLabel = if (converted.rawTriangleCount > 0L || converted.rawVertexCount > 0L) {
+                            "${formatCompactCount(converted.rawVertexCount)} verts • ${formatCompactCount(converted.rawTriangleCount)} tris"
                         } else null
                         applyImportedModelOutcome(
                             ModelImportOutcome(
@@ -758,11 +758,10 @@ data class ModelImportOutcome(
     val statsLabel: String? = null
 )
 
-internal fun formatCompactCount(count: Int): String = when {
-    count >= 1_000_000 -> String.format(Locale.US, "%.1fM", count / 1_000_000.0)
-    count >= 1_000 -> String.format(Locale.US, "%.0fK", count / 1_000.0)
-    else -> count.toString()
-}
+internal fun formatCompactCount(count: Int): String = formatCompactCount(count.toLong())
+
+internal fun formatCompactCount(count: Long): String =
+    com.aistudio.mixedreality.util.StreamingMeshProcessor.formatCompact(count)
 
 internal fun pruneStaleModelCache(cacheDir: File, keepFile: File? = null) {
     val keepPath = runCatching { keepFile?.canonicalPath }.getOrNull()
@@ -786,6 +785,16 @@ internal fun pruneStaleModelCache(cacheDir: File, keepFile: File? = null) {
 }
 
 private fun sniffModelExtensionFromHeader(header: ByteArray, length: Int): String? {
+    if (length >= 8) {
+        // Binary OpenUSD Crate ('PXR-USDC')
+        if (header[0] == 'P'.code.toByte() && header[1] == 'X'.code.toByte() &&
+            header[2] == 'R'.code.toByte() && header[3] == '-'.code.toByte() &&
+            header[4] == 'U'.code.toByte() && header[5] == 'S'.code.toByte() &&
+            header[6] == 'D'.code.toByte() && header[7] == 'C'.code.toByte()
+        ) {
+            return "usdc"
+        }
+    }
     if (length >= 4) {
         // Binary glTF ('glTF')
         if (header[0] == 'g'.code.toByte() && header[1] == 'l'.code.toByte() &&
@@ -802,6 +811,7 @@ private fun sniffModelExtensionFromHeader(header: ByteArray, length: Int): Strin
     }
     val text = String(header, 0, length.coerceAtMost(256), Charsets.UTF_8).trimStart()
     return when {
+        text.startsWith("#usda", ignoreCase = true) -> "usda"
         text.startsWith("{") -> "gltf"
         text.startsWith("ply\n", ignoreCase = true) || text.startsWith("ply\r", ignoreCase = true) -> "ply"
         text.startsWith("solid ", ignoreCase = true) -> "stl"
@@ -878,8 +888,8 @@ fun copyUriAndConvertModel(context: Context, uri: Uri): ModelImportOutcome {
         }
 
         val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile)
-        val statsLabel = if (conversion.triangleCount > 0 || conversion.vertexCount > 0) {
-            "${formatCompactCount(conversion.vertexCount)} verts • ${formatCompactCount(conversion.triangleCount)} tris"
+        val statsLabel = if (conversion.rawTriangleCount > 0L || conversion.rawVertexCount > 0L) {
+            "${formatCompactCount(conversion.rawVertexCount)} verts • ${formatCompactCount(conversion.rawTriangleCount)} tris"
         } else {
             "${(conversion.glbFile.length() / (1024 * 1024).coerceAtLeast(1)).coerceAtLeast(1)} MB"
         }

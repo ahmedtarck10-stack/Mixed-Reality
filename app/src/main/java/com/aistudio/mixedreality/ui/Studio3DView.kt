@@ -136,7 +136,11 @@ fun Studio3DView(
 
     val currentOrientation by rememberUpdatedState(orientation)
     val renderQuality = remember(customModelFile?.absolutePath) {
-        if (customModelFile != null && customModelFile.length() > 4L * 1024L * 1024L) {
+        if (customModelFile != null && (
+                customModelFile.length() > 2L * 1024L * 1024L ||
+                    com.aistudio.mixedreality.util.StreamingMeshProcessor.inspectGlbMetadata(customModelFile).isHeavyForMobile
+                )
+        ) {
             RenderQuality.Performance
         } else {
             RenderQuality.Default

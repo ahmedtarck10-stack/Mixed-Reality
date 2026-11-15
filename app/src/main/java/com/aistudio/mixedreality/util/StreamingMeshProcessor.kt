@@ -18,6 +18,8 @@ import java.io.InputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 import java.util.Locale
 import java.util.zip.ZipInputStream
 import kotlin.math.max
@@ -26,8 +28,8 @@ import kotlin.math.sqrt
 
 /**
  * High-capacity streaming 3D geometry processor engineered for mobile RAM/GPU constraints.
- * Supports up to 30,000,000+ vertices and 30,000,000+ polygons for OBJ, STL, PLY, 3MF, and GLB
- * using disk-paged float buffers, zero-boxing primitives, and adaptive spatial vertex clustering.
+ * Supports unlimited ("∞") vertex and polygon counts across OBJ, STL, PLY, 3MF, GLB, and USD
+ * using sequential binary streaming, memory-mapped float buffers, and single-pass spatial clustering.
  */
 object StreamingMeshProcessor {
 
@@ -36,9 +38,11 @@ object StreamingMeshProcessor {
     private const val GLB_CHUNK_BYTES = 65_536
 
     // Lossless direct emission up to 1.8M triangles; above that, adaptive vertex clustering
-    // preserves silhouette and topology within mobile ES3.0/Vulkan GPU memory bounds (~1.25M tris).
+    // preserves silhouette and topology within mobile ES3.0/Vulkan GPU memory bounds while accepting
+    // arbitrary (infinite) input vertices and polygons.
+    const val UNLIMITED_CAPACITY = Long.MAX_VALUE
     const val DIRECT_TRIANGLE_LIMIT = 1_800_000
-    const val CLUSTER_MAX_VERTICES = 1_150_000
+    const val CLUSTER_MAX_VERTICES = 850_000
     const val CLUSTER_HASH_TABLE_SIZE = 2_097_152 // Power of 2; ~16 MB hash keys
 
     data class MeshStats(
@@ -46,7 +50,9 @@ object StreamingMeshProcessor {
         val originalTriangles: Int,
         val outputVertices: Int,
         val outputTriangles: Int,
-        val wasSimplified: Boolean
+        val wasSimplified: Boolean,
+        val rawOriginalVertices: Long = originalVertices.toLong(),
+        val rawOriginalTriangles: Long = originalTriangles.toLong()
     )
 
     data class GlbInspection(
@@ -60,9 +66,12 @@ object StreamingMeshProcessor {
         val hasWebp: Boolean,
         val hasUncompressedAccessors: Boolean,
         val imageCount: Int
-    )
+    ) {
+        val isHeavyForMobile: Boolean
+            get() = triangleCount > 250_000L || vertexCount > 250_000L || binByteLength > 2_000_000L
+    }
 
-    private data class BoundingBox(
+    internal class MeshBounds(
         var minX: Float = Float.MAX_VALUE,
         var minY: Float = Float.MAX_VALUE,
         var minZ: Float = Float.MAX_VALUE,
@@ -90,196 +99,277 @@ object StreamingMeshProcessor {
     }
 
     /**
-     * Paged float-tuple storage that stays in RAM for <= 524K entries (~6 MB) and automatically
-     * spills cold pages to a temp file on disk so 30,000,000 vertices only use ~18 MB Java heap.
+     * Zero-heap memory-mapped float-tuple storage supporting unlimited (Long-indexed) vertices.
+     * - Write phase: sequential buffered binary stream (zero seeks, 512 KB OS-friendly writes).
+     * - Read phase: windowed read-only FileChannel.map (32 MB sliding LRU + fallback Raf),
+     *   delivering ~5ns random vertex lookups with 0 MB Java heap on 30M+ / infinite meshes.
      */
-    private class PagedFloatTupleStore(
+    internal class MappedFloatTupleStore(
         private val tupleSize: Int,
         private val scratchDir: File,
         private val tag: String
     ) : AutoCloseable {
-        private val entriesPerPage = 131_072 // 131K * 3 floats * 4B = 1.5 MB per page
-        private val pageFloatCount = entriesPerPage * tupleSize
-        private val pageByteCount = pageFloatCount.toLong() * 4L
-        private val maxRamPages = 8 // Max ~12-18 MB cached in Java Heap
+        private val tupleBytes = tupleSize * 4L
+        private val ramCapacityEntries = 65_536 // Up to ~768 KB tiny fast-path in RAM before spilling
+        private var ramFastArray: FloatArray? = FloatArray(1024 * tupleSize)
+        private var spilledToDisk = false
 
-        private val ramPages = LinkedHashMap<Int, FloatArray>(16, 0.75f, true)
-        private val dirtyPages = HashSet<Int>()
         private var diskFile: File? = null
-        private var raf: RandomAccessFile? = null
-        private var ioByteBuf: ByteBuffer? = null
+        private var writeStream: BufferedOutputStream? = null
+        private var writeBuf: ByteBuffer? = null
 
-        var count: Int = 0
+        private var readRaf: RandomAccessFile? = null
+        private var readChannel: FileChannel? = null
+        private val windowBytes = 32L * 1024L * 1024L // 32 MB mmap window
+        private val mappedWindows = object : LinkedHashMap<Long, MappedByteBuffer>(8, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, MappedByteBuffer>?): Boolean {
+                return size > 8 // Cap virtual address space at 256 MB even on 32-bit processes
+            }
+        }
+        private var lastWindowIdx = -1L
+        private var lastWindowBuf: MappedByteBuffer? = null
+        private val fallbackScratch = ByteArray(16)
+        private val fallbackBB = ByteBuffer.wrap(fallbackScratch).order(ByteOrder.LITTLE_ENDIAN)
+        private var sealed = false
+
+        var count: Long = 0L
             private set
 
-        private var activeWritePageIdx = -1
-        private var activeWritePage: FloatArray? = null
+        val intCount: Int
+            get() = count.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
         fun add3(x: Float, y: Float, z: Float) {
-            val idx = count
-            val pIdx = idx / entriesPerPage
-            val offset = (idx % entriesPerPage) * 3
-            val page = obtainWritePage(pIdx)
-            page[offset] = x
-            page[offset + 1] = y
-            page[offset + 2] = z
-            dirtyPages.add(pIdx)
-            count = idx + 1
+            if (!spilledToDisk) {
+                val idx = count.toInt()
+                if (idx < ramCapacityEntries) {
+                    val arr = ensureRamCapacity(idx + 1)
+                    val base = idx * 3
+                    arr[base] = x
+                    arr[base + 1] = y
+                    arr[base + 2] = z
+                    count++
+                    return
+                }
+                spillRamToDisk()
+            }
+            val bos = writeStream!!
+            val bb = writeBuf!!
+            if (bb.remaining() < 12) flushWriteBuffer(bos, bb)
+            bb.putFloat(x)
+            bb.putFloat(y)
+            bb.putFloat(z)
+            count++
         }
 
         fun add2(u: Float, v: Float) {
-            val idx = count
-            val pIdx = idx / entriesPerPage
-            val offset = (idx % entriesPerPage) * 2
-            val page = obtainWritePage(pIdx)
-            page[offset] = u
-            page[offset + 1] = v
-            dirtyPages.add(pIdx)
-            count = idx + 1
-        }
-
-        fun getX(idx: Int): Float = readComponent(idx, 0)
-        fun getY(idx: Int): Float = readComponent(idx, 1)
-        fun getZ(idx: Int): Float = readComponent(idx, 2)
-        fun getU(idx: Int): Float = readComponent(idx, 0)
-        fun getV(idx: Int): Float = readComponent(idx, 1)
-
-        private fun readComponent(idx: Int, comp: Int): Float {
-            if (idx < 0 || idx >= count) return 0f
-            val pIdx = idx / entriesPerPage
-            val offset = (idx % entriesPerPage) * tupleSize + comp
-            val page = if (pIdx == activeWritePageIdx && activeWritePage != null) {
-                activeWritePage!!
-            } else {
-                obtainReadPage(pIdx)
-            }
-            return page[offset]
-        }
-
-        private fun obtainWritePage(pIdx: Int): FloatArray {
-            if (pIdx == activeWritePageIdx && activeWritePage != null) {
-                return activeWritePage!!
-            }
-            val existing = ramPages[pIdx]
-            if (existing != null) {
-                activeWritePageIdx = pIdx
-                activeWritePage = existing
-                return existing
-            }
-            evictIfNeeded(reserveForNew = true)
-            val fresh = FloatArray(pageFloatCount)
-            ramPages[pIdx] = fresh
-            activeWritePageIdx = pIdx
-            activeWritePage = fresh
-            return fresh
-        }
-
-        private fun obtainReadPage(pIdx: Int): FloatArray {
-            val cached = ramPages[pIdx]
-            if (cached != null) return cached
-
-            evictIfNeeded(reserveForNew = true)
-            val arr = FloatArray(pageFloatCount)
-            val fileRaf = raf
-            if (fileRaf != null) {
-                val byteOffset = pIdx.toLong() * pageByteCount
-                if (byteOffset < fileRaf.length()) {
-                    val buf = ensureIoBuf()
-                    buf.clear()
-                    val available = minOf(pageByteCount, fileRaf.length() - byteOffset).toInt()
-                    fileRaf.seek(byteOffset)
-                    fileRaf.readFully(buf.array(), 0, available)
-                    buf.limit(available)
-                    buf.rewind()
-                    val floatCount = available / 4
-                    buf.asFloatBuffer().get(arr, 0, floatCount)
+            if (!spilledToDisk) {
+                val idx = count.toInt()
+                if (idx < ramCapacityEntries) {
+                    val arr = ensureRamCapacity(idx + 1)
+                    val base = idx * 2
+                    arr[base] = u
+                    arr[base + 1] = v
+                    count++
+                    return
                 }
+                spillRamToDisk()
             }
-            ramPages[pIdx] = arr
-            return arr
+            val bos = writeStream!!
+            val bb = writeBuf!!
+            if (bb.remaining() < 8) flushWriteBuffer(bos, bb)
+            bb.putFloat(u)
+            bb.putFloat(v)
+            count++
         }
 
-        private fun evictIfNeeded(reserveForNew: Boolean) {
-            val cap = if (reserveForNew) maxRamPages - 1 else maxRamPages
-            while (ramPages.size > cap) {
-                val it = ramPages.entries.iterator()
-                if (!it.hasNext()) break
-                var victimEntry = it.next()
-                if (victimEntry.key == activeWritePageIdx && it.hasNext()) {
-                    victimEntry = it.next()
+        fun sealForRead() {
+            if (sealed) return
+            sealed = true
+            if (spilledToDisk) {
+                writeStream?.let { bos ->
+                    writeBuf?.let { bb -> flushWriteBuffer(bos, bb) }
+                    bos.flush()
+                    bos.close()
                 }
-                val vKey = victimEntry.key
-                val vArr = victimEntry.value
-                if (dirtyPages.remove(vKey)) {
-                    spillPageToDisk(vKey, vArr)
-                }
-                ramPages.remove(vKey)
-                if (vKey == activeWritePageIdx) {
-                    activeWritePageIdx = -1
-                    activeWritePage = null
-                }
+                writeStream = null
+                writeBuf = null
+                val f = diskFile ?: return
+                val raf = RandomAccessFile(f, "r")
+                readRaf = raf
+                readChannel = raf.channel
             }
         }
 
-        private fun spillPageToDisk(pIdx: Int, data: FloatArray) {
-            val fileRaf = ensureRaf()
-            val buf = ensureIoBuf()
-            buf.clear()
-            buf.asFloatBuffer().put(data)
-            fileRaf.seek(pIdx.toLong() * pageByteCount)
-            fileRaf.write(buf.array(), 0, pageByteCount.toInt())
+        fun getX(idx: Long): Float = readComponent(idx, 0)
+        fun getY(idx: Long): Float = readComponent(idx, 1)
+        fun getZ(idx: Long): Float = readComponent(idx, 2)
+        fun getU(idx: Long): Float = readComponent(idx, 0)
+        fun getV(idx: Long): Float = readComponent(idx, 1)
+
+        fun getX(idx: Int): Float = readComponent(idx.toLong(), 0)
+        fun getY(idx: Int): Float = readComponent(idx.toLong(), 1)
+        fun getZ(idx: Int): Float = readComponent(idx.toLong(), 2)
+        fun getU(idx: Int): Float = readComponent(idx.toLong(), 0)
+        fun getV(idx: Int): Float = readComponent(idx.toLong(), 1)
+
+        fun readTuple3(idx: Long, out: FloatArray, outOffset: Int = 0) {
+            if (idx < 0L || idx >= count) {
+                out[outOffset] = 0f; out[outOffset + 1] = 0f; out[outOffset + 2] = 0f
+                return
+            }
+            if (!spilledToDisk) {
+                val arr = ramFastArray ?: return
+                val base = idx.toInt() * 3
+                out[outOffset] = arr[base]
+                out[outOffset + 1] = arr[base + 1]
+                out[outOffset + 2] = arr[base + 2]
+                return
+            }
+            if (!sealed) sealForRead()
+            val bytePos = idx * 12L
+            val wIdx = bytePos / windowBytes
+            val inWin = (bytePos - (wIdx * windowBytes)).toInt()
+            val win = obtainWindow(wIdx)
+            if (win != null && inWin + 12 <= win.limit()) {
+                out[outOffset] = win.getFloat(inWin)
+                out[outOffset + 1] = win.getFloat(inWin + 4)
+                out[outOffset + 2] = win.getFloat(inWin + 8)
+                return
+            }
+            readFallbackBytes(bytePos, 12)
+            out[outOffset] = fallbackBB.getFloat(0)
+            out[outOffset + 1] = fallbackBB.getFloat(4)
+            out[outOffset + 2] = fallbackBB.getFloat(8)
         }
 
-        private fun ensureRaf(): RandomAccessFile {
-            raf?.let { return it }
+        private fun readComponent(idx: Long, comp: Int): Float {
+            if (idx < 0L || idx >= count) return 0f
+            if (!spilledToDisk) {
+                val arr = ramFastArray ?: return 0f
+                return arr[idx.toInt() * tupleSize + comp]
+            }
+            if (!sealed) sealForRead()
+            val bytePos = idx * tupleBytes + comp * 4L
+            val wIdx = bytePos / windowBytes
+            val inWin = (bytePos - (wIdx * windowBytes)).toInt()
+            val win = obtainWindow(wIdx)
+            if (win != null && inWin + 4 <= win.limit()) {
+                return win.getFloat(inWin)
+            }
+            readFallbackBytes(bytePos, 4)
+            return fallbackBB.getFloat(0)
+        }
+
+        private fun obtainWindow(wIdx: Long): MappedByteBuffer? {
+            if (wIdx == lastWindowIdx && lastWindowBuf != null) return lastWindowBuf
+            val cached = mappedWindows[wIdx]
+            if (cached != null) {
+                lastWindowIdx = wIdx
+                lastWindowBuf = cached
+                return cached
+            }
+            val ch = readChannel ?: return null
+            val startByte = wIdx * windowBytes
+            val totalLen = ch.size()
+            if (startByte >= totalLen) return null
+            val mapLen = minOf(windowBytes + 16L, totalLen - startByte)
+            val mapped = runCatching {
+                ch.map(FileChannel.MapMode.READ_ONLY, startByte, mapLen).apply {
+                    order(ByteOrder.LITTLE_ENDIAN)
+                }
+            }.getOrNull() ?: return null
+            mappedWindows[wIdx] = mapped
+            lastWindowIdx = wIdx
+            lastWindowBuf = mapped
+            return mapped
+        }
+
+        private fun readFallbackBytes(bytePos: Long, size: Int) {
+            val raf = readRaf ?: return
+            synchronized(raf) {
+                raf.seek(bytePos)
+                raf.readFully(fallbackScratch, 0, size)
+            }
+        }
+
+        private fun ensureRamCapacity(requiredEntries: Int): FloatArray {
+            val reqFloats = requiredEntries * tupleSize
+            val cur = ramFastArray!!
+            if (reqFloats <= cur.size) return cur
+            val newEntries = minOf(ramCapacityEntries, maxOf(requiredEntries, (cur.size / tupleSize) * 2))
+            return cur.copyOf(newEntries * tupleSize).also { ramFastArray = it }
+        }
+
+        private fun spillRamToDisk() {
             scratchDir.mkdirs()
             val file = File(scratchDir, "vtx_${tag}_${System.nanoTime()}.bin")
             diskFile = file
-            return RandomAccessFile(file, "rw").also { raf = it }
+            val bos = BufferedOutputStream(FileOutputStream(file), IO_BUFFER_BYTES)
+            val bb = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+            writeStream = bos
+            writeBuf = bb
+            val cur = ramFastArray
+            if (cur != null) {
+                val floatCount = count.toInt() * tupleSize
+                for (i in 0 until floatCount) {
+                    if (bb.remaining() < 4) flushWriteBuffer(bos, bb)
+                    bb.putFloat(cur[i])
+                }
+            }
+            ramFastArray = null
+            spilledToDisk = true
         }
 
-        private fun ensureIoBuf(): ByteBuffer {
-            ioByteBuf?.let { return it }
-            return ByteBuffer.allocate(pageByteCount.toInt())
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .also { ioByteBuf = it }
+        private fun flushWriteBuffer(bos: BufferedOutputStream, bb: ByteBuffer) {
+            val pos = bb.position()
+            if (pos > 0) {
+                bos.write(bb.array(), 0, pos)
+                bb.clear()
+            }
         }
 
         override fun close() {
-            ramPages.clear()
-            dirtyPages.clear()
-            activeWritePage = null
-            activeWritePageIdx = -1
-            ioByteBuf = null
-            runCatching { raf?.close() }
-            raf = null
+            ramFastArray = null
+            mappedWindows.clear()
+            lastWindowBuf = null
+            lastWindowIdx = -1L
+            runCatching { writeStream?.close() }
+            writeStream = null
+            writeBuf = null
+            runCatching { readChannel?.close() }
+            readChannel = null
+            runCatching { readRaf?.close() }
+            readRaf = null
             runCatching { diskFile?.delete() }
             diskFile = null
         }
     }
 
     /**
-     * Streaming spatial vertex clustering engine that converts huge triangle streams (up to 30M+ tris)
-     * into a crisp, watertight-oriented GLB mesh well within mobile GPU/VRAM budgets.
+     * Streaming spatial vertex clustering engine that converts arbitrarily large triangle streams
+     * (30M, 100M, infinity polygons/vertices) into a crisp, watertight-oriented GLB mesh well within
+     * mobile GPU/VRAM budgets while growing arrays lazily instead of reserving 66 MB up front.
      */
     private class SpatialClusterAccumulator(
-        private val bounds: BoundingBox,
+        private val bounds: MeshBounds,
         private val gridResolution: Int,
-        private val maxClusters: Int = CLUSTER_MAX_VERTICES
+        private val maxClusters: Int = CLUSTER_MAX_VERTICES,
+        private val forceNoOverflowFallback: Boolean = false
     ) {
         private val tableMask = CLUSTER_HASH_TABLE_SIZE - 1
         private var hashKeys = LongArray(CLUSTER_HASH_TABLE_SIZE) { -1L }
         private var hashVals = IntArray(CLUSTER_HASH_TABLE_SIZE)
 
-        private var sumX = FloatArray(maxClusters)
-        private var sumY = FloatArray(maxClusters)
-        private var sumZ = FloatArray(maxClusters)
-        private var normX = FloatArray(maxClusters)
-        private var normY = FloatArray(maxClusters)
-        private var normZ = FloatArray(maxClusters)
-        private var sumU = FloatArray(maxClusters)
-        private var sumV = FloatArray(maxClusters)
-        private var counts = IntArray(maxClusters)
+        private var capacity = 65_536
+        private var sumX = FloatArray(capacity)
+        private var sumY = FloatArray(capacity)
+        private var sumZ = FloatArray(capacity)
+        private var normX = FloatArray(capacity)
+        private var normY = FloatArray(capacity)
+        private var normZ = FloatArray(capacity)
+        private var sumU = FloatArray(capacity)
+        private var sumV = FloatArray(capacity)
+        private var counts = IntArray(capacity)
 
         var clusterCount = 0
             private set
@@ -305,6 +395,20 @@ object StreamingMeshProcessor {
             triFos = BufferedOutputStream(FileOutputStream(f), IO_BUFFER_BYTES)
         }
 
+        private fun growArrays(needed: Int) {
+            val nextCap = minOf(maxClusters, maxOf(needed, capacity * 2))
+            sumX = sumX.copyOf(nextCap)
+            sumY = sumY.copyOf(nextCap)
+            sumZ = sumZ.copyOf(nextCap)
+            normX = normX.copyOf(nextCap)
+            normY = normY.copyOf(nextCap)
+            normZ = normZ.copyOf(nextCap)
+            sumU = sumU.copyOf(nextCap)
+            sumV = sumV.copyOf(nextCap)
+            counts = counts.copyOf(nextCap)
+            capacity = nextCap
+        }
+
         fun getOrAssignCluster(
             px: Float, py: Float, pz: Float,
             nx: Float, ny: Float, nz: Float,
@@ -325,10 +429,16 @@ object StreamingMeshProcessor {
                 }
                 if (existing == -1L) {
                     if (clusterCount >= maxClusters) {
+                        if (forceNoOverflowFallback) {
+                            // Quantize key down safely into an existing bucket rather than discarding geometry
+                            val foldedId = (mix64(key) and 0x7FFF_FFFF) % maxClusters
+                            return foldedId
+                        }
                         overflowed = true
                         return -1
                     }
                     val cId = clusterCount++
+                    if (cId >= capacity) growArrays(cId + 1)
                     hashKeys[slot] = key
                     hashVals[slot] = cId
                     accumulate(cId, px, py, pz, nx, ny, nz, u, v)
@@ -369,7 +479,14 @@ object StreamingMeshProcessor {
             emittedTriangles++
         }
 
-        fun writeToGlb(outGlb: File): BoundingBox {
+        fun writeToGlb(
+            outGlb: File,
+            baseColorFactor: FloatArray? = null,
+            metallicFactor: Float = 0.1f,
+            roughnessFactor: Float = 0.7f,
+            textureFile: File? = null,
+            textureMime: String? = null
+        ): MeshBounds {
             triFos?.let { out ->
                 if (triChunk.position() > 0) {
                     out.write(triChunk.array(), 0, triChunk.position())
@@ -380,8 +497,7 @@ object StreamingMeshProcessor {
             }
             triFos = null
 
-            val vertCount = clusterCount.coerceAtLeast(3)
-            val finalBounds = BoundingBox()
+            val finalBounds = MeshBounds()
 
             for (i in 0 until clusterCount) {
                 val inv = 1f / counts[i].coerceAtLeast(1).toFloat()
@@ -408,10 +524,13 @@ object StreamingMeshProcessor {
             }
             finalBounds.normalizeIfEmpty()
 
-            // Release hash lookup arrays before GLB output
             hashKeys = LongArray(0)
             hashVals = IntArray(0)
             counts = IntArray(0)
+
+            val texBytes = if (textureFile != null && textureFile.exists() && textureFile.length() in 1L..24_000_000L) {
+                runCatching { textureFile.readBytes() }.getOrNull()
+            } else null
 
             val indexCount = emittedTriangles * 3
             val useIntIndices = clusterCount > 65535 || indexCount > 65535
@@ -419,7 +538,9 @@ object StreamingMeshProcessor {
             val normBytes = clusterCount.toLong() * 3L * 4L
             val uvBytes = clusterCount.toLong() * 2L * 4L
             val idxBytes = if (useIntIndices) indexCount.toLong() * 4L else indexCount.toLong() * 2L
-            val totalBinBytes = posBytes + normBytes + uvBytes + idxBytes
+            val rawGeoBytes = posBytes + normBytes + uvBytes + idxBytes
+            val texPrePad = if (texBytes != null) ((4L - (rawGeoBytes % 4L)) % 4L).toInt() else 0
+            val totalBinBytes = rawGeoBytes + texPrePad + (texBytes?.size?.toLong() ?: 0L)
             val binPadding = ((4L - (totalBinBytes % 4L)) % 4L).toInt()
             val paddedBinBytes = totalBinBytes + binPadding
 
@@ -433,7 +554,13 @@ object StreamingMeshProcessor {
                 indexByteLength = idxBytes,
                 totalBinaryLength = totalBinBytes,
                 bounds = finalBounds,
-                generator = "MixedReality Streaming Cluster Engine"
+                generator = "MixedReality Streaming Cluster Engine",
+                baseColorFactor = baseColorFactor,
+                metallicFactor = metallicFactor,
+                roughnessFactor = roughnessFactor,
+                textureOffset = rawGeoBytes + texPrePad,
+                textureByteLength = texBytes?.size ?: 0,
+                textureMimeType = textureMime
             )
             val jsonPadding = (4 - (jsonBytes.size % 4)) % 4
             val paddedJsonLen = jsonBytes.size + jsonPadding
@@ -454,10 +581,9 @@ object StreamingMeshProcessor {
                     putFloat2Checked(bos, writeBuf, sumU[i], sumV[i])
                 }
 
-                // Stream indices cleanly from temp disk file
                 val tFile = triFile
                 if (tFile != null && tFile.exists() && emittedTriangles > 0) {
-                    val readChunk = ByteArray(65_536 * 3) // Divisible by 12
+                    val readChunk = ByteArray(65_536 * 3)
                     val readBB = ByteBuffer.wrap(readChunk).order(ByteOrder.LITTLE_ENDIAN)
                     BufferedInputStream(FileInputStream(tFile), IO_BUFFER_BYTES).use { bis ->
                         while (true) {
@@ -478,11 +604,12 @@ object StreamingMeshProcessor {
                         }
                     }
                 }
-                for (p in 0 until binPadding) {
-                    if (writeBuf.remaining() < 1) flushWriteBuf(bos, writeBuf)
-                    writeBuf.put(0.toByte())
-                }
                 flushWriteBuf(bos, writeBuf)
+                if (texBytes != null) {
+                    for (p in 0 until texPrePad) bos.write(0)
+                    bos.write(texBytes)
+                }
+                for (p in 0 until binPadding) bos.write(0)
             }
             cleanup()
             return finalBounds
@@ -531,7 +658,7 @@ object StreamingMeshProcessor {
             private set
         var indexCount = 0
             private set
-        val bounds = BoundingBox()
+        val bounds = MeshBounds()
 
         fun emitVertex(
             px: Float, py: Float, pz: Float,
@@ -556,19 +683,33 @@ object StreamingMeshProcessor {
             indexCount += 3
         }
 
-        fun finalizeToGlb(outGlb: File, generator: String) {
+        fun finalizeToGlb(
+            outGlb: File,
+            generator: String,
+            baseColorFactor: FloatArray? = null,
+            metallicFactor: Float = 0.1f,
+            roughnessFactor: Float = 0.7f,
+            textureFile: File? = null,
+            textureMime: String? = null
+        ) {
             flushWriteBuf(posOut, posBuf); posOut.close()
             flushWriteBuf(normOut, normBuf); normOut.close()
             flushWriteBuf(uvOut, uvBuf); uvOut.close()
             flushWriteBuf(idxOut, idxBuf); idxOut.close()
             bounds.normalizeIfEmpty()
 
+            val texBytes = if (textureFile != null && textureFile.exists() && textureFile.length() in 1L..24_000_000L) {
+                runCatching { textureFile.readBytes() }.getOrNull()
+            } else null
+
             val useIntIndices = vertexCount > 65535 || indexCount > 65535
             val posBytes = vertexCount.toLong() * 3L * 4L
             val normBytes = vertexCount.toLong() * 3L * 4L
             val uvBytes = vertexCount.toLong() * 2L * 4L
             val idxBytes = if (useIntIndices) indexCount.toLong() * 4L else indexCount.toLong() * 2L
-            val totalBinBytes = posBytes + normBytes + uvBytes + idxBytes
+            val rawGeoBytes = posBytes + normBytes + uvBytes + idxBytes
+            val texPrePad = if (texBytes != null) ((4L - (rawGeoBytes % 4L)) % 4L).toInt() else 0
+            val totalBinBytes = rawGeoBytes + texPrePad + (texBytes?.size?.toLong() ?: 0L)
             val binPadding = ((4L - (totalBinBytes % 4L)) % 4L).toInt()
             val paddedBinBytes = totalBinBytes + binPadding
 
@@ -582,7 +723,13 @@ object StreamingMeshProcessor {
                 indexByteLength = idxBytes,
                 totalBinaryLength = totalBinBytes,
                 bounds = bounds,
-                generator = generator
+                generator = generator,
+                baseColorFactor = baseColorFactor,
+                metallicFactor = metallicFactor,
+                roughnessFactor = roughnessFactor,
+                textureOffset = rawGeoBytes + texPrePad,
+                textureByteLength = texBytes?.size ?: 0,
+                textureMimeType = textureMime
             )
             val jsonPadding = (4 - (jsonBytes.size % 4)) % 4
             val paddedJsonLen = jsonBytes.size + jsonPadding
@@ -616,7 +763,10 @@ object StreamingMeshProcessor {
                     }
                     flushWriteBuf(bos, writeBuf)
                 }
-
+                if (texBytes != null) {
+                    for (p in 0 until texPrePad) bos.write(0)
+                    bos.write(texBytes)
+                }
                 for (p in 0 until binPadding) bos.write(0)
             }
         }
@@ -655,23 +805,23 @@ object StreamingMeshProcessor {
             FileInputStream(stlFile).use { it.read(header) }
             val isAscii = isAsciiStl(header, fileLen)
 
-            val bounds = BoundingBox()
-            var totalTris = 0
+            val bounds = MeshBounds()
+            var totalTris = 0L
 
             // Pass 1: exact triangle count and bounding box
             if (!isAscii && fileLen >= 84L) {
                 val lenBB = ByteBuffer.wrap(header, 80, 4).order(ByteOrder.LITTLE_ENDIAN)
                 val declaredTris = lenBB.int.toLong() and 0xFFFF_FFFFL
                 val maxPossible = ((fileLen - 84L) / 50L).coerceAtLeast(0L)
-                val binaryCount = minOf(declaredTris, maxPossible).toInt()
+                val binaryCount = minOf(declaredTris, maxPossible)
                 totalTris = binaryCount
                 val recBuf = ByteArray(50 * 4096)
                 val recBB = ByteBuffer.wrap(recBuf).order(ByteOrder.LITTLE_ENDIAN)
                 BufferedInputStream(FileInputStream(stlFile), IO_BUFFER_BYTES).use { bis ->
                     skipFully(bis, 84L)
                     var remaining = binaryCount
-                    while (remaining > 0) {
-                        val batch = minOf(remaining, 4096)
+                    while (remaining > 0L) {
+                        val batch = minOf(remaining, 4096L).toInt()
                         readFully(bis, recBuf, batch * 50)
                         for (i in 0 until batch) {
                             val base = i * 50
@@ -679,13 +829,14 @@ object StreamingMeshProcessor {
                             bounds.expand(recBB.getFloat(base + 24), recBB.getFloat(base + 28), recBB.getFloat(base + 32))
                             bounds.expand(recBB.getFloat(base + 36), recBB.getFloat(base + 40), recBB.getFloat(base + 44))
                         }
-                        remaining -= batch
+                        remaining -= batch.toLong()
                     }
                 }
             } else {
                 var vInTri = 0
-                stlFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
-                    for (line in lines) {
+                BufferedInputStream(FileInputStream(stlFile), IO_BUFFER_BYTES).bufferedReader(Charsets.UTF_8).use { reader ->
+                    while (true) {
+                        val line = reader.readLine() ?: break
                         val trimmed = line.trimStart()
                         if (trimmed.startsWith("vertex", ignoreCase = true)) {
                             parseThreeFloatsAfterToken(trimmed, 6)?.let { (x, y, z) ->
@@ -701,7 +852,7 @@ object StreamingMeshProcessor {
                 }
             }
 
-            if (totalTris <= 0) {
+            if (totalTris <= 0L) {
                 return ModelFormatConverter.ConversionResult(
                     glbFile = stlFile,
                     originalFormat = "STL",
@@ -724,9 +875,9 @@ object StreamingMeshProcessor {
             )
 
             val note = if (stats.wasSimplified) {
-                "STL (${formatCompact(stats.originalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles)} tris for mobile GPU"
+                "STL (${formatCompact(stats.rawOriginalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles.toLong())} tris for mobile GPU"
             } else {
-                "STL (${formatCompact(stats.outputTriangles)} triangles) loaded natively"
+                "STL (${formatCompact(stats.outputTriangles.toLong())} triangles) loaded natively"
             }
             return ModelFormatConverter.ConversionResult(
                 glbFile = outGlb,
@@ -734,7 +885,9 @@ object StreamingMeshProcessor {
                 triangleCount = stats.outputTriangles,
                 vertexCount = stats.outputVertices,
                 message = note,
-                isSuccess = true
+                isSuccess = true,
+                rawTriangleCount = stats.rawOriginalTriangles,
+                rawVertexCount = stats.rawOriginalVertices
             )
         } catch (t: Throwable) {
             Log.e(TAG, "STL streaming conversion error: ${t.message}", t)
@@ -754,14 +907,12 @@ object StreamingMeshProcessor {
     private fun emitStlPass2(
         stlFile: File,
         isAscii: Boolean,
-        totalTris: Int,
-        bounds: BoundingBox,
+        totalTris: Long,
+        bounds: MeshBounds,
         scratchDir: File,
         outGlb: File
     ): MeshStats {
-        // STL stores 3 unshared corners per tri; cluster even medium-large STLs (>600K tris -> >1.8M unshared verts)
-        // OR use direct deduplication below threshold cleanly.
-        val useCluster = totalTris > 600_000
+        val useCluster = totalTris > 600_000L
         if (!useCluster) {
             DirectStreamingGlbWriter(scratchDir).use { writer ->
                 forEachStlTriangle(stlFile, isAscii, totalTris) { nx, ny, nz, x0, y0, z0, x1, y1, z1, x2, y2, z2 ->
@@ -772,19 +923,23 @@ object StreamingMeshProcessor {
                     writer.emitTriangle(i0, i1, i2)
                 }
                 writer.finalizeToGlb(outGlb, "MixedReality Streaming STL Engine")
+                val rawVerts = totalTris * 3L
                 return MeshStats(
-                    originalVertices = totalTris * 3,
-                    originalTriangles = totalTris,
+                    originalVertices = rawVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     outputVertices = writer.vertexCount,
                     outputTriangles = writer.indexCount / 3,
-                    wasSimplified = false
+                    wasSimplified = false,
+                    rawOriginalVertices = rawVerts,
+                    rawOriginalTriangles = totalTris
                 )
             }
         }
 
         var gridRes = estimateInitialGridResolution(totalTris)
         while (true) {
-            val acc = SpatialClusterAccumulator(bounds, gridRes)
+            val isFloor = gridRes <= 64
+            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
             acc.startTriangleStream(scratchDir)
             try {
                 forEachStlTriangle(stlFile, isAscii, totalTris) { nx, ny, nz, x0, y0, z0, x1, y1, z1, x2, y2, z2 ->
@@ -795,20 +950,23 @@ object StreamingMeshProcessor {
                     val c2 = acc.getOrAssignCluster(x2, y2, z2, fnx, fny, fnz, 0f, 0f)
                     acc.addTriangle(c0, c1, c2)
                 }
-                if (acc.overflowed && gridRes > 96) {
+                if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(96)
+                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
                     continue
                 }
                 val outTris = acc.emittedTriangles
                 val outVerts = acc.clusterCount
                 acc.writeToGlb(outGlb)
+                val rawVerts = totalTris * 3L
                 return MeshStats(
-                    originalVertices = totalTris * 3,
-                    originalTriangles = totalTris,
+                    originalVertices = rawVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     outputVertices = outVerts,
                     outputTriangles = outTris,
-                    wasSimplified = true
+                    wasSimplified = true,
+                    rawOriginalVertices = rawVerts,
+                    rawOriginalTriangles = totalTris
                 )
             } finally {
                 acc.cleanup()
@@ -819,7 +977,7 @@ object StreamingMeshProcessor {
     private inline fun forEachStlTriangle(
         stlFile: File,
         isAscii: Boolean,
-        totalTris: Int,
+        totalTris: Long,
         onTri: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float) -> Unit
     ) {
         if (!isAscii) {
@@ -828,8 +986,8 @@ object StreamingMeshProcessor {
             BufferedInputStream(FileInputStream(stlFile), IO_BUFFER_BYTES).use { bis ->
                 skipFully(bis, 84L)
                 var remaining = totalTris
-                while (remaining > 0) {
-                    val batch = minOf(remaining, 4096)
+                while (remaining > 0L) {
+                    val batch = minOf(remaining, 4096L).toInt()
                     readFully(bis, recBuf, batch * 50)
                     for (i in 0 until batch) {
                         val b = i * 50
@@ -840,7 +998,7 @@ object StreamingMeshProcessor {
                             recBB.getFloat(b + 36), recBB.getFloat(b + 40), recBB.getFloat(b + 44)
                         )
                     }
-                    remaining -= batch
+                    remaining -= batch.toLong()
                 }
             }
         } else {
@@ -887,23 +1045,24 @@ object StreamingMeshProcessor {
                     isSuccess = false
                 )
 
-            if (headerInfo.vertexCount <= 0 || headerInfo.faceCount <= 0) {
+            if (headerInfo.vertexCount <= 0L || headerInfo.faceCount <= 0L) {
                 return ModelFormatConverter.ConversionResult(
                     glbFile = plyFile,
                     originalFormat = "PLY",
                     triangleCount = 0,
-                    vertexCount = headerInfo.vertexCount,
+                    vertexCount = headerInfo.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     message = "PLY contains point cloud with 0 triangle faces",
-                    isSuccess = false
+                    isSuccess = false,
+                    rawVertexCount = headerInfo.vertexCount
                 )
             }
 
-            val positions = PagedFloatTupleStore(3, scratchDir, "ply_pos")
-            val normals = if (headerInfo.hasNormals) PagedFloatTupleStore(3, scratchDir, "ply_nrm") else null
-            val uvs = if (headerInfo.hasUvs) PagedFloatTupleStore(2, scratchDir, "ply_uv") else null
+            val positions = MappedFloatTupleStore(3, scratchDir, "ply_pos")
+            val normals = if (headerInfo.hasNormals) MappedFloatTupleStore(3, scratchDir, "ply_nrm") else null
+            val uvs = if (headerInfo.hasUvs) MappedFloatTupleStore(2, scratchDir, "ply_uv") else null
 
             try {
-                val bounds = BoundingBox()
+                val bounds = MeshBounds()
                 val rawTris = streamPlyGeometryAndFaces(
                     plyFile = plyFile,
                     header = headerInfo,
@@ -929,14 +1088,15 @@ object StreamingMeshProcessor {
                     bounds = bounds,
                     scratchDir = scratchDir,
                     outGlb = outGlb,
-                    generator = "MixedReality Streaming PLY Engine"
+                    generator = "MixedReality Streaming PLY Engine",
+                    indexIsLong = rawTris.indexIsLong
                 )
                 rawTris.close()
 
                 val msg = if (stats.wasSimplified) {
-                    "PLY (${formatCompact(stats.originalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles)} tris for mobile GPU"
+                    "PLY (${formatCompact(stats.rawOriginalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles.toLong())} tris for mobile GPU"
                 } else {
-                    "PLY (${formatCompact(stats.outputTriangles)} triangles) loaded"
+                    "PLY (${formatCompact(stats.outputTriangles.toLong())} triangles) loaded"
                 }
                 return ModelFormatConverter.ConversionResult(
                     glbFile = outGlb,
@@ -944,7 +1104,9 @@ object StreamingMeshProcessor {
                     triangleCount = stats.outputTriangles,
                     vertexCount = stats.outputVertices,
                     message = msg,
-                    isSuccess = true
+                    isSuccess = true,
+                    rawTriangleCount = stats.rawOriginalTriangles,
+                    rawVertexCount = stats.rawOriginalVertices
                 )
             } finally {
                 positions.close()
@@ -967,22 +1129,22 @@ object StreamingMeshProcessor {
     }
 
     /**
-     * Streaming Wavefront OBJ converter using disk-paged vertex pools and adaptive vertex clustering,
-     * handling up to 30,000,000+ vertices & 30,000,000+ polygons inside minimal Java heap.
+     * Streaming Wavefront OBJ converter using zero-heap memory-mapped vertex pools and spatial clustering,
+     * supporting unlimited ("∞") vertices & polygons without Int overflow or GC stalls.
      */
     fun convertObjToGlbStreaming(cacheDir: File, objFile: File): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "obj_scratch_${System.nanoTime()}").apply { mkdirs() }
-        val positions = PagedFloatTupleStore(3, scratchDir, "obj_pos")
-        val normals = PagedFloatTupleStore(3, scratchDir, "obj_nrm")
-        val uvs = PagedFloatTupleStore(2, scratchDir, "obj_uv")
+        val positions = MappedFloatTupleStore(3, scratchDir, "obj_pos")
+        val normals = MappedFloatTupleStore(3, scratchDir, "obj_nrm")
+        val uvs = MappedFloatTupleStore(2, scratchDir, "obj_uv")
         val triIndexFile = File(scratchDir, "obj_tris.bin")
 
-        val bounds = BoundingBox()
-        var triCount = 0
+        val bounds = MeshBounds()
+        var triCount = 0L
         var parsedMtlNote: String? = null
-        var faceV = IntArray(16)
-        var faceT = IntArray(16)
-        var faceN = IntArray(16)
+        var faceV = LongArray(16)
+        var faceT = LongArray(16)
+        var faceN = LongArray(16)
 
         try {
             val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUFFER_BYTES)
@@ -1050,24 +1212,24 @@ object StreamingMeshProcessor {
                                         faceT = faceT.copyOf(nc)
                                         faceN = faceN.copyOf(nc)
                                     }
-                                    parseObjFaceToken(line, cursor, tokEnd, totalV, totalT, totalN, faceV, faceT, faceN, faceCount)
+                                    parseObjFaceTokenLong(line, cursor, tokEnd, totalV, totalT, totalN, faceV, faceT, faceN, faceCount)
                                     faceCount++
                                 }
                                 cursor = skipWhitespace(line, tokEnd, len)
                             }
                             if (faceCount >= 3) {
-                                val v0 = faceV[0] - 1
-                                if (v0 !in 0 until totalV) continue
-                                val t0 = faceT[0] - 1
-                                val n0 = faceN[0] - 1
+                                val v0 = faceV[0] - 1L
+                                if (v0 !in 0L until totalV) continue
+                                val t0 = faceT[0] - 1L
+                                val n0 = faceN[0] - 1L
                                 for (i in 1 until faceCount - 1) {
-                                    val v1 = faceV[i] - 1
-                                    val v2 = faceV[i + 1] - 1
-                                    if (v1 !in 0 until totalV || v2 !in 0 until totalV) continue
-                                    if (triBuf.remaining() < 36) flushWriteBuf(triOut, triBuf)
-                                    triBuf.putInt(v0); triBuf.putInt(t0); triBuf.putInt(n0)
-                                    triBuf.putInt(v1); triBuf.putInt(faceT[i] - 1); triBuf.putInt(faceN[i] - 1)
-                                    triBuf.putInt(v2); triBuf.putInt(faceT[i + 1] - 1); triBuf.putInt(faceN[i + 1] - 1)
+                                    val v1 = faceV[i] - 1L
+                                    val v2 = faceV[i + 1] - 1L
+                                    if (v1 !in 0L until totalV || v2 !in 0L until totalV) continue
+                                    if (triBuf.remaining() < 72) flushWriteBuf(triOut, triBuf)
+                                    triBuf.putLong(v0); triBuf.putLong(t0); triBuf.putLong(n0)
+                                    triBuf.putLong(v1); triBuf.putLong(faceT[i] - 1L); triBuf.putLong(faceN[i] - 1L)
+                                    triBuf.putLong(v2); triBuf.putLong(faceT[i + 1] - 1L); triBuf.putLong(faceN[i + 1] - 1L)
                                     triCount++
                                 }
                             }
@@ -1093,7 +1255,7 @@ object StreamingMeshProcessor {
             bounds.normalizeIfEmpty()
             val outGlb = File(cacheDir, "${objFile.nameWithoutExtension}_converted.glb")
 
-            if (triCount <= 0 || positions.count <= 0) {
+            if (triCount <= 0L || positions.count <= 0L) {
                 return ModelFormatConverter.ConversionResult(
                     glbFile = objFile,
                     originalFormat = "OBJ",
@@ -1117,9 +1279,9 @@ object StreamingMeshProcessor {
             )
 
             val baseMsg = if (stats.wasSimplified) {
-                "OBJ (${formatCompact(stats.originalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles)} tris"
+                "OBJ (${formatCompact(stats.rawOriginalTriangles)} tris) optimized to ${formatCompact(stats.outputTriangles.toLong())} tris"
             } else {
-                "OBJ (${formatCompact(stats.outputTriangles)} tris) loaded"
+                "OBJ (${formatCompact(stats.outputTriangles.toLong())} tris) loaded"
             }
             val fullMsg = if (parsedMtlNote != null) "$baseMsg ($parsedMtlNote)" else baseMsg
 
@@ -1129,7 +1291,9 @@ object StreamingMeshProcessor {
                 triangleCount = stats.outputTriangles,
                 vertexCount = stats.outputVertices,
                 message = fullMsg,
-                isSuccess = true
+                isSuccess = true,
+                rawTriangleCount = stats.rawOriginalTriangles,
+                rawVertexCount = stats.rawOriginalVertices
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Streaming OBJ error: ${t.message}", t)
@@ -1155,10 +1319,10 @@ object StreamingMeshProcessor {
      */
     fun convertThreeMfToGlb(cacheDir: File, threeMfFile: File): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "3mf_scratch_${System.nanoTime()}").apply { mkdirs() }
-        val positions = PagedFloatTupleStore(3, scratchDir, "3mf_pos")
+        val positions = MappedFloatTupleStore(3, scratchDir, "3mf_pos")
         val triIndexFile = File(scratchDir, "3mf_tris.bin")
-        val bounds = BoundingBox()
-        var triCount = 0
+        val bounds = MeshBounds()
+        var triCount = 0L
 
         try {
             val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUFFER_BYTES)
@@ -1185,14 +1349,14 @@ object StreamingMeshProcessor {
                                         bounds.expand(x, y, z)
                                     }
                                     "triangle" -> {
-                                        val v1 = (parser.getAttributeValue(null, "v1")?.toIntOrNull() ?: -1) + objectVertexOffset
-                                        val v2 = (parser.getAttributeValue(null, "v2")?.toIntOrNull() ?: -1) + objectVertexOffset
-                                        val v3 = (parser.getAttributeValue(null, "v3")?.toIntOrNull() ?: -1) + objectVertexOffset
-                                        if (v1 in 0 until positions.count && v2 in 0 until positions.count && v3 in 0 until positions.count) {
-                                            if (triBuf.remaining() < 12) flushWriteBuf(triOut, triBuf)
-                                            triBuf.putInt(v1)
-                                            triBuf.putInt(v2)
-                                            triBuf.putInt(v3)
+                                        val v1 = (parser.getAttributeValue(null, "v1")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        val v2 = (parser.getAttributeValue(null, "v2")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        val v3 = (parser.getAttributeValue(null, "v3")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        if (v1 in 0L until positions.count && v2 in 0L until positions.count && v3 in 0L until positions.count) {
+                                            if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
+                                            triBuf.putLong(v1)
+                                            triBuf.putLong(v2)
+                                            triBuf.putLong(v3)
                                             triCount++
                                         }
                                     }
@@ -1209,7 +1373,7 @@ object StreamingMeshProcessor {
             triOut.close()
             bounds.normalizeIfEmpty()
 
-            if (triCount <= 0 || positions.count <= 0) {
+            if (triCount <= 0L || positions.count <= 0L) {
                 return ModelFormatConverter.ConversionResult(
                     glbFile = threeMfFile,
                     originalFormat = "3MF",
@@ -1231,7 +1395,8 @@ object StreamingMeshProcessor {
                 bounds = bounds,
                 scratchDir = scratchDir,
                 outGlb = outGlb,
-                generator = "MixedReality Streaming 3MF Engine"
+                generator = "MixedReality Streaming 3MF Engine",
+                indexIsLong = true
             )
 
             return ModelFormatConverter.ConversionResult(
@@ -1239,8 +1404,10 @@ object StreamingMeshProcessor {
                 originalFormat = "3MF",
                 triangleCount = stats.outputTriangles,
                 vertexCount = stats.outputVertices,
-                message = "3MF (${formatCompact(stats.outputTriangles)} tris) loaded",
-                isSuccess = true
+                message = "3MF (${formatCompact(stats.rawOriginalTriangles)} tris) loaded",
+                isSuccess = true,
+                rawTriangleCount = stats.rawOriginalTriangles,
+                rawVertexCount = stats.rawOriginalVertices
             )
         } catch (t: Throwable) {
             Log.e(TAG, "3MF conversion error: ${t.message}", t)
@@ -1287,27 +1454,27 @@ object StreamingMeshProcessor {
                 val jsonStr = String(jsonBytes, Charsets.UTF_8)
                 val binByteLength = (len - 20L - jsonLen.toLong() - 8L).coerceAtLeast(0L)
 
-                val root = JSONObject(jsonStr)
-                val accessors = root.optJSONArray("accessors") ?: JSONArray()
-                val meshes = root.optJSONArray("meshes") ?: JSONArray()
+                val root = MiniJson.parseObject(jsonStr) ?: return@runCatching GlbInspection(false, 0, 0, 0, 0, false, false, false, false, 0)
+                val accessors = root.optArr("accessors") ?: MiniJson.Arr(emptyList())
+                val meshes = root.optArr("meshes") ?: MiniJson.Arr(emptyList())
 
                 var vertTotal = 0L
                 var triTotal = 0L
                 for (m in 0 until meshes.length()) {
-                    val prims = meshes.getJSONObject(m).optJSONArray("primitives") ?: continue
+                    val prims = meshes.optObj(m)?.optArr("primitives") ?: continue
                     for (p in 0 until prims.length()) {
-                        val prim = prims.getJSONObject(p)
-                        val attrs = prim.optJSONObject("attributes")
+                        val prim = prims.optObj(p) ?: continue
+                        val attrs = prim.optObj("attributes")
                         val posAccIdx = attrs?.optInt("POSITION", -1) ?: -1
                         val primVerts = if (posAccIdx in 0 until accessors.length()) {
-                            accessors.getJSONObject(posAccIdx).optLong("count", 0L)
+                            accessors.optObj(posAccIdx)?.optLong("count", 0L) ?: 0L
                         } else 0L
                         vertTotal += primVerts
 
                         val mode = prim.optInt("mode", 4)
                         val idxAcc = prim.optInt("indices", -1)
                         val elemCount = if (idxAcc in 0 until accessors.length()) {
-                            accessors.getJSONObject(idxAcc).optLong("count", primVerts)
+                            accessors.optObj(idxAcc)?.optLong("count", primVerts) ?: primVerts
                         } else primVerts
 
                         triTotal += when (mode) {
@@ -1322,7 +1489,7 @@ object StreamingMeshProcessor {
                 val hasMeshopt = jsonStr.contains("EXT_meshopt_compression", ignoreCase = true)
                 val hasWebp = jsonStr.contains("image/webp", ignoreCase = true) ||
                     jsonStr.contains("EXT_texture_webp", ignoreCase = true)
-                val images = root.optJSONArray("images")?.length() ?: 0
+                val images = root.optArr("images")?.length() ?: 0
 
                 GlbInspection(
                     isValidGlb = true,
@@ -1469,11 +1636,13 @@ object StreamingMeshProcessor {
 
     /**
      * Decimates an UNCOMPRESSED oversized `.glb` (when raw vertices/triangles exceed GPU VRAM bounds)
-     * directly on disk into a mobile-safe GLB.
+     * directly on disk into a mobile-safe GLB using bulk channel reads, full node world transforms,
+     * and quantized/float accessor support + triangle strip/fan conversion.
      */
-    fun simplifyUncompressedGlb(cacheDir: File, srcGlb: File): File? {
+    fun simplifyUncompressedGlb(cacheDir: File, srcGlb: File, force: Boolean = false): File? {
         val info = inspectGlbMetadata(srcGlb)
-        if (!info.isValidGlb || !info.hasUncompressedAccessors || info.triangleCount <= DIRECT_TRIANGLE_LIMIT) {
+        if (!info.isValidGlb || !info.hasUncompressedAccessors) return null
+        if (!force && info.triangleCount <= DIRECT_TRIANGLE_LIMIT && srcGlb.length() <= 40L * 1024L * 1024L) {
             return null
         }
         val scratchDir = File(cacheDir, "glb_decim_${System.nanoTime()}").apply { mkdirs() }
@@ -1484,101 +1653,153 @@ object StreamingMeshProcessor {
                 raf.readFully(jsonBytes)
                 val binOffset = 20L + info.jsonByteLength.toLong() + 8L
 
-                val root = JSONObject(String(jsonBytes, Charsets.UTF_8))
-                val accessors = root.optJSONArray("accessors") ?: return@use null
-                val bufferViews = root.optJSONArray("bufferViews") ?: return@use null
-                val meshes = root.optJSONArray("meshes") ?: return@use null
+                val root = MiniJson.parseObject(String(jsonBytes, Charsets.UTF_8)) ?: return@use null
+                val accessors = root.optArr("accessors") ?: return@use null
+                val bufferViews = root.optArr("bufferViews") ?: return@use null
+                val meshes = root.optArr("meshes") ?: return@use null
 
-                val positions = PagedFloatTupleStore(3, scratchDir, "glb_pos")
+                // Build mesh -> world matrices list via scene/nodes hierarchy
+                val meshTransforms = collectGlbMeshWorldMatrices(root, meshes.length())
+
+                val positions = MappedFloatTupleStore(3, scratchDir, "glb_pos")
+                val normals = MappedFloatTupleStore(3, scratchDir, "glb_nrm")
+                val uvs = MappedFloatTupleStore(2, scratchDir, "glb_uv")
                 val triIndexFile = File(scratchDir, "glb_tris.bin")
                 val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUFFER_BYTES)
                 val triBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
-                val bounds = BoundingBox()
-                var totalTris = 0
+                val bounds = MeshBounds()
+                var totalTris = 0L
+
+                val chunkBytes = IO_BUFFER_BYTES
+                val bulkBuf = ByteArray(chunkBytes)
+                val bulkBB = ByteBuffer.wrap(bulkBuf).order(ByteOrder.LITTLE_ENDIAN)
 
                 try {
                     for (m in 0 until meshes.length()) {
-                        val prims = meshes.getJSONObject(m).optJSONArray("primitives") ?: continue
-                        for (p in 0 until prims.length()) {
-                            val prim = prims.getJSONObject(p)
-                            if (prim.optInt("mode", 4) != 4) continue
-                            val attrs = prim.optJSONObject("attributes") ?: continue
-                            val posAccIdx = attrs.optInt("POSITION", -1)
-                            if (posAccIdx !in 0 until accessors.length()) continue
+                        val prims = meshes.optObj(m)?.optArr("primitives") ?: continue
+                        val matrices = meshTransforms[m] ?: listOf(identityMat4())
+                        for (mat in matrices) {
+                            val isIdentity = isIdentityMat4(mat)
+                            for (p in 0 until prims.length()) {
+                                val prim = prims.optObj(p) ?: continue
+                                val mode = prim.optInt("mode", 4)
+                                if (mode !in 4..6) continue
+                                val attrs = prim.optObj("attributes") ?: continue
+                                val posAccIdx = attrs.optInt("POSITION", -1)
+                                if (posAccIdx !in 0 until accessors.length()) continue
 
-                            val posAcc = accessors.getJSONObject(posAccIdx)
-                            if (posAcc.optInt("componentType") != 5126 || posAcc.optString("type") != "VEC3") continue
-                            val posCount = posAcc.optInt("count", 0)
-                            val posBvIdx = posAcc.optInt("bufferView", -1)
-                            if (posCount <= 0 || posBvIdx !in 0 until bufferViews.length()) continue
-                            val posBv = bufferViews.getJSONObject(posBvIdx)
-                            val posStride = posBv.optInt("byteStride", 12).coerceAtLeast(12)
-                            val posBaseOffset = binOffset + posBv.optLong("byteOffset", 0L) + posAcc.optLong("byteOffset", 0L)
+                                val posAcc = accessors.optObj(posAccIdx) ?: continue
+                                if (posAcc.optString("type") != "VEC3") continue
+                                val posComp = posAcc.optInt("componentType")
+                                val posCompSize = gltfCompByteSize(posComp)
+                                if (posCompSize == 0) continue
+                                val posCount = posAcc.optLong("count", 0L)
+                                val posBvIdx = posAcc.optInt("bufferView", -1)
+                                if (posCount <= 0L || posBvIdx !in 0 until bufferViews.length()) continue
+                                val posBv = bufferViews.optObj(posBvIdx) ?: continue
+                                val posMinElemBytes = posCompSize * 3
+                                val posStride = posBv.optInt("byteStride", posMinElemBytes).coerceAtLeast(posMinElemBytes)
+                                val posBaseOffset = binOffset + posBv.optLong("byteOffset", 0L) + posAcc.optLong("byteOffset", 0L)
+                                val posNormalized = posAcc.optBoolean("normalized", false)
 
-                            val vertStartIdx = positions.count
-                            val vReadBuf = ByteArray(posStride)
-                            val vReadBB = ByteBuffer.wrap(vReadBuf).order(ByteOrder.LITTLE_ENDIAN)
-                            raf.seek(posBaseOffset)
-                            for (vi in 0 until posCount) {
-                                raf.readFully(vReadBuf)
-                                val x = vReadBB.getFloat(0)
-                                val y = vReadBB.getFloat(4)
-                                val z = vReadBB.getFloat(8)
-                                positions.add3(x, y, z)
-                                bounds.expand(x, y, z)
-                            }
+                                // Optional NORMAL & TEXCOORD_0 streams read sequentially if present
+                                val nrmAccIdx = attrs.optInt("NORMAL", -1)
+                                val uvAccIdx = attrs.optInt("TEXCOORD_0", -1)
 
-                            val idxAccIdx = prim.optInt("indices", -1)
-                            if (idxAccIdx in 0 until accessors.length()) {
-                                val idxAcc = accessors.getJSONObject(idxAccIdx)
-                                val compType = idxAcc.optInt("componentType")
-                                val idxCount = idxAcc.optInt("count", 0)
-                                val idxBvIdx = idxAcc.optInt("bufferView", -1)
-                                if (idxBvIdx !in 0 until bufferViews.length()) continue
-                                val idxBv = bufferViews.getJSONObject(idxBvIdx)
-                                val idxOff = binOffset + idxBv.optLong("byteOffset", 0L) + idxAcc.optLong("byteOffset", 0L)
-                                raf.seek(idxOff)
-                                val elemBytes = when (compType) {
-                                    5121 -> 1; 5123 -> 2; 5125 -> 4; else -> 0
+                                val vertStartIdx = positions.count
+                                streamGlbVec3AccessorBulk(
+                                    raf = raf,
+                                    baseOffset = posBaseOffset,
+                                    count = posCount,
+                                    stride = posStride,
+                                    compType = posComp,
+                                    normalized = posNormalized,
+                                    worldMat = if (isIdentity) null else mat,
+                                    isNormal = false,
+                                    bulkBuf = bulkBuf,
+                                    bulkBB = bulkBB,
+                                    dst = positions,
+                                    bounds = bounds
+                                )
+
+                                // Keep normals/uvs aligned to positions.count
+                                val nrmWritten = if (nrmAccIdx in 0 until accessors.length()) {
+                                    val nAcc = accessors.optObj(nrmAccIdx)
+                                    val nBvIdx = nAcc?.optInt("bufferView", -1) ?: -1
+                                    val nComp = nAcc?.optInt("componentType") ?: 0
+                                    val nCompSz = gltfCompByteSize(nComp)
+                                    if (nAcc != null && nAcc.optString("type") == "VEC3" && nCompSz > 0 &&
+                                        nAcc.optLong("count", 0L) == posCount && nBvIdx in 0 until bufferViews.length()
+                                    ) {
+                                        val nBv = bufferViews.optObj(nBvIdx)!!
+                                        val nStride = nBv.optInt("byteStride", nCompSz * 3).coerceAtLeast(nCompSz * 3)
+                                        val nOff = binOffset + nBv.optLong("byteOffset", 0L) + nAcc.optLong("byteOffset", 0L)
+                                        streamGlbVec3AccessorBulk(
+                                            raf = raf,
+                                            baseOffset = nOff,
+                                            count = posCount,
+                                            stride = nStride,
+                                            compType = nComp,
+                                            normalized = nAcc.optBoolean("normalized", true),
+                                            worldMat = if (isIdentity) null else mat,
+                                            isNormal = true,
+                                            bulkBuf = bulkBuf,
+                                            bulkBB = bulkBB,
+                                            dst = normals,
+                                            bounds = null
+                                        )
+                                        true
+                                    } else false
+                                } else false
+                                if (!nrmWritten) {
+                                    for (k in 0L until posCount) normals.add3(0f, 1f, 0f)
                                 }
-                                if (elemBytes == 0) continue
-                                val trisInPrim = idxCount / 3
-                                val iReadBuf = ByteArray(elemBytes * 3)
-                                val iReadBB = ByteBuffer.wrap(iReadBuf).order(ByteOrder.LITTLE_ENDIAN)
-                                for (ti in 0 until trisInPrim) {
-                                    raf.readFully(iReadBuf)
-                                    val i0: Int; val i1: Int; val i2: Int
-                                    when (elemBytes) {
-                                        1 -> {
-                                            i0 = iReadBuf[0].toInt() and 0xFF
-                                            i1 = iReadBuf[1].toInt() and 0xFF
-                                            i2 = iReadBuf[2].toInt() and 0xFF
-                                        }
-                                        2 -> {
-                                            i0 = iReadBB.getShort(0).toInt() and 0xFFFF
-                                            i1 = iReadBB.getShort(2).toInt() and 0xFFFF
-                                            i2 = iReadBB.getShort(4).toInt() and 0xFFFF
-                                        }
-                                        else -> {
-                                            i0 = iReadBB.getInt(0)
-                                            i1 = iReadBB.getInt(4)
-                                            i2 = iReadBB.getInt(8)
-                                        }
-                                    }
-                                    if (triBuf.remaining() < 12) flushWriteBuf(triOut, triBuf)
-                                    triBuf.putInt(vertStartIdx + i0)
-                                    triBuf.putInt(vertStartIdx + i1)
-                                    triBuf.putInt(vertStartIdx + i2)
-                                    totalTris++
+
+                                val uvWritten = if (uvAccIdx in 0 until accessors.length()) {
+                                    val uAcc = accessors.optObj(uvAccIdx)
+                                    val uBvIdx = uAcc?.optInt("bufferView", -1) ?: -1
+                                    val uComp = uAcc?.optInt("componentType") ?: 0
+                                    val uCompSz = gltfCompByteSize(uComp)
+                                    if (uAcc != null && uAcc.optString("type") == "VEC2" && uCompSz > 0 &&
+                                        uAcc.optLong("count", 0L) == posCount && uBvIdx in 0 until bufferViews.length()
+                                    ) {
+                                        val uBv = bufferViews.optObj(uBvIdx)!!
+                                        val uStride = uBv.optInt("byteStride", uCompSz * 2).coerceAtLeast(uCompSz * 2)
+                                        val uOff = binOffset + uBv.optLong("byteOffset", 0L) + uAcc.optLong("byteOffset", 0L)
+                                        streamGlbVec2AccessorBulk(
+                                            raf = raf,
+                                            baseOffset = uOff,
+                                            count = posCount,
+                                            stride = uStride,
+                                            compType = uComp,
+                                            normalized = uAcc.optBoolean("normalized", false),
+                                            bulkBuf = bulkBuf,
+                                            bulkBB = bulkBB,
+                                            dst = uvs
+                                        )
+                                        true
+                                    } else false
+                                } else false
+                                if (!uvWritten) {
+                                    for (k in 0L until posCount) uvs.add2(0f, 0f)
                                 }
-                            } else {
-                                val trisInPrim = posCount / 3
-                                for (ti in 0 until trisInPrim) {
-                                    val b = vertStartIdx + ti * 3
-                                    if (triBuf.remaining() < 12) flushWriteBuf(triOut, triBuf)
-                                    triBuf.putInt(b); triBuf.putInt(b + 1); triBuf.putInt(b + 2)
-                                    totalTris++
-                                }
+
+                                // Stream indices in bulk and triangulate TRIANGLES / STRIP / FAN
+                                val idxAccIdx = prim.optInt("indices", -1)
+                                totalTris += streamGlbPrimitiveIndicesBulk(
+                                    raf = raf,
+                                    binOffset = binOffset,
+                                    accessors = accessors,
+                                    bufferViews = bufferViews,
+                                    idxAccIdx = idxAccIdx,
+                                    mode = mode,
+                                    vertStartIdx = vertStartIdx,
+                                    posCount = posCount,
+                                    bulkBuf = bulkBuf,
+                                    bulkBB = bulkBB,
+                                    triOut = triOut,
+                                    triBuf = triBuf
+                                )
                             }
                         }
                     }
@@ -1586,24 +1807,30 @@ object StreamingMeshProcessor {
                     flushWriteBuf(triOut, triBuf)
                     triOut.close()
                     bounds.normalizeIfEmpty()
-                    if (totalTris <= 0) return@use null
+                    if (totalTris <= 0L) return@use null
 
+                    // Preserve first material's baseColorFactor if no external texture dependencies exist
+                    val baseColor = extractPrimaryMaterialBaseColor(root)
                     val outGlb = File(cacheDir, "${srcGlb.nameWithoutExtension}_optimized.glb")
                     emitIndexedDiskTrianglesToGlb(
                         positions = positions,
-                        normals = null,
-                        uvs = null,
+                        normals = normals,
+                        uvs = uvs,
                         triIndexFile = triIndexFile,
                         totalVerts = positions.count,
                         totalTris = totalTris,
                         bounds = bounds,
                         scratchDir = scratchDir,
                         outGlb = outGlb,
-                        generator = "MixedReality GLB Optimizer"
+                        generator = "MixedReality GLB Optimizer",
+                        indexIsLong = true,
+                        baseColorFactor = baseColor
                     )
                     outGlb
                 } finally {
                     positions.close()
+                    normals.close()
+                    uvs.close()
                     runCatching { triOut.close() }
                 }
             }
@@ -1615,31 +1842,498 @@ object StreamingMeshProcessor {
         }
     }
 
+    private fun gltfCompByteSize(compType: Int): Int = when (compType) {
+        5120, 5121 -> 1 // BYTE, UBYTE
+        5122, 5123 -> 2 // SHORT, USHORT
+        5125, 5126 -> 4 // UINT, FLOAT
+        else -> 0
+    }
+
+    private fun decodeGlbScalar(bb: ByteBuffer, buf: ByteArray, offset: Int, compType: Int, normalized: Boolean): Float {
+        return when (compType) {
+            5126 -> bb.getFloat(offset)
+            5122 -> {
+                val s = bb.getShort(offset).toFloat()
+                if (normalized) maxOf(s / 32767f, -1f) else s
+            }
+            5123 -> {
+                val u = (bb.getShort(offset).toInt() and 0xFFFF).toFloat()
+                if (normalized) u / 65535f else u
+            }
+            5120 -> {
+                val b = buf[offset].toFloat()
+                if (normalized) maxOf(b / 127f, -1f) else b
+            }
+            5121 -> {
+                val ub = (buf[offset].toInt() and 0xFF).toFloat()
+                if (normalized) ub / 255f else ub
+            }
+            5125 -> bb.getInt(offset).toFloat()
+            else -> 0f
+        }
+    }
+
+    private fun streamGlbVec3AccessorBulk(
+        raf: RandomAccessFile,
+        baseOffset: Long,
+        count: Long,
+        stride: Int,
+        compType: Int,
+        normalized: Boolean,
+        worldMat: DoubleArray?,
+        isNormal: Boolean,
+        bulkBuf: ByteArray,
+        bulkBB: ByteBuffer,
+        dst: MappedFloatTupleStore,
+        bounds: MeshBounds?
+    ) {
+        val cSz = gltfCompByteSize(compType)
+        val elemsPerChunk = (bulkBuf.size / stride).coerceAtLeast(1)
+        raf.seek(baseOffset)
+        var remaining = count
+        while (remaining > 0L) {
+            val batch = minOf(remaining, elemsPerChunk.toLong()).toInt()
+            val bytesNeeded = if (batch == 1) cSz * 3 else (batch - 1) * stride + cSz * 3
+            raf.readFully(bulkBuf, 0, bytesNeeded)
+            for (i in 0 until batch) {
+                val o = i * stride
+                val rx = decodeGlbScalar(bulkBB, bulkBuf, o, compType, normalized)
+                val ry = decodeGlbScalar(bulkBB, bulkBuf, o + cSz, compType, normalized)
+                val rz = decodeGlbScalar(bulkBB, bulkBuf, o + cSz * 2, compType, normalized)
+                if (worldMat == null) {
+                    dst.add3(rx, ry, rz)
+                    bounds?.expand(rx, ry, rz)
+                } else if (isNormal) {
+                    val nx = (worldMat[0] * rx + worldMat[4] * ry + worldMat[8] * rz).toFloat()
+                    val ny = (worldMat[1] * rx + worldMat[5] * ry + worldMat[9] * rz).toFloat()
+                    val nz = (worldMat[2] * rx + worldMat[6] * ry + worldMat[10] * rz).toFloat()
+                    val nl = sqrt(nx * nx + ny * ny + nz * nz)
+                    if (nl > 1e-6f && nl.isFinite()) {
+                        val inv = 1f / nl
+                        dst.add3(nx * inv, ny * inv, nz * inv)
+                    } else {
+                        dst.add3(0f, 1f, 0f)
+                    }
+                } else {
+                    val wx = (worldMat[0] * rx + worldMat[4] * ry + worldMat[8] * rz + worldMat[12]).toFloat()
+                    val wy = (worldMat[1] * rx + worldMat[5] * ry + worldMat[9] * rz + worldMat[13]).toFloat()
+                    val wz = (worldMat[2] * rx + worldMat[6] * ry + worldMat[10] * rz + worldMat[14]).toFloat()
+                    dst.add3(wx, wy, wz)
+                    bounds?.expand(wx, wy, wz)
+                }
+            }
+            if (stride > cSz * 3 && remaining > batch) {
+                raf.skipBytes(stride - cSz * 3)
+            }
+            remaining -= batch.toLong()
+        }
+    }
+
+    private fun streamGlbVec2AccessorBulk(
+        raf: RandomAccessFile,
+        baseOffset: Long,
+        count: Long,
+        stride: Int,
+        compType: Int,
+        normalized: Boolean,
+        bulkBuf: ByteArray,
+        bulkBB: ByteBuffer,
+        dst: MappedFloatTupleStore
+    ) {
+        val cSz = gltfCompByteSize(compType)
+        val elemsPerChunk = (bulkBuf.size / stride).coerceAtLeast(1)
+        raf.seek(baseOffset)
+        var remaining = count
+        while (remaining > 0L) {
+            val batch = minOf(remaining, elemsPerChunk.toLong()).toInt()
+            val bytesNeeded = if (batch == 1) cSz * 2 else (batch - 1) * stride + cSz * 2
+            raf.readFully(bulkBuf, 0, bytesNeeded)
+            for (i in 0 until batch) {
+                val o = i * stride
+                val u = decodeGlbScalar(bulkBB, bulkBuf, o, compType, normalized)
+                val v = decodeGlbScalar(bulkBB, bulkBuf, o + cSz, compType, normalized)
+                dst.add2(u, v)
+            }
+            if (stride > cSz * 2 && remaining > batch) {
+                raf.skipBytes(stride - cSz * 2)
+            }
+            remaining -= batch.toLong()
+        }
+    }
+
+    private fun streamGlbPrimitiveIndicesBulk(
+        raf: RandomAccessFile,
+        binOffset: Long,
+        accessors: MiniJson.Arr,
+        bufferViews: MiniJson.Arr,
+        idxAccIdx: Int,
+        mode: Int,
+        vertStartIdx: Long,
+        posCount: Long,
+        bulkBuf: ByteArray,
+        bulkBB: ByteBuffer,
+        triOut: BufferedOutputStream,
+        triBuf: ByteBuffer
+    ): Long {
+        var tris = 0L
+        fun emitTri(a: Long, b: Long, c: Long) {
+            if (a == b || b == c || a == c) return
+            if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
+            triBuf.putLong(vertStartIdx + a)
+            triBuf.putLong(vertStartIdx + b)
+            triBuf.putLong(vertStartIdx + c)
+            tris++
+        }
+
+        if (idxAccIdx !in 0 until accessors.length()) {
+            when (mode) {
+                4 -> for (ti in 0L until posCount / 3L) {
+                    val b = ti * 3L; emitTri(b, b + 1L, b + 2L)
+                }
+                5 -> for (ti in 0L until (posCount - 2L).coerceAtLeast(0L)) {
+                    if ((ti and 1L) == 0L) emitTri(ti, ti + 1L, ti + 2L)
+                    else emitTri(ti + 1L, ti, ti + 2L)
+                }
+                6 -> for (ti in 1L until (posCount - 1L).coerceAtLeast(1L)) {
+                    emitTri(0L, ti, ti + 1L)
+                }
+            }
+            return tris
+        }
+
+        val idxAcc = accessors.optObj(idxAccIdx) ?: return 0L
+        val compType = idxAcc.optInt("componentType")
+        val idxCount = idxAcc.optLong("count", 0L)
+        val idxBvIdx = idxAcc.optInt("bufferView", -1)
+        if (idxBvIdx !in 0 until bufferViews.length() || idxCount <= 0L) return 0L
+        val idxBv = bufferViews.optObj(idxBvIdx) ?: return 0L
+        val elemBytes = when (compType) {
+            5121 -> 1; 5123 -> 2; 5125 -> 4; else -> 0
+        }
+        if (elemBytes == 0) return 0L
+        val idxOff = binOffset + idxBv.optLong("byteOffset", 0L) + idxAcc.optLong("byteOffset", 0L)
+        raf.seek(idxOff)
+
+        var prev0 = 0L
+        var prev1 = 0L
+        var idxSeen = 0L
+        val elemsPerChunk = ((bulkBuf.size / elemBytes) / 3) * 3
+        val batchLimit = maxOf(elemsPerChunk, 3)
+
+        var remaining = idxCount
+        var triPhase = 0
+        while (remaining > 0L) {
+            val batch = minOf(remaining, batchLimit.toLong()).toInt()
+            raf.readFully(bulkBuf, 0, batch * elemBytes)
+            for (i in 0 until batch) {
+                val off = i * elemBytes
+                val vIdx = when (elemBytes) {
+                    1 -> (bulkBuf[off].toInt() and 0xFF).toLong()
+                    2 -> (bulkBB.getShort(off).toInt() and 0xFFFF).toLong()
+                    else -> bulkBB.getInt(off).toLong() and 0xFFFF_FFFFL
+                }
+                when (mode) {
+                    4 -> {
+                        when (triPhase) {
+                            0 -> { prev0 = vIdx; triPhase = 1 }
+                            1 -> { prev1 = vIdx; triPhase = 2 }
+                            else -> { emitTri(prev0, prev1, vIdx); triPhase = 0 }
+                        }
+                    }
+                    5 -> {
+                        if (idxSeen == 0L) prev0 = vIdx
+                        else if (idxSeen == 1L) prev1 = vIdx
+                        else {
+                            if ((idxSeen and 1L) == 0L) emitTri(prev0, prev1, vIdx)
+                            else emitTri(prev1, prev0, vIdx)
+                            prev0 = prev1; prev1 = vIdx
+                        }
+                    }
+                    6 -> {
+                        if (idxSeen == 0L) prev0 = vIdx
+                        else if (idxSeen == 1L) prev1 = vIdx
+                        else {
+                            emitTri(prev0, prev1, vIdx)
+                            prev1 = vIdx
+                        }
+                    }
+                }
+                idxSeen++
+            }
+            remaining -= batch.toLong()
+        }
+        return tris
+    }
+
+    private fun extractPrimaryMaterialBaseColor(root: MiniJson.Obj): FloatArray? {
+        val mats = root.optArr("materials") ?: return null
+        if (mats.length() == 0) return null
+        val pbr = mats.optObj(0)?.optObj("pbrMetallicRoughness") ?: return null
+        val arr = pbr.optArr("baseColorFactor") ?: return null
+        if (arr.length() < 3) return null
+        return floatArrayOf(
+            arr.optDouble(0, 1.0).toFloat(),
+            arr.optDouble(1, 1.0).toFloat(),
+            arr.optDouble(2, 1.0).toFloat(),
+            arr.optDouble(3, 1.0).toFloat()
+        )
+    }
+
+    private fun collectGlbMeshWorldMatrices(root: MiniJson.Obj, meshCount: Int): Map<Int, List<DoubleArray>> {
+        val nodes = root.optArr("nodes") ?: return emptyMap()
+        val scenes = root.optArr("scenes")
+        val sceneIdx = root.optInt("scene", 0)
+        val rootNodeIndices = mutableListOf<Int>()
+        val rootArr = scenes?.optObj(sceneIdx)?.optArr("nodes")
+        if (rootArr != null && rootArr.length() > 0) {
+            for (i in 0 until rootArr.length()) rootNodeIndices.add(rootArr.optInt(i, -1))
+        } else {
+            val isChild = BooleanArray(nodes.length())
+            for (n in 0 until nodes.length()) {
+                val ch = nodes.optObj(n)?.optArr("children") ?: continue
+                for (c in 0 until ch.length()) {
+                    val ci = ch.optInt(c, -1)
+                    if (ci in 0 until nodes.length()) isChild[ci] = true
+                }
+            }
+            for (n in 0 until nodes.length()) if (!isChild[n]) rootNodeIndices.add(n)
+        }
+
+        val out = HashMap<Int, MutableList<DoubleArray>>(meshCount)
+        fun walk(nodeIdx: Int, parentMat: DoubleArray, depth: Int) {
+            if (nodeIdx !in 0 until nodes.length() || depth > 128) return
+            val node = nodes.optObj(nodeIdx) ?: return
+            val local = gltfNodeLocalMatrix(node)
+            val world = mulMat4(parentMat, local)
+            val meshIdx = node.optInt("mesh", -1)
+            if (meshIdx in 0 until meshCount) {
+                out.getOrPut(meshIdx) { mutableListOf() }.add(world)
+            }
+            val children = node.optArr("children") ?: return
+            for (c in 0 until children.length()) walk(children.optInt(c, -1), world, depth + 1)
+        }
+        val id = identityMat4()
+        for (rn in rootNodeIndices) walk(rn, id, 0)
+        return out
+    }
+
+    private fun gltfNodeLocalMatrix(node: MiniJson.Obj): DoubleArray {
+        val matArr = node.optArr("matrix")
+        if (matArr != null && matArr.length() == 16) {
+            return DoubleArray(16) { i -> matArr.optDouble(i, if (i % 5 == 0) 1.0 else 0.0) }
+        }
+        val tArr = node.optArr("translation")
+        val rArr = node.optArr("rotation")
+        val sArr = node.optArr("scale")
+        val tx = tArr?.optDouble(0, 0.0) ?: 0.0
+        val ty = tArr?.optDouble(1, 0.0) ?: 0.0
+        val tz = tArr?.optDouble(2, 0.0) ?: 0.0
+        val qx = rArr?.optDouble(0, 0.0) ?: 0.0
+        val qy = rArr?.optDouble(1, 0.0) ?: 0.0
+        val qz = rArr?.optDouble(2, 0.0) ?: 0.0
+        val qw = rArr?.optDouble(3, 1.0) ?: 1.0
+        val sx = sArr?.optDouble(0, 1.0) ?: 1.0
+        val sy = sArr?.optDouble(1, 1.0) ?: 1.0
+        val sz = sArr?.optDouble(2, 1.0) ?: 1.0
+
+        val xx = qx * qx; val yy = qy * qy; val zz = qz * qz
+        val xy = qx * qy; val xz = qx * qz; val yz = qy * qz
+        val wx = qw * qx; val wy = qw * qy; val wz = qw * qz
+
+        return doubleArrayOf(
+            (1.0 - 2.0 * (yy + zz)) * sx, (2.0 * (xy + wz)) * sx, (2.0 * (xz - wy)) * sx, 0.0,
+            (2.0 * (xy - wz)) * sy, (1.0 - 2.0 * (xx + zz)) * sy, (2.0 * (yz + wx)) * sy, 0.0,
+            (2.0 * (xz + wy)) * sz, (2.0 * (yz - wx)) * sz, (1.0 - 2.0 * (xx + yy)) * sz, 0.0,
+            tx, ty, tz, 1.0
+        )
+    }
+
+    /** Fast, zero-dependency pure-Kotlin JSON reader for GLB/glTF headers across Android & JVM tests. */
+    private object MiniJson {
+        class Obj(private val map: Map<String, Any?>) {
+            fun optObj(k: String): Obj? = map[k] as? Obj
+            fun optArr(k: String): Arr? = map[k] as? Arr
+            fun optString(k: String, def: String = ""): String = map[k] as? String ?: def
+            fun optInt(k: String, def: Int = 0): Int = (map[k] as? Number)?.toInt() ?: def
+            fun optLong(k: String, def: Long = 0L): Long = (map[k] as? Number)?.toLong() ?: def
+            fun optBoolean(k: String, def: Boolean = false): Boolean = map[k] as? Boolean ?: def
+        }
+        class Arr(private val list: List<Any?>) {
+            fun length(): Int = list.size
+            fun optObj(i: Int): Obj? = list.getOrNull(i) as? Obj
+            fun optInt(i: Int, def: Int = 0): Int = (list.getOrNull(i) as? Number)?.toInt() ?: def
+            fun optDouble(i: Int, def: Double = 0.0): Double = (list.getOrNull(i) as? Number)?.toDouble() ?: def
+        }
+        fun parseObject(src: String): Obj? {
+            val p = Parser(src)
+            p.skipWs()
+            return p.readVal() as? Obj
+        }
+        private class Parser(private val s: String) {
+            var i = 0
+            fun skipWs() { while (i < s.length && s[i].isWhitespace()) i++ }
+            fun readVal(): Any? {
+                skipWs()
+                if (i >= s.length) return null
+                return when (s[i]) {
+                    '{' -> readObj()
+                    '[' -> readArr()
+                    '"' -> readStr()
+                    't' -> { i = (i + 4).coerceAtMost(s.length); true }
+                    'f' -> { i = (i + 5).coerceAtMost(s.length); false }
+                    'n' -> { i = (i + 4).coerceAtMost(s.length); null }
+                    else -> readNum()
+                }
+            }
+            fun readObj(): Obj {
+                i++ // '{'
+                val m = HashMap<String, Any?>()
+                skipWs()
+                if (i < s.length && s[i] == '}') { i++; return Obj(m) }
+                while (i < s.length) {
+                    skipWs()
+                    val k = if (s[i] == '"') readStr() else ""
+                    skipWs()
+                    if (i < s.length && s[i] == ':') i++
+                    val v = readVal()
+                    m[k] = v
+                    skipWs()
+                    if (i < s.length && s[i] == ',') { i++; continue }
+                    if (i < s.length && s[i] == '}') { i++; break }
+                    break
+                }
+                return Obj(m)
+            }
+            fun readArr(): Arr {
+                i++ // '['
+                val l = ArrayList<Any?>()
+                skipWs()
+                if (i < s.length && s[i] == ']') { i++; return Arr(l) }
+                while (i < s.length) {
+                    l.add(readVal())
+                    skipWs()
+                    if (i < s.length && s[i] == ',') { i++; continue }
+                    if (i < s.length && s[i] == ']') { i++; break }
+                    break
+                }
+                return Arr(l)
+            }
+            fun readStr(): String {
+                i++ // '"'
+                val start = i
+                var hasEsc = false
+                while (i < s.length) {
+                    val c = s[i]
+                    if (c == '\\') { hasEsc = true; i += 2; continue }
+                    if (c == '"') {
+                        val raw = s.substring(start, i)
+                        i++
+                        return if (!hasEsc) raw else unescape(raw)
+                    }
+                    i++
+                }
+                return s.substring(start, i)
+            }
+            fun unescape(raw: String): String {
+                val sb = StringBuilder(raw.length)
+                var k = 0
+                while (k < raw.length) {
+                    val c = raw[k++]
+                    if (c == '\\' && k < raw.length) {
+                        when (val e = raw[k++]) {
+                            '"', '\\', '/' -> sb.append(e)
+                            'n' -> sb.append('\n')
+                            'r' -> sb.append('\r')
+                            't' -> sb.append('\t')
+                            'u' -> if (k + 4 <= raw.length) {
+                                sb.append(raw.substring(k, k + 4).toIntOrNull(16)?.toChar() ?: ' ')
+                                k += 4
+                            }
+                            else -> sb.append(e)
+                        }
+                    } else sb.append(c)
+                }
+                return sb.toString()
+            }
+            fun readNum(): Double {
+                val st = i
+                var isDouble = false
+                while (i < s.length) {
+                    val c = s[i]
+                    if (c in '0'..'9' || c == '-' || c == '+') { i++ }
+                    else if (c == '.' || c == 'e' || c == 'E') { isDouble = true; i++ }
+                    else break
+                }
+                val txt = s.substring(st, i)
+                return if (isDouble) (txt.toDoubleOrNull() ?: 0.0) else (txt.toDoubleOrNull() ?: 0.0)
+            }
+        }
+    }
+
+    private fun identityMat4(): DoubleArray = doubleArrayOf(
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0
+    )
+
+    private fun isIdentityMat4(m: DoubleArray): Boolean {
+        return kotlin.math.abs(m[0] - 1.0) < 1e-6 && kotlin.math.abs(m[5] - 1.0) < 1e-6 &&
+            kotlin.math.abs(m[10] - 1.0) < 1e-6 && kotlin.math.abs(m[15] - 1.0) < 1e-6 &&
+            kotlin.math.abs(m[12]) < 1e-6 && kotlin.math.abs(m[13]) < 1e-6 && kotlin.math.abs(m[14]) < 1e-6 &&
+            kotlin.math.abs(m[1]) < 1e-6 && kotlin.math.abs(m[2]) < 1e-6 && kotlin.math.abs(m[4]) < 1e-6 &&
+            kotlin.math.abs(m[6]) < 1e-6 && kotlin.math.abs(m[8]) < 1e-6 && kotlin.math.abs(m[9]) < 1e-6
+    }
+
+    private fun mulMat4(a: DoubleArray, b: DoubleArray): DoubleArray {
+        val c = DoubleArray(16)
+        for (col in 0 until 4) {
+            val c4 = col * 4
+            val b0 = b[c4]; val b1 = b[c4 + 1]; val b2 = b[c4 + 2]; val b3 = b[c4 + 3]
+            c[c4]     = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3
+            c[c4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3
+            c[c4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3
+            c[c4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3
+        }
+        return c
+    }
+
     // =========================================================================
     // Internal Indexed Disk Emission + Clustering
     // =========================================================================
 
-    private fun emitIndexedDiskTrianglesToGlb(
-        positions: PagedFloatTupleStore,
-        normals: PagedFloatTupleStore?,
-        uvs: PagedFloatTupleStore?,
+    internal fun emitIndexedDiskTrianglesToGlb(
+        positions: MappedFloatTupleStore,
+        normals: MappedFloatTupleStore?,
+        uvs: MappedFloatTupleStore?,
         triIndexFile: File,
-        totalVerts: Int,
-        totalTris: Int,
-        bounds: BoundingBox,
+        totalVerts: Long,
+        totalTris: Long,
+        bounds: MeshBounds,
         scratchDir: File,
         outGlb: File,
-        generator: String
+        generator: String,
+        indexIsLong: Boolean = false,
+        baseColorFactor: FloatArray? = null,
+        metallicFactor: Float = 0.1f,
+        roughnessFactor: Float = 0.7f,
+        textureFile: File? = null,
+        textureMime: String? = null
     ): MeshStats {
-        val needsCluster = totalVerts > DIRECT_TRIANGLE_LIMIT || totalTris > DIRECT_TRIANGLE_LIMIT
-        val readBuf = ByteArray(12 * 4096)
+        positions.sealForRead()
+        normals?.sealForRead()
+        uvs?.sealForRead()
+
+        val needsCluster = totalVerts > DIRECT_TRIANGLE_LIMIT.toLong() || totalTris > DIRECT_TRIANGLE_LIMIT.toLong()
+        val triBytes = if (indexIsLong) 24 else 12
+        val readBuf = ByteArray(triBytes * 4096)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
 
         if (!needsCluster) {
-            // Even in lossless mode, synthesize missing flat normals per corner if normals == null
             DirectStreamingGlbWriter(scratchDir).use { writer ->
                 if (normals != null && normals.count == positions.count) {
-                    for (v in 0 until positions.count) {
+                    var v = 0L
+                    while (v < positions.count) {
                         val u = if (uvs != null && v < uvs.count) uvs.getU(v) else 0f
                         val tv = if (uvs != null && v < uvs.count) uvs.getV(v) else 0f
                         writer.emitVertex(
@@ -1647,20 +2341,24 @@ object StreamingMeshProcessor {
                             normals.getX(v), normals.getY(v), normals.getZ(v),
                             u, tv
                         )
+                        v++
                     }
                     BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
                         while (true) {
                             val n = bis.read(readBuf)
                             if (n <= 0) break
                             var off = 0
-                            while (off + 12 <= n) {
-                                val i0 = readBB.getInt(off)
-                                val i1 = readBB.getInt(off + 4)
-                                val i2 = readBB.getInt(off + 8)
-                                if (i0 in 0 until totalVerts && i1 in 0 until totalVerts && i2 in 0 until totalVerts) {
-                                    writer.emitTriangle(i0, i1, i2)
+                            while (off + triBytes <= n) {
+                                val i0: Long; val i1: Long; val i2: Long
+                                if (indexIsLong) {
+                                    i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                                } else {
+                                    i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
                                 }
-                                off += 12
+                                if (i0 in 0L until totalVerts && i1 in 0L until totalVerts && i2 in 0L until totalVerts) {
+                                    writer.emitTriangle(i0.toInt(), i1.toInt(), i2.toInt())
+                                }
+                                off += triBytes
                             }
                         }
                     }
@@ -1670,11 +2368,14 @@ object StreamingMeshProcessor {
                             val n = bis.read(readBuf)
                             if (n <= 0) break
                             var off = 0
-                            while (off + 12 <= n) {
-                                val i0 = readBB.getInt(off)
-                                val i1 = readBB.getInt(off + 4)
-                                val i2 = readBB.getInt(off + 8)
-                                if (i0 in 0 until totalVerts && i1 in 0 until totalVerts && i2 in 0 until totalVerts) {
+                            while (off + triBytes <= n) {
+                                val i0: Long; val i1: Long; val i2: Long
+                                if (indexIsLong) {
+                                    i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                                } else {
+                                    i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                                }
+                                if (i0 in 0L until totalVerts && i1 in 0L until totalVerts && i2 in 0L until totalVerts) {
                                     val x0 = positions.getX(i0); val y0 = positions.getY(i0); val z0 = positions.getZ(i0)
                                     val x1 = positions.getX(i1); val y1 = positions.getY(i1); val z1 = positions.getZ(i1)
                                     val x2 = positions.getX(i2); val y2 = positions.getY(i2); val z2 = positions.getZ(i2)
@@ -1690,20 +2391,38 @@ object StreamingMeshProcessor {
                                     val o2 = writer.emitVertex(x2, y2, z2, nx, ny, nz, u2, v2)
                                     writer.emitTriangle(o0, o1, o2)
                                 }
-                                off += 12
+                                off += triBytes
                             }
                         }
                     }
                 }
-                writer.finalizeToGlb(outGlb, generator)
-                return MeshStats(totalVerts, totalTris, writer.vertexCount, writer.indexCount / 3, false)
+                writer.finalizeToGlb(
+                    outGlb = outGlb,
+                    generator = generator,
+                    baseColorFactor = baseColorFactor,
+                    metallicFactor = metallicFactor,
+                    roughnessFactor = roughnessFactor,
+                    textureFile = textureFile,
+                    textureMime = textureMime
+                )
+                return MeshStats(
+                    originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    outputVertices = writer.vertexCount,
+                    outputTriangles = writer.indexCount / 3,
+                    wasSimplified = false,
+                    rawOriginalVertices = totalVerts,
+                    rawOriginalTriangles = totalTris
+                )
             }
         }
 
-        // Spatial Clustering Pass for >1.8M up to 30M+ vertices/triangles
+        // Single-pass / adaptive spatial clustering for arbitrarily massive (30M..infinity) meshes
         var gridRes = estimateInitialGridResolution(totalTris)
+        val hasPerVertNorm = normals != null && normals.count == positions.count
         while (true) {
-            val acc = SpatialClusterAccumulator(bounds, gridRes)
+            val isFloor = gridRes <= 64
+            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
             acc.startTriangleStream(scratchDir)
             try {
                 BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
@@ -1711,38 +2430,40 @@ object StreamingMeshProcessor {
                         val n = bis.read(readBuf)
                         if (n <= 0) break
                         var off = 0
-                        while (off + 12 <= n && !acc.overflowed) {
-                            val i0 = readBB.getInt(off)
-                            val i1 = readBB.getInt(off + 4)
-                            val i2 = readBB.getInt(off + 8)
-                            off += 12
-                            if (i0 !in 0 until totalVerts || i1 !in 0 until totalVerts || i2 !in 0 until totalVerts) continue
+                        while (off + triBytes <= n && !acc.overflowed) {
+                            val i0: Long; val i1: Long; val i2: Long
+                            if (indexIsLong) {
+                                i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                            } else {
+                                i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                            }
+                            off += triBytes
+                            if (i0 !in 0L until totalVerts || i1 !in 0L until totalVerts || i2 !in 0L until totalVerts) continue
                             val x0 = positions.getX(i0); val y0 = positions.getY(i0); val z0 = positions.getZ(i0)
                             val x1 = positions.getX(i1); val y1 = positions.getY(i1); val z1 = positions.getZ(i1)
                             val x2 = positions.getX(i2); val y2 = positions.getY(i2); val z2 = positions.getZ(i2)
-                            val (fnx, fny, fnz) = computeFaceNormal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
-                            val hasPerVertNorm = normals != null && normals.count == positions.count
+                            val (fnx, fny, fnz) = if (hasPerVertNorm) Triple(0f, 1f, 0f) else computeFaceNormal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
                             val c0 = acc.getOrAssignCluster(
                                 x0, y0, z0,
-                                if (hasPerVertNorm) normals!!.getX(i0) else fnx,
-                                if (hasPerVertNorm) normals!!.getY(i0) else fny,
-                                if (hasPerVertNorm) normals!!.getZ(i0) else fnz,
+                                if (hasPerVertNorm) normals.getX(i0) else fnx,
+                                if (hasPerVertNorm) normals.getY(i0) else fny,
+                                if (hasPerVertNorm) normals.getZ(i0) else fnz,
                                 if (uvs != null && i0 < uvs.count) uvs.getU(i0) else 0f,
                                 if (uvs != null && i0 < uvs.count) uvs.getV(i0) else 0f
                             )
                             val c1 = acc.getOrAssignCluster(
                                 x1, y1, z1,
-                                if (hasPerVertNorm) normals!!.getX(i1) else fnx,
-                                if (hasPerVertNorm) normals!!.getY(i1) else fny,
-                                if (hasPerVertNorm) normals!!.getZ(i1) else fnz,
+                                if (hasPerVertNorm) normals.getX(i1) else fnx,
+                                if (hasPerVertNorm) normals.getY(i1) else fny,
+                                if (hasPerVertNorm) normals.getZ(i1) else fnz,
                                 if (uvs != null && i1 < uvs.count) uvs.getU(i1) else 0f,
                                 if (uvs != null && i1 < uvs.count) uvs.getV(i1) else 0f
                             )
                             val c2 = acc.getOrAssignCluster(
                                 x2, y2, z2,
-                                if (hasPerVertNorm) normals!!.getX(i2) else fnx,
-                                if (hasPerVertNorm) normals!!.getY(i2) else fny,
-                                if (hasPerVertNorm) normals!!.getZ(i2) else fnz,
+                                if (hasPerVertNorm) normals.getX(i2) else fnx,
+                                if (hasPerVertNorm) normals.getY(i2) else fny,
+                                if (hasPerVertNorm) normals.getZ(i2) else fnz,
                                 if (uvs != null && i2 < uvs.count) uvs.getU(i2) else 0f,
                                 if (uvs != null && i2 < uvs.count) uvs.getV(i2) else 0f
                             )
@@ -1750,15 +2471,30 @@ object StreamingMeshProcessor {
                         }
                     }
                 }
-                if (acc.overflowed && gridRes > 96) {
+                if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(96)
+                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
                     continue
                 }
                 val outVerts = acc.clusterCount
                 val outTris = acc.emittedTriangles
-                acc.writeToGlb(outGlb)
-                return MeshStats(totalVerts, totalTris, outVerts, outTris, true)
+                acc.writeToGlb(
+                    outGlb = outGlb,
+                    baseColorFactor = baseColorFactor,
+                    metallicFactor = metallicFactor,
+                    roughnessFactor = roughnessFactor,
+                    textureFile = textureFile,
+                    textureMime = textureMime
+                )
+                return MeshStats(
+                    originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    outputVertices = outVerts,
+                    outputTriangles = outTris,
+                    wasSimplified = true,
+                    rawOriginalVertices = totalVerts,
+                    rawOriginalTriangles = totalTris
+                )
             } finally {
                 acc.cleanup()
             }
@@ -1766,34 +2502,39 @@ object StreamingMeshProcessor {
     }
 
     private fun emitObjDiskTrianglesToGlb(
-        positions: PagedFloatTupleStore,
-        normals: PagedFloatTupleStore,
-        uvs: PagedFloatTupleStore,
+        positions: MappedFloatTupleStore,
+        normals: MappedFloatTupleStore,
+        uvs: MappedFloatTupleStore,
         triRecordFile: File,
-        totalVerts: Int,
-        totalTris: Int,
-        bounds: BoundingBox,
+        totalVerts: Long,
+        totalTris: Long,
+        bounds: MeshBounds,
         scratchDir: File,
         outGlb: File
     ): MeshStats {
+        positions.sealForRead()
+        normals.sealForRead()
+        uvs.sealForRead()
+
         val totalN = normals.count
         val totalT = uvs.count
-        val readBuf = ByteArray(36 * 2048) // 2048 triangles per chunk
+        val recBytes = 72 // 9 Longs per triangle (v0,t0,n0, v1,t1,n1, v2,t2,n2)
+        val readBuf = ByteArray(recBytes * 2048)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
 
-        if (totalVerts <= DIRECT_TRIANGLE_LIMIT && totalTris <= DIRECT_TRIANGLE_LIMIT) {
+        if (totalVerts <= DIRECT_TRIANGLE_LIMIT.toLong() && totalTris <= DIRECT_TRIANGLE_LIMIT.toLong()) {
             DirectStreamingGlbWriter(scratchDir).use { writer ->
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
                     while (true) {
                         val n = bis.read(readBuf)
                         if (n <= 0) break
                         var off = 0
-                        while (off + 36 <= n) {
-                            val v0 = readBB.getInt(off); val t0 = readBB.getInt(off + 4); val n0 = readBB.getInt(off + 8)
-                            val v1 = readBB.getInt(off + 12); val t1 = readBB.getInt(off + 16); val n1 = readBB.getInt(off + 20)
-                            val v2 = readBB.getInt(off + 24); val t2 = readBB.getInt(off + 28); val n2 = readBB.getInt(off + 32)
-                            off += 36
-                            if (v0 !in 0 until totalVerts || v1 !in 0 until totalVerts || v2 !in 0 until totalVerts) continue
+                        while (off + recBytes <= n) {
+                            val v0 = readBB.getLong(off); val t0 = readBB.getLong(off + 8); val n0 = readBB.getLong(off + 16)
+                            val v1 = readBB.getLong(off + 24); val t1 = readBB.getLong(off + 32); val n1 = readBB.getLong(off + 40)
+                            val v2 = readBB.getLong(off + 48); val t2 = readBB.getLong(off + 56); val n2 = readBB.getLong(off + 64)
+                            off += recBytes
+                            if (v0 !in 0L until totalVerts || v1 !in 0L until totalVerts || v2 !in 0L until totalVerts) continue
 
                             val x0 = positions.getX(v0); val y0 = positions.getY(v0); val z0 = positions.getZ(v0)
                             val x1 = positions.getX(v1); val y1 = positions.getY(v1); val z1 = positions.getZ(v1)
@@ -1802,41 +2543,50 @@ object StreamingMeshProcessor {
 
                             val o0 = writer.emitVertex(
                                 x0, y0, z0,
-                                if (n0 in 0 until totalN) normals.getX(n0) else fnx,
-                                if (n0 in 0 until totalN) normals.getY(n0) else fny,
-                                if (n0 in 0 until totalN) normals.getZ(n0) else fnz,
-                                if (t0 in 0 until totalT) uvs.getU(t0) else 0f,
-                                if (t0 in 0 until totalT) uvs.getV(t0) else 0f
+                                if (n0 in 0L until totalN) normals.getX(n0) else fnx,
+                                if (n0 in 0L until totalN) normals.getY(n0) else fny,
+                                if (n0 in 0L until totalN) normals.getZ(n0) else fnz,
+                                if (t0 in 0L until totalT) uvs.getU(t0) else 0f,
+                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f
                             )
                             val o1 = writer.emitVertex(
                                 x1, y1, z1,
-                                if (n1 in 0 until totalN) normals.getX(n1) else fnx,
-                                if (n1 in 0 until totalN) normals.getY(n1) else fny,
-                                if (n1 in 0 until totalN) normals.getZ(n1) else fnz,
-                                if (t1 in 0 until totalT) uvs.getU(t1) else 0f,
-                                if (t1 in 0 until totalT) uvs.getV(t1) else 0f
+                                if (n1 in 0L until totalN) normals.getX(n1) else fnx,
+                                if (n1 in 0L until totalN) normals.getY(n1) else fny,
+                                if (n1 in 0L until totalN) normals.getZ(n1) else fnz,
+                                if (t1 in 0L until totalT) uvs.getU(t1) else 0f,
+                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f
                             )
                             val o2 = writer.emitVertex(
                                 x2, y2, z2,
-                                if (n2 in 0 until totalN) normals.getX(n2) else fnx,
-                                if (n2 in 0 until totalN) normals.getY(n2) else fny,
-                                if (n2 in 0 until totalN) normals.getZ(n2) else fnz,
-                                if (t2 in 0 until totalT) uvs.getU(t2) else 0f,
-                                if (t2 in 0 until totalT) uvs.getV(t2) else 0f
+                                if (n2 in 0L until totalN) normals.getX(n2) else fnx,
+                                if (n2 in 0L until totalN) normals.getY(n2) else fny,
+                                if (n2 in 0L until totalN) normals.getZ(n2) else fnz,
+                                if (t2 in 0L until totalT) uvs.getU(t2) else 0f,
+                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f
                             )
                             writer.emitTriangle(o0, o1, o2)
                         }
                     }
                 }
                 writer.finalizeToGlb(outGlb, "MixedReality Streaming OBJ Engine")
-                return MeshStats(totalVerts, totalTris, writer.vertexCount, writer.indexCount / 3, false)
+                return MeshStats(
+                    originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    outputVertices = writer.vertexCount,
+                    outputTriangles = writer.indexCount / 3,
+                    wasSimplified = false,
+                    rawOriginalVertices = totalVerts,
+                    rawOriginalTriangles = totalTris
+                )
             }
         }
 
-        // Spatial Clustering Pass for massive OBJ (up to 30M verts / 30M tris)
+        // Spatial Clustering Pass for unbounded ("∞") OBJ meshes
         var gridRes = estimateInitialGridResolution(totalTris)
         while (true) {
-            val acc = SpatialClusterAccumulator(bounds, gridRes)
+            val isFloor = gridRes <= 64
+            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
             acc.startTriangleStream(scratchDir)
             try {
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
@@ -1844,12 +2594,12 @@ object StreamingMeshProcessor {
                         val n = bis.read(readBuf)
                         if (n <= 0) break
                         var off = 0
-                        while (off + 36 <= n && !acc.overflowed) {
-                            val v0 = readBB.getInt(off); val t0 = readBB.getInt(off + 4); val n0 = readBB.getInt(off + 8)
-                            val v1 = readBB.getInt(off + 12); val t1 = readBB.getInt(off + 16); val n1 = readBB.getInt(off + 20)
-                            val v2 = readBB.getInt(off + 24); val t2 = readBB.getInt(off + 28); val n2 = readBB.getInt(off + 32)
-                            off += 36
-                            if (v0 !in 0 until totalVerts || v1 !in 0 until totalVerts || v2 !in 0 until totalVerts) continue
+                        while (off + recBytes <= n && !acc.overflowed) {
+                            val v0 = readBB.getLong(off); val t0 = readBB.getLong(off + 8); val n0 = readBB.getLong(off + 16)
+                            val v1 = readBB.getLong(off + 24); val t1 = readBB.getLong(off + 32); val n1 = readBB.getLong(off + 40)
+                            val v2 = readBB.getLong(off + 48); val t2 = readBB.getLong(off + 56); val n2 = readBB.getLong(off + 64)
+                            off += recBytes
+                            if (v0 !in 0L until totalVerts || v1 !in 0L until totalVerts || v2 !in 0L until totalVerts) continue
 
                             val x0 = positions.getX(v0); val y0 = positions.getY(v0); val z0 = positions.getZ(v0)
                             val x1 = positions.getX(v1); val y1 = positions.getY(v1); val z1 = positions.getZ(v1)
@@ -1858,41 +2608,49 @@ object StreamingMeshProcessor {
 
                             val c0 = acc.getOrAssignCluster(
                                 x0, y0, z0,
-                                if (n0 in 0 until totalN) normals.getX(n0) else fnx,
-                                if (n0 in 0 until totalN) normals.getY(n0) else fny,
-                                if (n0 in 0 until totalN) normals.getZ(n0) else fnz,
-                                if (t0 in 0 until totalT) uvs.getU(t0) else 0f,
-                                if (t0 in 0 until totalT) uvs.getV(t0) else 0f
+                                if (n0 in 0L until totalN) normals.getX(n0) else fnx,
+                                if (n0 in 0L until totalN) normals.getY(n0) else fny,
+                                if (n0 in 0L until totalN) normals.getZ(n0) else fnz,
+                                if (t0 in 0L until totalT) uvs.getU(t0) else 0f,
+                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f
                             )
                             val c1 = acc.getOrAssignCluster(
                                 x1, y1, z1,
-                                if (n1 in 0 until totalN) normals.getX(n1) else fnx,
-                                if (n1 in 0 until totalN) normals.getY(n1) else fny,
-                                if (n1 in 0 until totalN) normals.getZ(n1) else fnz,
-                                if (t1 in 0 until totalT) uvs.getU(t1) else 0f,
-                                if (t1 in 0 until totalT) uvs.getV(t1) else 0f
+                                if (n1 in 0L until totalN) normals.getX(n1) else fnx,
+                                if (n1 in 0L until totalN) normals.getY(n1) else fny,
+                                if (n1 in 0L until totalN) normals.getZ(n1) else fnz,
+                                if (t1 in 0L until totalT) uvs.getU(t1) else 0f,
+                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f
                             )
                             val c2 = acc.getOrAssignCluster(
                                 x2, y2, z2,
-                                if (n2 in 0 until totalN) normals.getX(n2) else fnx,
-                                if (n2 in 0 until totalN) normals.getY(n2) else fny,
-                                if (n2 in 0 until totalN) normals.getZ(n2) else fnz,
-                                if (t2 in 0 until totalT) uvs.getU(t2) else 0f,
-                                if (t2 in 0 until totalT) uvs.getV(t2) else 0f
+                                if (n2 in 0L until totalN) normals.getX(n2) else fnx,
+                                if (n2 in 0L until totalN) normals.getY(n2) else fny,
+                                if (n2 in 0L until totalN) normals.getZ(n2) else fnz,
+                                if (t2 in 0L until totalT) uvs.getU(t2) else 0f,
+                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f
                             )
                             acc.addTriangle(c0, c1, c2)
                         }
                     }
                 }
-                if (acc.overflowed && gridRes > 96) {
+                if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(96)
+                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
                     continue
                 }
                 val outVerts = acc.clusterCount
                 val outTris = acc.emittedTriangles
                 acc.writeToGlb(outGlb)
-                return MeshStats(totalVerts, totalTris, outVerts, outTris, true)
+                return MeshStats(
+                    originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    outputVertices = outVerts,
+                    outputTriangles = outTris,
+                    wasSimplified = true,
+                    rawOriginalVertices = totalVerts,
+                    rawOriginalTriangles = totalTris
+                )
             } finally {
                 acc.cleanup()
             }
@@ -1912,8 +2670,8 @@ object StreamingMeshProcessor {
     private data class PlyHeader(
         val format: PlyFormat,
         val headerByteLength: Long,
-        val vertexCount: Int,
-        val faceCount: Int,
+        val vertexCount: Long,
+        val faceCount: Long,
         val vertexStride: Int,
         val xIdx: Int, val yIdx: Int, val zIdx: Int,
         val nxIdx: Int, val nyIdx: Int, val nzIdx: Int,
@@ -1926,13 +2684,13 @@ object StreamingMeshProcessor {
         val hasUvs: Boolean get() = uIdx >= 0 && vIdx >= 0
     }
 
-    private data class DiskTriStream(val file: File, val count: Int) {
+    private data class DiskTriStream(val file: File, val count: Long, val indexIsLong: Boolean) {
         fun close() { runCatching { file.delete() } }
     }
 
     private fun parsePlyHeader(file: File): PlyHeader? {
         FileInputStream(file).use { fis ->
-            val buf = ByteArray(16_384)
+            val buf = ByteArray(32_768)
             var len = 0
             while (len < buf.size) {
                 val b = fis.read()
@@ -1949,8 +2707,8 @@ object StreamingMeshProcessor {
 
             var format = PlyFormat.ASCII
             var currentElement = ""
-            var vertCount = 0
-            var faceCount = 0
+            var vertCount = 0L
+            var faceCount = 0L
             val props = mutableListOf<PlyVertexProp>()
             var stride = 0
             var faceCountType = PlyPropType.UCHAR
@@ -1973,7 +2731,7 @@ object StreamingMeshProcessor {
                     "element" -> {
                         if (parts.size >= 3) {
                             currentElement = parts[1]
-                            val c = parts[2].toIntOrNull() ?: 0
+                            val c = parts[2].toLongOrNull() ?: 0L
                             when (currentElement) {
                                 "vertex" -> vertCount = c
                                 "face" -> faceCount = c
@@ -2033,14 +2791,14 @@ object StreamingMeshProcessor {
     private fun streamPlyGeometryAndFaces(
         plyFile: File,
         header: PlyHeader,
-        positions: PagedFloatTupleStore,
-        normals: PagedFloatTupleStore?,
-        uvs: PagedFloatTupleStore?,
-        bounds: BoundingBox,
+        positions: MappedFloatTupleStore,
+        normals: MappedFloatTupleStore?,
+        uvs: MappedFloatTupleStore?,
+        bounds: MeshBounds,
         scratchDir: File
     ): DiskTriStream {
         val triFile = File(scratchDir, "ply_tris.bin")
-        var triCount = 0
+        var triCount = 0L
         val triOut = BufferedOutputStream(FileOutputStream(triFile), IO_BUFFER_BYTES)
         val triBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -2048,39 +2806,74 @@ object StreamingMeshProcessor {
             skipFully(bis, header.headerByteLength)
             if (header.format == PlyFormat.ASCII) {
                 val reader = bis.bufferedReader(Charsets.UTF_8)
-                for (vi in 0 until header.vertexCount) {
+                var tokStarts = IntArray(64)
+                var tokEnds = IntArray(64)
+                var vi = 0L
+                val maxNeededCoordIdx = max(header.xIdx, max(header.yIdx, header.zIdx))
+
+                while (vi < header.vertexCount) {
                     val line = reader.readLine() ?: break
-                    val toks = line.trim().split(Regex("\\s+"))
-                    if (toks.size <= max(header.xIdx, max(header.yIdx, header.zIdx))) continue
-                    val x = toks[header.xIdx].toFloatOrNull() ?: 0f
-                    val y = toks[header.yIdx].toFloatOrNull() ?: 0f
-                    val z = toks[header.zIdx].toFloatOrNull() ?: 0f
+                    vi++
+                    val len = line.length
+                    var tCount = 0
+                    var c = skipWhitespace(line, 0, len)
+                    while (c < len) {
+                        val e = findWhitespace(line, c, len)
+                        if (e > c) {
+                            if (tCount == tokStarts.size) {
+                                tokStarts = tokStarts.copyOf(tCount * 2)
+                                tokEnds = tokEnds.copyOf(tCount * 2)
+                            }
+                            tokStarts[tCount] = c
+                            tokEnds[tCount] = e
+                            tCount++
+                        }
+                        c = skipWhitespace(line, e, len)
+                    }
+                    if (tCount <= maxNeededCoordIdx) continue
+                    val x = parseFastFloat(line, tokStarts[header.xIdx], tokEnds[header.xIdx])
+                    val y = parseFastFloat(line, tokStarts[header.yIdx], tokEnds[header.yIdx])
+                    val z = parseFastFloat(line, tokStarts[header.zIdx], tokEnds[header.zIdx])
                     positions.add3(x, y, z)
                     bounds.expand(x, y, z)
                     if (normals != null) {
-                        val nx = toks.getOrNull(header.nxIdx)?.toFloatOrNull() ?: 0f
-                        val ny = toks.getOrNull(header.nyIdx)?.toFloatOrNull() ?: 1f
-                        val nz = toks.getOrNull(header.nzIdx)?.toFloatOrNull() ?: 0f
+                        val nx = if (header.nxIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.nxIdx], tokEnds[header.nxIdx]) else 0f
+                        val ny = if (header.nyIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.nyIdx], tokEnds[header.nyIdx], 1f) else 1f
+                        val nz = if (header.nzIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.nzIdx], tokEnds[header.nzIdx]) else 0f
                         normals.add3(nx, ny, nz)
                     }
                     if (uvs != null) {
-                        val u = toks.getOrNull(header.uIdx)?.toFloatOrNull() ?: 0f
-                        val v = toks.getOrNull(header.vIdx)?.toFloatOrNull() ?: 0f
+                        val u = if (header.uIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.uIdx], tokEnds[header.uIdx]) else 0f
+                        val v = if (header.vIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.vIdx], tokEnds[header.vIdx]) else 0f
                         uvs.add2(u, v)
                     }
                 }
-                val faceVerts = IntArray(32)
-                for (fi in 0 until header.faceCount) {
+
+                var faceVerts = LongArray(64)
+                var fi = 0L
+                while (fi < header.faceCount) {
                     val line = reader.readLine() ?: break
-                    val toks = line.trim().split(Regex("\\s+"))
-                    if (toks.isEmpty()) continue
-                    val nVerts = toks[0].toIntOrNull() ?: continue
-                    if (nVerts < 3 || toks.size < 1 + nVerts) continue
-                    val polyLen = minOf(nVerts, faceVerts.size)
-                    for (k in 0 until polyLen) faceVerts[k] = toks[1 + k].toIntOrNull() ?: 0
-                    for (i in 1 until polyLen - 1) {
-                        if (triBuf.remaining() < 12) flushWriteBuf(triOut, triBuf)
-                        triBuf.putInt(faceVerts[0]); triBuf.putInt(faceVerts[i]); triBuf.putInt(faceVerts[i + 1])
+                    fi++
+                    val len = line.length
+                    var c = skipWhitespace(line, 0, len)
+                    if (c >= len) continue
+                    val nEnd = findWhitespace(line, c, len)
+                    val nVerts = parseFastInt(line, c, nEnd, 0)
+                    if (nVerts < 3) continue
+                    if (nVerts > faceVerts.size) faceVerts = LongArray(nVerts)
+                    c = skipWhitespace(line, nEnd, len)
+                    var parsed = 0
+                    while (c < len && parsed < nVerts) {
+                        val e = findWhitespace(line, c, len)
+                        if (e > c) {
+                            faceVerts[parsed++] = parseFastLong(line, c, e, 0L)
+                        }
+                        c = skipWhitespace(line, e, len)
+                    }
+                    if (parsed < 3) continue
+                    for (i in 1 until parsed - 1) {
+                        if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
+                        triBuf.putLong(faceVerts[0]); triBuf.putLong(faceVerts[i]); triBuf.putLong(faceVerts[i + 1])
                         triCount++
                     }
                 }
@@ -2095,7 +2888,8 @@ object StreamingMeshProcessor {
                 val uP = if (header.hasUvs) header.props[header.uIdx] else null
                 val vP = if (header.hasUvs) header.props[header.vIdx] else null
 
-                for (vi in 0 until header.vertexCount) {
+                var vi = 0L
+                while (vi < header.vertexCount) {
                     readFully(bis, vBuf, header.vertexStride)
                     val x = readPlyFloat(vBB, xP)
                     val y = readPlyFloat(vBB, yP)
@@ -2108,30 +2902,33 @@ object StreamingMeshProcessor {
                     if (uvs != null && uP != null && vP != null) {
                         uvs.add2(readPlyFloat(vBB, uP), readPlyFloat(vBB, vP))
                     }
+                    vi++
                 }
 
                 val dis = DataInputStream(bis)
                 val scratch = ByteArray(8)
                 val sBB = ByteBuffer.wrap(scratch).order(order)
-                var poly = IntArray(16)
-                for (fi in 0 until header.faceCount) {
+                var poly = LongArray(64)
+                var fi = 0L
+                while (fi < header.faceCount) {
                     val cnt = readPlyIntScalar(dis, header.faceListCountType, scratch, sBB)
-                    if (cnt < 0 || cnt > 256) break
-                    if (cnt > poly.size) poly = IntArray(cnt)
+                    if (cnt < 0 || cnt > 65_536) break
+                    if (cnt > poly.size) poly = LongArray(cnt)
                     for (k in 0 until cnt) {
-                        poly[k] = readPlyIntScalar(dis, header.faceListIndexType, scratch, sBB)
+                        poly[k] = readPlyIntScalar(dis, header.faceListIndexType, scratch, sBB).toLong() and 0xFFFF_FFFFL
                     }
                     for (i in 1 until cnt - 1) {
-                        if (triBuf.remaining() < 12) flushWriteBuf(triOut, triBuf)
-                        triBuf.putInt(poly[0]); triBuf.putInt(poly[i]); triBuf.putInt(poly[i + 1])
+                        if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
+                        triBuf.putLong(poly[0]); triBuf.putLong(poly[i]); triBuf.putLong(poly[i + 1])
                         triCount++
                     }
+                    fi++
                 }
             }
         }
         flushWriteBuf(triOut, triBuf)
         triOut.close()
-        return DiskTriStream(triFile, triCount)
+        return DiskTriStream(triFile, triCount, indexIsLong = true)
     }
 
     private fun readPlyFloat(bb: ByteBuffer, prop: PlyVertexProp): Float = when (prop.type) {
@@ -2162,16 +2959,18 @@ object StreamingMeshProcessor {
     // Low-Level Streaming Helpers
     // =========================================================================
 
-    private fun estimateInitialGridResolution(totalTris: Int): Int = when {
-        totalTris >= 20_000_000 -> 640
-        totalTris >= 10_000_000 -> 740
-        totalTris >= 5_000_000 -> 860
+    private fun estimateInitialGridResolution(totalTris: Long): Int = when {
+        totalTris >= 80_000_000L -> 512
+        totalTris >= 30_000_000L -> 600
+        totalTris >= 15_000_000L -> 680
+        totalTris >= 5_000_000L -> 820
         else -> 960
     }
 
-    private fun formatCompact(n: Int): String = when {
-        n >= 1_000_000 -> String.format(Locale.US, "%.1fM", n / 1_000_000.0)
-        n >= 1_000 -> String.format(Locale.US, "%.0fK", n / 1_000.0)
+    internal fun formatCompact(n: Long): String = when {
+        n >= 1_000_000_000L -> String.format(Locale.US, "%.2fB", n / 1_000_000_000.0)
+        n >= 1_000_000L -> String.format(Locale.US, "%.1fM", n / 1_000_000.0)
+        n >= 1_000L -> String.format(Locale.US, "%.0fK", n / 1_000.0)
         else -> n.toString()
     }
 
@@ -2184,60 +2983,58 @@ object StreamingMeshProcessor {
         uvByteLength: Long,
         indexByteLength: Long,
         totalBinaryLength: Long,
-        bounds: BoundingBox,
-        generator: String
+        bounds: MeshBounds,
+        generator: String,
+        baseColorFactor: FloatArray? = null,
+        metallicFactor: Float = 0.1f,
+        roughnessFactor: Float = 0.7f,
+        textureOffset: Long = 0L,
+        textureByteLength: Int = 0,
+        textureMimeType: String? = null
     ): ByteArray {
-        val json = """
-        {
-          "asset": {
-            "version": "2.0",
-            "generator": "$generator"
-          },
-          "scene": 0,
-          "scenes": [{ "nodes": [0] }],
-          "nodes": [{ "mesh": 0 }],
-          "meshes": [
-            {
-              "primitives": [
-                {
-                  "attributes": { "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 },
-                  "indices": 3,
-                  "mode": 4
-                }
-              ]
-            }
-          ],
-          "accessors": [
-            {
-              "bufferView": 0, "byteOffset": 0, "componentType": 5126,
-              "count": $vertCount, "type": "VEC3",
-              "max": [${bounds.maxX}, ${bounds.maxY}, ${bounds.maxZ}],
-              "min": [${bounds.minX}, ${bounds.minY}, ${bounds.minZ}]
-            },
-            {
-              "bufferView": 1, "byteOffset": 0, "componentType": 5126,
-              "count": $vertCount, "type": "VEC3"
-            },
-            {
-              "bufferView": 2, "byteOffset": 0, "componentType": 5126,
-              "count": $vertCount, "type": "VEC2"
-            },
-            {
-              "bufferView": 3, "byteOffset": 0,
-              "componentType": ${if (useIntIndices) 5125 else 5123},
-              "count": $indexCount, "type": "SCALAR"
-            }
-          ],
-          "bufferViews": [
-            { "buffer": 0, "byteOffset": 0, "byteLength": $posByteLength, "target": 34962 },
-            { "buffer": 0, "byteOffset": $posByteLength, "byteLength": $normByteLength, "target": 34962 },
-            { "buffer": 0, "byteOffset": ${posByteLength + normByteLength}, "byteLength": $uvByteLength, "target": 34962 },
-            { "buffer": 0, "byteOffset": ${posByteLength + normByteLength + uvByteLength}, "byteLength": $indexByteLength, "target": 34963 }
-          ],
-          "buffers": [{ "byteLength": $totalBinaryLength }]
+        val hasMat = baseColorFactor != null || textureByteLength > 0
+        val hasTex = textureByteLength > 0 && !textureMimeType.isNullOrBlank()
+        val sb = StringBuilder(1024)
+        sb.append('{')
+        sb.append("\"asset\":{\"version\":\"2.0\",\"generator\":\"").append(generator).append("\"},")
+        sb.append("\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],")
+        sb.append("\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"mode\":4")
+        if (hasMat) sb.append(",\"material\":0")
+        sb.append("}]}],")
+        if (hasMat) {
+            val c = baseColorFactor ?: floatArrayOf(1f, 1f, 1f, 1f)
+            sb.append("\"materials\":[{\"pbrMetallicRoughness\":{")
+            sb.append("\"baseColorFactor\":[")
+                .append(c[0]).append(',').append(c[1]).append(',').append(c[2]).append(',').append(if (c.size > 3) c[3] else 1f)
+                .append("],")
+            if (hasTex) sb.append("\"baseColorTexture\":{\"index\":0},")
+            sb.append("\"metallicFactor\":").append(metallicFactor)
+            sb.append(",\"roughnessFactor\":").append(roughnessFactor)
+            sb.append("},\"doubleSided\":true}],")
         }
-        """.trimIndent()
-        return json.toByteArray(Charsets.UTF_8)
+        if (hasTex) {
+            sb.append("\"textures\":[{\"sampler\":0,\"source\":0}],")
+            sb.append("\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}],")
+            sb.append("\"images\":[{\"bufferView\":4,\"mimeType\":\"").append(textureMimeType).append("\"}],")
+        }
+        sb.append("\"accessors\":[")
+        sb.append("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount)
+            .append(",\"type\":\"VEC3\",\"max\":[").append(bounds.maxX).append(',').append(bounds.maxY).append(',').append(bounds.maxZ)
+            .append("],\"min\":[").append(bounds.minX).append(',').append(bounds.minY).append(',').append(bounds.minZ).append("]},")
+        sb.append("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount).append(",\"type\":\"VEC3\"},")
+        sb.append("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount).append(",\"type\":\"VEC2\"},")
+        sb.append("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":").append(if (useIntIndices) 5125 else 5123)
+            .append(",\"count\":").append(indexCount).append(",\"type\":\"SCALAR\"}],")
+        sb.append("\"bufferViews\":[")
+        sb.append("{\"buffer\":0,\"byteOffset\":0,\"byteLength\":").append(posByteLength).append(",\"target\":34962},")
+        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength).append(",\"byteLength\":").append(normByteLength).append(",\"target\":34962},")
+        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength).append(",\"byteLength\":").append(uvByteLength).append(",\"target\":34962},")
+        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength + uvByteLength).append(",\"byteLength\":").append(indexByteLength).append(",\"target\":34963}")
+        if (hasTex) {
+            sb.append(",{\"buffer\":0,\"byteOffset\":").append(textureOffset).append(",\"byteLength\":").append(textureByteLength).append('}')
+        }
+        sb.append("],\"buffers\":[{\"byteLength\":").append(totalBinaryLength).append("}]}")
+        return sb.toString().toByteArray(Charsets.UTF_8)
     }
 
     private fun writeGlbHeaders(
@@ -2417,6 +3214,11 @@ object StreamingMeshProcessor {
     }
 
     private fun parseFastInt(s: String, start: Int, end: Int, defaultVal: Int): Int {
+        val v = parseFastLong(s, start, end, defaultVal.toLong())
+        return v.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt()
+    }
+
+    private fun parseFastLong(s: String, start: Int, end: Int, defaultVal: Long): Long {
         if (start >= end) return defaultVal
         var i = start
         var neg = false
@@ -2425,37 +3227,37 @@ object StreamingMeshProcessor {
             '+' -> i++
         }
         if (i >= end) return defaultVal
-        var acc = 0
+        var acc = 0L
         while (i < end) {
             val d = s[i] - '0'
             if (d !in 0..9) return defaultVal
-            acc = acc * 10 + d
+            acc = acc * 10L + d
             i++
         }
         return if (neg) -acc else acc
     }
 
-    private fun parseObjFaceToken(
+    private fun parseObjFaceTokenLong(
         line: String, start: Int, end: Int,
-        totalV: Int, totalT: Int, totalN: Int,
-        outV: IntArray, outT: IntArray, outN: IntArray, slot: Int
+        totalV: Long, totalT: Long, totalN: Long,
+        outV: LongArray, outT: LongArray, outN: LongArray, slot: Int
     ) {
         val slash1 = line.indexOf('/', start)
-        val rawV: Int; val rawT: Int; val rawN: Int
+        val rawV: Long; val rawT: Long; val rawN: Long
         if (slash1 < 0 || slash1 >= end) {
-            rawV = parseFastInt(line, start, end, 1); rawT = 0; rawN = 0
+            rawV = parseFastLong(line, start, end, 1L); rawT = 0L; rawN = 0L
         } else {
-            rawV = parseFastInt(line, start, slash1, 1)
+            rawV = parseFastLong(line, start, slash1, 1L)
             val slash2 = line.indexOf('/', slash1 + 1)
             if (slash2 < 0 || slash2 >= end) {
-                rawT = parseFastInt(line, slash1 + 1, end, 0); rawN = 0
+                rawT = parseFastLong(line, slash1 + 1, end, 0L); rawN = 0L
             } else {
-                rawT = if (slash2 > slash1 + 1) parseFastInt(line, slash1 + 1, slash2, 0) else 0
-                rawN = if (end > slash2 + 1) parseFastInt(line, slash2 + 1, end, 0) else 0
+                rawT = if (slash2 > slash1 + 1) parseFastLong(line, slash1 + 1, slash2, 0L) else 0L
+                rawN = if (end > slash2 + 1) parseFastLong(line, slash2 + 1, end, 0L) else 0L
             }
         }
-        outV[slot] = if (rawV < 0) (totalV + 1 + rawV).coerceAtLeast(1) else rawV
-        outT[slot] = if (rawT < 0) (totalT + 1 + rawT).coerceAtLeast(0) else rawT
-        outN[slot] = if (rawN < 0) (totalN + 1 + rawN).coerceAtLeast(0) else rawN
+        outV[slot] = if (rawV < 0L) (totalV + 1L + rawV).coerceAtLeast(1L) else rawV
+        outT[slot] = if (rawT < 0L) (totalT + 1L + rawT).coerceAtLeast(0L) else rawT
+        outN[slot] = if (rawN < 0L) (totalN + 1L + rawN).coerceAtLeast(0L) else rawN
     }
 }

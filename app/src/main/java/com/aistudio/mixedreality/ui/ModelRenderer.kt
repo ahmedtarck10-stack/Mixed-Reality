@@ -38,9 +38,11 @@ import io.github.sceneview.node.ModelNode
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
 import io.github.sceneview.node.ViewNode
+import android.os.SystemClock
+import com.aistudio.mixedreality.util.StreamingMeshProcessor
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -125,9 +127,11 @@ fun rememberOptimizedModelState(
         suspend fun loadSingleFile(targetFile: File, allowFallback: Boolean): ModelLoadState {
             var activeResourceLoader: ResourceLoader? = null
             var createdAsset: FilamentAsset? = null
+            val retainedBuffers = ArrayList<ByteBuffer>(4)
             try {
                 state = ModelLoadState.Loading(0.05f, "Streaming geometry buffer...")
                 val mappedBuffer = mapOrStreamDirectBuffer(targetFile)
+                retainedBuffers.add(mappedBuffer)
 
                 val asset = modelLoader.assetLoader.createAsset(mappedBuffer)
                     ?: error("Filament could not parse ${targetFile.name} (unsupported or corrupt binary layout)")
@@ -148,6 +152,7 @@ fun rememberOptimizedModelState(
                             val sidecar = File(baseDir, resUri)
                             if (sidecar.exists() && sidecar.length() > 0L) {
                                 val sidecarBuf = mapOrStreamDirectBuffer(sidecar)
+                                retainedBuffers.add(sidecarBuf)
                                 resLoader.addResourceData(resUri, sidecarBuf)
                             }
                         }
@@ -158,11 +163,23 @@ fun rememberOptimizedModelState(
                 if (!resLoader.asyncBeginLoad(asset)) {
                     resLoader.loadResources(asset)
                 } else {
+                    var lastProgressEmitMs = 0L
                     while (resLoader.asyncGetLoadProgress() < 1.0f) {
-                        resLoader.asyncUpdateLoad()
-                        val prog = 0.15f + (resLoader.asyncGetLoadProgress().coerceIn(0f, 1f) * 0.80f)
-                        state = ModelLoadState.Loading(prog, "Decompressing & uploading (${(prog * 100).toInt()}%)...")
-                        delay(12L)
+                        val sliceStart = SystemClock.uptimeMillis()
+                        do {
+                            resLoader.asyncUpdateLoad()
+                        } while (
+                            resLoader.asyncGetLoadProgress() < 1.0f &&
+                            SystemClock.uptimeMillis() - sliceStart < 12L
+                        )
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastProgressEmitMs >= 50L || resLoader.asyncGetLoadProgress() >= 1.0f) {
+                            lastProgressEmitMs = now
+                            val rawProg = resLoader.asyncGetLoadProgress().coerceIn(0f, 1f)
+                            val prog = 0.15f + (rawProg * 0.80f)
+                            state = ModelLoadState.Loading(prog, "Uploading mesh to GPU (${(prog * 100).toInt()}%)...")
+                        }
+                        yield()
                     }
                 }
 
@@ -170,6 +187,7 @@ fun rememberOptimizedModelState(
                 resLoader.evictResourceData()
                 resLoader.destroy()
                 activeResourceLoader = null
+                retainedBuffers.clear()
 
                 val instance = asset.instance ?: modelLoader.assetLoader.createInstance(asset)
                     ?: error("Filament failed to instantiate ${targetFile.name}")
@@ -181,22 +199,33 @@ fun rememberOptimizedModelState(
                 runCatching { activeResourceLoader?.evictResourceData() }
                 runCatching { activeResourceLoader?.destroy() }
                 runCatching { createdAsset?.let { modelLoader.assetLoader.destroyAsset(it) } }
+                retainedBuffers.clear()
                 System.gc()
 
                 if (allowFallback) {
-                    state = ModelLoadState.Loading(0.1f, "Optimizing textures for mobile RAM...")
-                    val downsampled = withContext(Dispatchers.IO) {
-                        val cacheParent = targetFile.parentFile ?: targetFile.absoluteFile.parentFile
-                        if (cacheParent != null) {
-                            com.aistudio.mixedreality.util.StreamingMeshProcessor.downsampleGlbTexturesForMobile(
+                    val cacheParent = targetFile.parentFile ?: targetFile.absoluteFile.parentFile
+                    val glbInfo = withContext(Dispatchers.IO) { StreamingMeshProcessor.inspectGlbMetadata(targetFile) }
+                    if (cacheParent != null && glbInfo.imageCount > 0) {
+                        state = ModelLoadState.Loading(0.1f, "Optimizing textures for mobile RAM...")
+                        val downsampled = withContext(Dispatchers.IO) {
+                            StreamingMeshProcessor.downsampleGlbTexturesForMobile(
                                 cacheParent,
                                 targetFile,
                                 maxEdge = 1024
                             )
-                        } else null
+                        }
+                        if (downsampled != null && downsampled.exists()) {
+                            return loadSingleFile(downsampled, allowFallback = false)
+                        }
                     }
-                    if (downsampled != null && downsampled.exists()) {
-                        return loadSingleFile(downsampled, allowFallback = false)
+                    if (cacheParent != null && glbInfo.isValidGlb && glbInfo.hasUncompressedAccessors) {
+                        state = ModelLoadState.Loading(0.12f, "Decimating dense geometry for GPU...")
+                        val simplified = withContext(Dispatchers.IO) {
+                            StreamingMeshProcessor.simplifyUncompressedGlb(cacheParent, targetFile, force = true)
+                        }
+                        if (simplified != null && simplified.exists()) {
+                            return loadSingleFile(simplified, allowFallback = false)
+                        }
                     }
                 }
                 return ModelLoadState.Error("Memory limit exceeded loading ${targetFile.name}: ${oom.message ?: "Out of memory"}")
@@ -205,16 +234,32 @@ fun rememberOptimizedModelState(
                 runCatching { activeResourceLoader?.evictResourceData() }
                 runCatching { activeResourceLoader?.destroy() }
                 runCatching { createdAsset?.let { modelLoader.assetLoader.destroyAsset(it) } }
+                retainedBuffers.clear()
                 if (t is kotlinx.coroutines.CancellationException) throw t
 
-                // Legacy fallback via ModelLoader for WebP if native WebP fails on legacy GPU or non-standard glTF
-                if (allowFallback && targetFile.length() < 48L * 1024L * 1024L) {
-                    val fallbackInstance = runCatching {
-                        modelLoader.loadModelInstance("file://${targetFile.absolutePath}")
-                    }.getOrNull()
-                    if (fallbackInstance != null) {
-                        activeLegacyInstanceRef.set(fallbackInstance)
-                        return ModelLoadState.Ready(fallbackInstance)
+                if (allowFallback) {
+                    val cacheParent = targetFile.parentFile ?: targetFile.absoluteFile.parentFile
+                    val glbInfo = withContext(Dispatchers.IO) { StreamingMeshProcessor.inspectGlbMetadata(targetFile) }
+                    if (cacheParent != null && glbInfo.isValidGlb && glbInfo.hasUncompressedAccessors &&
+                        glbInfo.triangleCount > 100_000L
+                    ) {
+                        state = ModelLoadState.Loading(0.12f, "Optimizing heavy mesh for GPU...")
+                        val simplified = withContext(Dispatchers.IO) {
+                            StreamingMeshProcessor.simplifyUncompressedGlb(cacheParent, targetFile, force = true)
+                        }
+                        if (simplified != null && simplified.exists()) {
+                            return loadSingleFile(simplified, allowFallback = false)
+                        }
+                    }
+                    // Legacy fallback via ModelLoader for WebP if native WebP fails on legacy GPU or non-standard glTF
+                    if (targetFile.length() < 48L * 1024L * 1024L) {
+                        val fallbackInstance = runCatching {
+                            modelLoader.loadModelInstance("file://${targetFile.absolutePath}")
+                        }.getOrNull()
+                        if (fallbackInstance != null) {
+                            activeLegacyInstanceRef.set(fallbackInstance)
+                            return ModelLoadState.Ready(fallbackInstance)
+                        }
                     }
                 }
                 val reason = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
@@ -319,7 +364,9 @@ fun SceneScope.Render3DModel(
             if (customModelFile != null) {
                 if (customModelInstance != null) {
                     val isHeavyMesh = remember(customModelFile.absolutePath, disableShadows) {
-                        disableShadows || customModelFile.length() > HEAVY_MESH_SHADOW_THRESHOLD_BYTES
+                        disableShadows ||
+                            customModelFile.length() > HEAVY_MESH_SHADOW_THRESHOLD_BYTES ||
+                            StreamingMeshProcessor.inspectGlbMetadata(customModelFile).isHeavyForMobile
                     }
                     ModelNode(
                         modelInstance = customModelInstance,
