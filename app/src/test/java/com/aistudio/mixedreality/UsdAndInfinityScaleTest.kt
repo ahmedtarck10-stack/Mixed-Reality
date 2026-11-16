@@ -911,4 +911,94 @@ class UsdAndInfinityScaleTest {
         ByteBuffer.wrap(finalBytes).order(ByteOrder.LITTLE_ENDIAN).putLong(tocOffsetPos, tocPos)
         return finalBytes
     }
+
+    @Test
+    fun tenMillionTriangleLimitAndArtifactPreservingBudgetAreEnforced() {
+        assertEquals(10_000_000, StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT)
+        assertEquals(5_500_000, StreamingMeshProcessor.CLUSTER_MAX_VERTICES)
+
+        // 30M triangle artifact -> max 70% reduction -> keeps 9M triangles (not 200K-300K!)
+        val (target30M, maxClusters30M) = StreamingMeshProcessor.computeTargetClusterBudget(30_000_000L)
+        assertEquals(9_000_000L, target30M)
+        assertEquals(5_500_000, maxClusters30M)
+
+        // 12M triangle artifact -> keeps >=8.5M triangles (~71% preserved)
+        val (target12M, _) = StreamingMeshProcessor.computeTargetClusterBudget(12_000_000L)
+        assertEquals(8_500_000L, target12M)
+
+        // 100M triangle model -> capped safely at 10M triangles
+        val (target100M, _) = StreamingMeshProcessor.computeTargetClusterBudget(100_000_000L)
+        assertEquals(10_000_000L, target100M)
+
+        // Emergency OOM fallback still preserves ~3.5M triangles instead of collapsing to 200K
+        val (targetEmergency, emergencyMax) = StreamingMeshProcessor.computeTargetClusterBudget(30_000_000L, emergencyFallback = true)
+        assertEquals(3_500_000L, targetEmergency)
+        assertEquals(2_200_000, emergencyMax)
+    }
+
+    @Test
+    fun pagedMmapSpatialClusterAccumulatorHandles16BitGridAndPreservesColors() {
+        val scratchDir = tempFolder.newFolder("paged_cluster")
+        val bounds = StreamingMeshProcessor.MeshBounds(0f, 0f, 0f, 10f, 10f, 10f)
+        // Grid resolution 4096 exceeds the old 1024 (10-bit) ceiling; 16-bit packing preserves fine carvings
+        val acc = StreamingMeshProcessor.SpatialClusterAccumulator(
+            bounds = bounds,
+            gridResolution = 4096,
+            maxClusters = 100_000,
+            hasColors = true,
+            hasMultiMaterial = true,
+            scratchDir = scratchDir,
+            forcePagedMmap = true
+        )
+        try {
+            acc.startTriangleStream(scratchDir)
+            // Two points separated by 0.004 along X in a 10-unit span (old 1024 grid cell was 0.0098 and merged them!)
+            val c0 = acc.getOrAssignCluster(0.000f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 0f, 1f, matId = 0)
+            val c1 = acc.getOrAssignCluster(0.004f, 0f, 0f, 0f, 0f, 1f, 0.5f, 0f, 0f, 1f, 0f, 1f, matId = 0)
+            val c2 = acc.getOrAssignCluster(0.002f, 0.004f, 0f, 0f, 0f, 1f, 0.5f, 0.5f, 0f, 0f, 1f, 1f, matId = 0)
+            // Second triangle on same location with different material must stay separate cluster
+            val c3 = acc.getOrAssignCluster(0.000f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 1f, 0f, 1f, matId = 1)
+            val c4 = acc.getOrAssignCluster(0.004f, 0f, 0f, 0f, 0f, 1f, 1f, 0f, 1f, 1f, 0f, 1f, matId = 1)
+            val c5 = acc.getOrAssignCluster(0.002f, 0.004f, 0f, 0f, 0f, 1f, 0.5f, 1f, 1f, 1f, 0f, 1f, matId = 1)
+
+            assertEquals("16-bit grid + material seam must preserve all 6 distinct clusters", 6, acc.clusterCount)
+            acc.addTriangle(c0, c1, c2, matId = 0)
+            acc.addTriangle(c3, c4, c5, matId = 1)
+            assertEquals(2, acc.emittedTriangles)
+
+            val outGlb = File(scratchDir, "clustered_artifact.glb")
+            val mats = listOf(
+                StreamingMeshProcessor.GlbMaterialSpec(baseColorFactor = floatArrayOf(1f, 1f, 1f, 1f)),
+                StreamingMeshProcessor.GlbMaterialSpec(baseColorFactor = floatArrayOf(0.8f, 0.6f, 0.2f, 1f))
+            )
+            acc.writeToGlb(outGlb, materials = mats)
+
+            assertTrue(outGlb.exists() && outGlb.length() > 100L)
+            val info = StreamingMeshProcessor.inspectGlbMetadata(outGlb)
+            assertTrue(info.isValidGlb)
+            // Multi-material GLB has 2 primitives sharing the single 6-vertex POSITION accessor
+            assertEquals(12L, info.vertexCount)
+            assertEquals(2L, info.triangleCount)
+            val json = extractGlbJson(outGlb)
+            assertTrue("Shared POSITION accessor must contain exactly 6 vertices", json.contains("\"count\":6"))
+            assertTrue("Paged cluster must emit COLOR_0", json.contains("\"COLOR_0\""))
+            assertTrue("Paged cluster must emit second material slot", json.contains("\"material\":1"))
+        } finally {
+            acc.cleanup()
+        }
+    }
+
+    @Test
+    fun surfaceAwareGridResolutionPreventsArtifactCollapseOnElongatedMesh() {
+        // Elongated 10m x 1m x 1m statue (~42 m^2 surface area) with 30M triangles targeting 9M triangles
+        val statueBounds = StreamingMeshProcessor.MeshBounds(0f, 0f, 0f, 10f, 1f, 1f)
+        val gridRes = StreamingMeshProcessor.estimateSurfaceAwareGridResolution(
+            bounds = statueBounds,
+            estimatedTotalArea = 42.0,
+            targetTris = 9_000_000L,
+            totalTris = 30_000_000L
+        )
+        // cellSize = sqrt(2.2 * 42 / 9_000_000) ≈ 0.00320m -> gridRes = 10 / 0.00320 ≈ 3120 (> old 1024 cap!)
+        assertTrue("Elongated 30M statue needs fine grid (> 2000) to avoid 200K collapse, got $gridRes", gridRes > 2000)
+    }
 }

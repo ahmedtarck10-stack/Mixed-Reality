@@ -221,7 +221,12 @@ fun rememberOptimizedModelState(
                     if (cacheParent != null && glbInfo.isValidGlb && glbInfo.hasUncompressedAccessors) {
                         state = ModelLoadState.Loading(0.12f, "Decimating dense geometry for GPU...")
                         val simplified = withContext(Dispatchers.IO) {
-                            StreamingMeshProcessor.simplifyUncompressedGlb(cacheParent, targetFile, force = true)
+                            StreamingMeshProcessor.simplifyUncompressedGlb(
+                                cacheParent,
+                                targetFile,
+                                force = true,
+                                emergencyFallback = true
+                            )
                         }
                         if (simplified != null && simplified.exists()) {
                             return loadSingleFile(simplified, allowFallback = false)
@@ -245,7 +250,12 @@ fun rememberOptimizedModelState(
                     ) {
                         state = ModelLoadState.Loading(0.12f, "Optimizing heavy mesh for GPU...")
                         val simplified = withContext(Dispatchers.IO) {
-                            StreamingMeshProcessor.simplifyUncompressedGlb(cacheParent, targetFile, force = true)
+                            StreamingMeshProcessor.simplifyUncompressedGlb(
+                                cacheParent,
+                                targetFile,
+                                force = true,
+                                emergencyFallback = true
+                            )
                         }
                         if (simplified != null && simplified.exists()) {
                             return loadSingleFile(simplified, allowFallback = false)

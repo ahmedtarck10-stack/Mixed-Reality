@@ -39,13 +39,24 @@ object StreamingMeshProcessor {
     private const val IO_BUFFER_BYTES = 524_288 // 512 KB streaming buffer
     private const val GLB_CHUNK_BYTES = 65_536
 
-    // Lossless direct emission up to 1.8M triangles; above that, adaptive vertex clustering
-    // preserves silhouette and topology within mobile ES3.0/Vulkan GPU memory bounds while accepting
-    // arbitrary (infinite) input vertices and polygons.
+    // Lossless direct emission up to 10M triangles; above that, surface-preserving clustering
+    // retains ~9M-10M triangles (e.g. max ~70% reduction on 30M models, instead of 98% loss to 200K-300K)
+    // using zero-heap memory-mapped storage and 16-bit-per-axis spatial hashing.
     const val UNLIMITED_CAPACITY = Long.MAX_VALUE
-    const val DIRECT_TRIANGLE_LIMIT = 1_800_000
-    const val CLUSTER_MAX_VERTICES = 850_000
-    const val CLUSTER_HASH_TABLE_SIZE = 2_097_152 // Power of 2; ~16 MB hash keys
+    const val DIRECT_TRIANGLE_LIMIT = 10_000_000
+    const val CLUSTER_MAX_VERTICES = 5_500_000
+    const val EMERGENCY_CLUSTER_MAX_VERTICES = 2_200_000
+    const val CLUSTER_HASH_TABLE_SIZE = 8_388_608 // Power of 2; off-heap sparse mmap table
+
+    internal fun computeTargetClusterBudget(totalTris: Long, emergencyFallback: Boolean = false): Pair<Long, Int> {
+        if (emergencyFallback) {
+            val targetTris = minOf(totalTris, 3_500_000L).coerceAtLeast(100_000L)
+            return targetTris to EMERGENCY_CLUSTER_MAX_VERTICES
+        }
+        val thirtyPercent = (totalTris * 0.30).toLong()
+        val targetTris = maxOf(thirtyPercent, 8_500_000L).coerceAtMost(10_000_000L)
+        return targetTris to CLUSTER_MAX_VERTICES
+    }
 
     data class MeshStats(
         val originalVertices: Int,
@@ -435,35 +446,93 @@ object StreamingMeshProcessor {
 
     /**
      * Streaming spatial vertex clustering engine that converts arbitrarily large triangle streams
-     * (30M, 100M, infinity polygons/vertices) into a crisp, watertight-oriented GLB mesh well within
-     * mobile GPU/VRAM budgets while preserving material seams, COLOR_0 vertex colors, and textures.
+     * (30M, 100M, infinity polygons/vertices) into high-detail glTF meshes (~9M-10M triangles)
+     * with 0 MB Java heap via paged off-heap FileChannel mmaps and 16-bit-per-axis spatial hashing,
+     * preserving artifact carvings, material seams, COLOR_0 vertex colors, and textures.
      */
-    private class SpatialClusterAccumulator(
+    internal class SpatialClusterAccumulator(
         private val bounds: MeshBounds,
         private val gridResolution: Int,
         private val maxClusters: Int = CLUSTER_MAX_VERTICES,
         private val forceNoOverflowFallback: Boolean = false,
         private val hasColors: Boolean = false,
-        private val hasMultiMaterial: Boolean = false
+        private val hasMultiMaterial: Boolean = false,
+        private val scratchDir: File? = null,
+        forcePagedMmap: Boolean = false
     ) {
-        private val tableMask = CLUSTER_HASH_TABLE_SIZE - 1
-        private var hashKeys = LongArray(CLUSTER_HASH_TABLE_SIZE) { -1L }
-        private var hashVals = IntArray(CLUSTER_HASH_TABLE_SIZE)
+        companion object {
+            private const val HASH_SLOT_BYTES = 12L
+            private const val HASH_PAGE_SHIFT = 20 // 1,048,576 slots (~12 MB/page)
+            private const val HASH_PAGE_MASK = (1 shl HASH_PAGE_SHIFT) - 1
+            private const val CLUSTER_PAGE_SHIFT = 18 // 262,144 clusters (~9.4-13.6 MB/page)
+            private const val CLUSTER_PAGE_MASK = (1 shl CLUSTER_PAGE_SHIFT) - 1
+        }
 
-        private var capacity = 65_536
-        private var sumX = FloatArray(capacity)
-        private var sumY = FloatArray(capacity)
-        private var sumZ = FloatArray(capacity)
-        private var normX = FloatArray(capacity)
-        private var normY = FloatArray(capacity)
-        private var normZ = FloatArray(capacity)
-        private var sumU = FloatArray(capacity)
-        private var sumV = FloatArray(capacity)
-        private var sumR = if (hasColors) FloatArray(capacity) else null
-        private var sumG = if (hasColors) FloatArray(capacity) else null
-        private var sumB = if (hasColors) FloatArray(capacity) else null
-        private var sumA = if (hasColors) FloatArray(capacity) else null
-        private var counts = IntArray(capacity)
+        private val usePagedMmap: Boolean = (forcePagedMmap || maxClusters > 262_144) && scratchDir != null
+        private val tableSize: Int = run {
+            val rawMin = (maxClusters.toLong() * 3L / 2L + 1L).coerceAtLeast(65_536L)
+            var ts = 65_536
+            while (ts.toLong() < rawMin && ts < (1 shl 25)) ts = ts shl 1
+            ts
+        }
+        private val tableMask = tableSize - 1
+
+        // Small in-RAM mode (used only when maxClusters <= 262_144)
+        private var hashKeys: LongArray? = if (!usePagedMmap) LongArray(tableSize) { -1L } else null
+        private var hashVals: IntArray? = if (!usePagedMmap) IntArray(tableSize) else null
+        private var capacity = if (!usePagedMmap) minOf(65_536, maxClusters.coerceAtLeast(16)) else 0
+        private var sumX: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var sumY: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var sumZ: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var normX: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var normY: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var normZ: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var sumU: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var sumV: FloatArray? = if (!usePagedMmap) FloatArray(capacity) else null
+        private var sumR: FloatArray? = if (!usePagedMmap && hasColors) FloatArray(capacity) else null
+        private var sumG: FloatArray? = if (!usePagedMmap && hasColors) FloatArray(capacity) else null
+        private var sumB: FloatArray? = if (!usePagedMmap && hasColors) FloatArray(capacity) else null
+        private var sumA: FloatArray? = if (!usePagedMmap && hasColors) FloatArray(capacity) else null
+        private var counts: IntArray? = if (!usePagedMmap) IntArray(capacity) else null
+
+        // Zero-heap paged mmap mode (used for millions of clusters -> 0 MB Java heap)
+        private val clusterStride: Int = if (hasColors) 52 else 36
+        private var hashFile: File? = null
+        private var hashRaf: RandomAccessFile? = null
+        private var hashChannel: FileChannel? = null
+        private var hashPages: Array<MappedByteBuffer?>? = null
+
+        private var clusterFile: File? = null
+        private var clusterRaf: RandomAccessFile? = null
+        private var clusterChannel: FileChannel? = null
+        private val clusterPages = ArrayList<MappedByteBuffer>(32)
+
+        init {
+            if (usePagedMmap) {
+                val dir = scratchDir!!.apply { mkdirs() }
+                val id = System.nanoTime()
+                val hf = File(dir, "chash_$id.bin")
+                val hr = RandomAccessFile(hf, "rw")
+                hr.setLength(tableSize.toLong() * HASH_SLOT_BYTES)
+                val hc = hr.channel
+                val nHashPages = ((tableSize + HASH_PAGE_MASK) ushr HASH_PAGE_SHIFT).coerceAtLeast(1)
+                hashFile = hf
+                hashRaf = hr
+                hashChannel = hc
+                hashPages = Array(nHashPages) { pIdx ->
+                    val startSlot = pIdx.toLong() shl HASH_PAGE_SHIFT
+                    val slotsInPage = minOf(1L shl HASH_PAGE_SHIFT, tableSize.toLong() - startSlot)
+                    hc.map(FileChannel.MapMode.READ_WRITE, startSlot * HASH_SLOT_BYTES, slotsInPage * HASH_SLOT_BYTES)
+                        .apply { order(ByteOrder.LITTLE_ENDIAN) }
+                }
+
+                val cf = File(dir, "cdat_$id.bin")
+                val cr = RandomAccessFile(cf, "rw")
+                clusterFile = cf
+                clusterRaf = cr
+                clusterChannel = cr.channel
+            }
+        }
 
         var clusterCount = 0
             private set
@@ -474,7 +543,8 @@ object StreamingMeshProcessor {
         private val spanY = max(1e-6f, bounds.maxY - bounds.minY)
         private val spanZ = max(1e-6f, bounds.maxZ - bounds.minZ)
         private val maxSpan = max(spanX, max(spanY, spanZ))
-        private val invCellSize = (gridResolution - 1).toFloat() / maxSpan
+        private val maxGridCoord = (gridResolution - 1).coerceIn(1, 65_535)
+        private val invCellSize = maxGridCoord.toFloat() / maxSpan
 
         private var triFile: File? = null
         private var triFos: BufferedOutputStream? = null
@@ -482,29 +552,45 @@ object StreamingMeshProcessor {
         var emittedTriangles = 0
             private set
 
-        fun startTriangleStream(scratchDir: File) {
-            scratchDir.mkdirs()
-            val f = File(scratchDir, "tris_${System.nanoTime()}.bin")
+        fun startTriangleStream(dir: File) {
+            dir.mkdirs()
+            val f = File(dir, "tris_${System.nanoTime()}.bin")
             triFile = f
             triFos = BufferedOutputStream(FileOutputStream(f), IO_BUFFER_BYTES)
         }
 
-        private fun growArrays(needed: Int) {
+        private fun growRamArrays(needed: Int) {
             val nextCap = minOf(maxClusters, maxOf(needed, capacity * 2))
-            sumX = sumX.copyOf(nextCap)
-            sumY = sumY.copyOf(nextCap)
-            sumZ = sumZ.copyOf(nextCap)
-            normX = normX.copyOf(nextCap)
-            normY = normY.copyOf(nextCap)
-            normZ = normZ.copyOf(nextCap)
-            sumU = sumU.copyOf(nextCap)
-            sumV = sumV.copyOf(nextCap)
+            sumX = sumX!!.copyOf(nextCap)
+            sumY = sumY!!.copyOf(nextCap)
+            sumZ = sumZ!!.copyOf(nextCap)
+            normX = normX!!.copyOf(nextCap)
+            normY = normY!!.copyOf(nextCap)
+            normZ = normZ!!.copyOf(nextCap)
+            sumU = sumU!!.copyOf(nextCap)
+            sumV = sumV!!.copyOf(nextCap)
             sumR = sumR?.copyOf(nextCap)
             sumG = sumG?.copyOf(nextCap)
             sumB = sumB?.copyOf(nextCap)
             sumA = sumA?.copyOf(nextCap)
-            counts = counts.copyOf(nextCap)
+            counts = counts!!.copyOf(nextCap)
             capacity = nextCap
+        }
+
+        private fun clusterPageFor(cId: Int): MappedByteBuffer {
+            val pIdx = cId ushr CLUSTER_PAGE_SHIFT
+            while (pIdx >= clusterPages.size) {
+                val newIdx = clusterPages.size
+                val ch = clusterChannel!!
+                val raf = clusterRaf!!
+                val pageBytes = (1L shl CLUSTER_PAGE_SHIFT) * clusterStride.toLong()
+                val neededLen = (newIdx.toLong() + 1L) * pageBytes
+                if (raf.length() < neededLen) raf.setLength(neededLen)
+                val buf = ch.map(FileChannel.MapMode.READ_WRITE, newIdx.toLong() * pageBytes, pageBytes)
+                    .apply { order(ByteOrder.LITTLE_ENDIAN) }
+                clusterPages.add(buf)
+            }
+            return clusterPages[pIdx]
         }
 
         fun getOrAssignCluster(
@@ -514,61 +600,118 @@ object StreamingMeshProcessor {
             r: Float = 1f, g: Float = 1f, b: Float = 1f, a: Float = 1f,
             matId: Int = 0
         ): Int {
-            val gx = ((px - bounds.minX) * invCellSize).toInt().coerceIn(0, 1023).toLong()
-            val gy = ((py - bounds.minY) * invCellSize).toInt().coerceIn(0, 1023).toLong()
-            val gz = ((pz - bounds.minZ) * invCellSize).toInt().coerceIn(0, 1023).toLong()
-            val key = ((matId.toLong() and 0xFFFFL) shl 32) or (gx shl 20) or (gy shl 10) or gz
+            val gx = ((px - bounds.minX) * invCellSize).toInt().coerceIn(0, maxGridCoord).toLong()
+            val gy = ((py - bounds.minY) * invCellSize).toInt().coerceIn(0, maxGridCoord).toLong()
+            val gz = ((pz - bounds.minZ) * invCellSize).toInt().coerceIn(0, maxGridCoord).toLong()
+            val key = ((matId.toLong() and 0x7FFFL) shl 48) or (gx shl 32) or (gy shl 16) or gz
 
             var slot = mix64(key) and tableMask
-            while (true) {
-                val existing = hashKeys[slot]
-                if (existing == key) {
-                    val cId = hashVals[slot]
-                    accumulate(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
-                    return cId
-                }
-                if (existing == -1L) {
-                    if (clusterCount >= maxClusters) {
-                        if (forceNoOverflowFallback) {
-                            val foldedId = (mix64(key) and 0x7FFF_FFFF) % maxClusters
-                            return foldedId
+            if (usePagedMmap) {
+                val pages = hashPages!!
+                while (true) {
+                    val page = pages[slot ushr HASH_PAGE_SHIFT]!!
+                    val off = (slot and HASH_PAGE_MASK) * 12
+                    val valPlusOne = page.getInt(off + 8)
+                    if (valPlusOne != 0) {
+                        if (page.getLong(off) == key) {
+                            val cId = valPlusOne - 1
+                            accumulatePaged(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
+                            return cId
                         }
-                        overflowed = true
-                        return -1
+                    } else {
+                        if (clusterCount >= maxClusters) {
+                            if (forceNoOverflowFallback) {
+                                return (mix64(key) and 0x7FFF_FFFF) % maxClusters
+                            }
+                            overflowed = true
+                            return -1
+                        }
+                        val cId = clusterCount++
+                        page.putLong(off, key)
+                        page.putInt(off + 8, cId + 1)
+                        accumulatePaged(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
+                        return cId
                     }
-                    val cId = clusterCount++
-                    if (cId >= capacity) growArrays(cId + 1)
-                    hashKeys[slot] = key
-                    hashVals[slot] = cId
-                    accumulate(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
-                    return cId
+                    slot = (slot + 1) and tableMask
                 }
-                slot = (slot + 1) and tableMask
+            } else {
+                val hk = hashKeys!!
+                val hv = hashVals!!
+                while (true) {
+                    val existing = hk[slot]
+                    if (existing == key) {
+                        val cId = hv[slot]
+                        accumulateRam(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
+                        return cId
+                    }
+                    if (existing == -1L) {
+                        if (clusterCount >= maxClusters) {
+                            if (forceNoOverflowFallback) {
+                                return (mix64(key) and 0x7FFF_FFFF) % maxClusters
+                            }
+                            overflowed = true
+                            return -1
+                        }
+                        val cId = clusterCount++
+                        if (cId >= capacity) growRamArrays(cId + 1)
+                        hk[slot] = key
+                        hv[slot] = cId
+                        accumulateRam(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
+                        return cId
+                    }
+                    slot = (slot + 1) and tableMask
+                }
             }
         }
 
-        private fun accumulate(
+        private fun accumulatePaged(
             cId: Int,
             px: Float, py: Float, pz: Float,
             nx: Float, ny: Float, nz: Float,
             u: Float, v: Float,
             r: Float, g: Float, b: Float, a: Float
         ) {
-            sumX[cId] += px
-            sumY[cId] += py
-            sumZ[cId] += pz
-            normX[cId] += nx
-            normY[cId] += ny
-            normZ[cId] += nz
-            sumU[cId] += u
-            sumV[cId] += v
+            val buf = clusterPageFor(cId)
+            val off = (cId and CLUSTER_PAGE_MASK) * clusterStride
+            buf.putFloat(off, buf.getFloat(off) + px)
+            buf.putFloat(off + 4, buf.getFloat(off + 4) + py)
+            buf.putFloat(off + 8, buf.getFloat(off + 8) + pz)
+            buf.putFloat(off + 12, buf.getFloat(off + 12) + nx)
+            buf.putFloat(off + 16, buf.getFloat(off + 16) + ny)
+            buf.putFloat(off + 20, buf.getFloat(off + 20) + nz)
+            buf.putFloat(off + 24, buf.getFloat(off + 24) + u)
+            buf.putFloat(off + 28, buf.getFloat(off + 28) + v)
+            buf.putInt(off + 32, buf.getInt(off + 32) + 1)
+            if (hasColors) {
+                buf.putFloat(off + 36, buf.getFloat(off + 36) + r)
+                buf.putFloat(off + 40, buf.getFloat(off + 40) + g)
+                buf.putFloat(off + 44, buf.getFloat(off + 44) + b)
+                buf.putFloat(off + 48, buf.getFloat(off + 48) + a)
+            }
+        }
+
+        private fun accumulateRam(
+            cId: Int,
+            px: Float, py: Float, pz: Float,
+            nx: Float, ny: Float, nz: Float,
+            u: Float, v: Float,
+            r: Float, g: Float, b: Float, a: Float
+        ) {
+            sumX!![cId] += px
+            sumY!![cId] += py
+            sumZ!![cId] += pz
+            normX!![cId] += nx
+            normY!![cId] += ny
+            normZ!![cId] += nz
+            sumU!![cId] += u
+            sumV!![cId] += v
             if (hasColors) {
                 sumR!![cId] += r
                 sumG!![cId] += g
                 sumB!![cId] += b
                 sumA!![cId] += a
             }
-            counts[cId]++
+            counts!![cId]++
         }
 
         fun addTriangle(c0: Int, c1: Int, c2: Int, matId: Int = 0) {
@@ -585,6 +728,19 @@ object StreamingMeshProcessor {
             triChunk.putInt(c2)
             if (hasMultiMaterial) triChunk.putInt(matId)
             emittedTriangles++
+        }
+
+        private fun releaseHashResources() {
+            hashKeys = null
+            hashVals = null
+            hashPages?.fill(null)
+            hashPages = null
+            runCatching { hashChannel?.close() }
+            hashChannel = null
+            runCatching { hashRaf?.close() }
+            hashRaf = null
+            runCatching { hashFile?.delete() }
+            hashFile = null
         }
 
         fun writeToGlb(
@@ -605,44 +761,74 @@ object StreamingMeshProcessor {
                 out.close()
             }
             triFos = null
+            releaseHashResources()
 
             val finalBounds = MeshBounds()
-            val sr = sumR; val sg = sumG; val sb = sumB; val sa = sumA
+            if (usePagedMmap) {
+                for (i in 0 until clusterCount) {
+                    val buf = clusterPages[i ushr CLUSTER_PAGE_SHIFT]
+                    val off = (i and CLUSTER_PAGE_MASK) * clusterStride
+                    val inv = 1f / buf.getInt(off + 32).coerceAtLeast(1).toFloat()
+                    val px = buf.getFloat(off) * inv
+                    val py = buf.getFloat(off + 4) * inv
+                    val pz = buf.getFloat(off + 8) * inv
+                    buf.putFloat(off, px)
+                    buf.putFloat(off + 4, py)
+                    buf.putFloat(off + 8, pz)
+                    finalBounds.expand(px, py, pz)
 
-            for (i in 0 until clusterCount) {
-                val inv = 1f / counts[i].coerceAtLeast(1).toFloat()
-                val px = sumX[i] * inv
-                val py = sumY[i] * inv
-                val pz = sumZ[i] * inv
-                sumX[i] = px
-                sumY[i] = py
-                sumZ[i] = pz
-                finalBounds.expand(px, py, pz)
-
-                val nLen = sqrt(normX[i] * normX[i] + normY[i] * normY[i] + normZ[i] * normZ[i])
-                if (nLen > 1e-6f && nLen.isFinite()) {
-                    val nInv = 1f / nLen
-                    normX[i] *= nInv
-                    normY[i] *= nInv
-                    normZ[i] *= nInv
-                } else {
-                    normX[i] = 0f; normY[i] = 1f; normZ[i] = 0f
+                    var rnx = buf.getFloat(off + 12)
+                    var rny = buf.getFloat(off + 16)
+                    var rnz = buf.getFloat(off + 20)
+                    val nLen = sqrt(rnx * rnx + rny * rny + rnz * rnz)
+                    if (nLen > 1e-6f && nLen.isFinite()) {
+                        val nInv = 1f / nLen
+                        rnx *= nInv; rny *= nInv; rnz *= nInv
+                    } else {
+                        rnx = 0f; rny = 1f; rnz = 0f
+                    }
+                    buf.putFloat(off + 12, rnx)
+                    buf.putFloat(off + 16, rny)
+                    buf.putFloat(off + 20, rnz)
+                    buf.putFloat(off + 24, buf.getFloat(off + 24) * inv)
+                    buf.putFloat(off + 28, buf.getFloat(off + 28) * inv)
+                    if (hasColors) {
+                        buf.putFloat(off + 36, buf.getFloat(off + 36) * inv)
+                        buf.putFloat(off + 40, buf.getFloat(off + 40) * inv)
+                        buf.putFloat(off + 44, buf.getFloat(off + 44) * inv)
+                        buf.putFloat(off + 48, buf.getFloat(off + 48) * inv)
+                    }
                 }
+            } else {
+                val sx = sumX!!; val sy = sumY!!; val sz = sumZ!!
+                val nxArr = normX!!; val nyArr = normY!!; val nzArr = normZ!!
+                val su = sumU!!; val sv = sumV!!; val cntArr = counts!!
+                val sr = sumR; val sg = sumG; val sb = sumB; val sa = sumA
 
-                sumU[i] *= inv
-                sumV[i] *= inv
-                if (hasColors && sr != null && sg != null && sb != null && sa != null) {
-                    sr[i] *= inv
-                    sg[i] *= inv
-                    sb[i] *= inv
-                    sa[i] *= inv
+                for (i in 0 until clusterCount) {
+                    val inv = 1f / cntArr[i].coerceAtLeast(1).toFloat()
+                    val px = sx[i] * inv
+                    val py = sy[i] * inv
+                    val pz = sz[i] * inv
+                    sx[i] = px; sy[i] = py; sz[i] = pz
+                    finalBounds.expand(px, py, pz)
+
+                    val nLen = sqrt(nxArr[i] * nxArr[i] + nyArr[i] * nyArr[i] + nzArr[i] * nzArr[i])
+                    if (nLen > 1e-6f && nLen.isFinite()) {
+                        val nInv = 1f / nLen
+                        nxArr[i] *= nInv; nyArr[i] *= nInv; nzArr[i] *= nInv
+                    } else {
+                        nxArr[i] = 0f; nyArr[i] = 1f; nzArr[i] = 0f
+                    }
+
+                    su[i] *= inv; sv[i] *= inv
+                    if (hasColors && sr != null && sg != null && sb != null && sa != null) {
+                        sr[i] *= inv; sg[i] *= inv; sb[i] *= inv; sa[i] *= inv
+                    }
                 }
+                counts = null
             }
             finalBounds.normalizeIfEmpty()
-
-            hashKeys = LongArray(0)
-            hashVals = IntArray(0)
-            counts = IntArray(0)
 
             val resolvedMats = resolveMaterialList(materials, baseColorFactor, metallicFactor, roughnessFactor, textureFile, textureMime, hasColors)
             val tFile = triFile
@@ -654,7 +840,7 @@ object StreamingMeshProcessor {
             val colorBytes = if (hasColors) clusterCount.toLong() * 4L else 0L
             val vertDataBytes = posBytes + normBytes + uvBytes + colorBytes
 
-            val scratchDir = tFile?.parentFile ?: outGlb.parentFile ?: File(".")
+            val dir = tFile?.parentFile ?: scratchDir ?: outGlb.parentFile ?: File(".")
             val plan = planGroupedGlbLayout(
                 vertCount = clusterCount,
                 vertDataBytes = vertDataBytes,
@@ -686,16 +872,49 @@ object StreamingMeshProcessor {
             BufferedOutputStream(FileOutputStream(outGlb), IO_BUFFER_BYTES).use { bos ->
                 writeGlbHeaders(bos, writeBuf, totalGlbLen, jsonBytes, paddedJsonLen, jsonPadding, plan.paddedBinBytes.toInt())
 
-                for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, sumX[i], sumY[i], sumZ[i])
-                for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, normX[i], normY[i], normZ[i])
-                for (i in 0 until clusterCount) putFloat2Checked(bos, writeBuf, sumU[i], sumV[i])
-                if (hasColors && sr != null && sg != null && sb != null && sa != null) {
+                if (usePagedMmap) {
                     for (i in 0 until clusterCount) {
-                        if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
-                        writeBuf.put(linearToUByte(sr[i]))
-                        writeBuf.put(linearToUByte(sg[i]))
-                        writeBuf.put(linearToUByte(sb[i]))
-                        writeBuf.put(linearToUByte(sa[i]))
+                        val buf = clusterPages[i ushr CLUSTER_PAGE_SHIFT]
+                        val off = (i and CLUSTER_PAGE_MASK) * clusterStride
+                        putFloat3Checked(bos, writeBuf, buf.getFloat(off), buf.getFloat(off + 4), buf.getFloat(off + 8))
+                    }
+                    for (i in 0 until clusterCount) {
+                        val buf = clusterPages[i ushr CLUSTER_PAGE_SHIFT]
+                        val off = (i and CLUSTER_PAGE_MASK) * clusterStride
+                        putFloat3Checked(bos, writeBuf, buf.getFloat(off + 12), buf.getFloat(off + 16), buf.getFloat(off + 20))
+                    }
+                    for (i in 0 until clusterCount) {
+                        val buf = clusterPages[i ushr CLUSTER_PAGE_SHIFT]
+                        val off = (i and CLUSTER_PAGE_MASK) * clusterStride
+                        putFloat2Checked(bos, writeBuf, buf.getFloat(off + 24), buf.getFloat(off + 28))
+                    }
+                    if (hasColors) {
+                        for (i in 0 until clusterCount) {
+                            val buf = clusterPages[i ushr CLUSTER_PAGE_SHIFT]
+                            val off = (i and CLUSTER_PAGE_MASK) * clusterStride
+                            if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
+                            writeBuf.put(linearToUByte(buf.getFloat(off + 36)))
+                            writeBuf.put(linearToUByte(buf.getFloat(off + 40)))
+                            writeBuf.put(linearToUByte(buf.getFloat(off + 44)))
+                            writeBuf.put(linearToUByte(buf.getFloat(off + 48)))
+                        }
+                    }
+                } else {
+                    val sx = sumX!!; val sy = sumY!!; val sz = sumZ!!
+                    val nxArr = normX!!; val nyArr = normY!!; val nzArr = normZ!!
+                    val su = sumU!!; val sv = sumV!!
+                    val sr = sumR; val sg = sumG; val sb = sumB; val sa = sumA
+                    for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, sx[i], sy[i], sz[i])
+                    for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, nxArr[i], nyArr[i], nzArr[i])
+                    for (i in 0 until clusterCount) putFloat2Checked(bos, writeBuf, su[i], sv[i])
+                    if (hasColors && sr != null && sg != null && sb != null && sa != null) {
+                        for (i in 0 until clusterCount) {
+                            if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
+                            writeBuf.put(linearToUByte(sr[i]))
+                            writeBuf.put(linearToUByte(sg[i]))
+                            writeBuf.put(linearToUByte(sb[i]))
+                            writeBuf.put(linearToUByte(sa[i]))
+                        }
                     }
                 }
                 flushWriteBuf(bos, writeBuf)
@@ -706,7 +925,7 @@ object StreamingMeshProcessor {
                     triFile = tFile,
                     hasMatInTri = hasMultiMaterial,
                     useIntIndices = useIntIndices,
-                    scratchDir = scratchDir,
+                    scratchDir = dir,
                     plan = plan
                 )
             }
@@ -715,6 +934,14 @@ object StreamingMeshProcessor {
         }
 
         fun cleanup() {
+            releaseHashResources()
+            clusterPages.clear()
+            runCatching { clusterChannel?.close() }
+            clusterChannel = null
+            runCatching { clusterRaf?.close() }
+            clusterRaf = null
+            runCatching { clusterFile?.delete() }
+            clusterFile = null
             runCatching { triFos?.close() }
             triFos = null
             runCatching { triFile?.delete() }
@@ -731,7 +958,7 @@ object StreamingMeshProcessor {
     }
 
     /**
-     * Lossless disk-backed stream writer for <= DIRECT_TRIANGLE_LIMIT meshes (< ~1.8M triangles).
+     * Lossless disk-backed stream writer for <= DIRECT_TRIANGLE_LIMIT meshes (< ~10M triangles).
      * Supports optional RGBA8 vertex colors (COLOR_0) and multi-material/multi-texture primitives.
      */
     private class DirectStreamingGlbWriter(
@@ -915,16 +1142,20 @@ object StreamingMeshProcessor {
 
             val bounds = MeshBounds()
             var totalTris = 0L
+            var areaSampleSum = 0.0
+            var areaSampleCount = 0L
 
-            // Pass 1: exact triangle count and bounding box
+            // Pass 1: exact triangle count, bounding box, and surface area sample
             if (!isAscii && fileLen >= 84L) {
                 val lenBB = ByteBuffer.wrap(header, 80, 4).order(ByteOrder.LITTLE_ENDIAN)
                 val declaredTris = lenBB.int.toLong() and 0xFFFF_FFFFL
                 val maxPossible = ((fileLen - 84L) / 50L).coerceAtLeast(0L)
                 val binaryCount = minOf(declaredTris, maxPossible)
                 totalTris = binaryCount
+                val sampleStep = maxOf(1L, binaryCount / 2048L)
                 val recBuf = ByteArray(50 * 4096)
                 val recBB = ByteBuffer.wrap(recBuf).order(ByteOrder.LITTLE_ENDIAN)
+                var seen = 0L
                 BufferedInputStream(FileInputStream(stlFile), IO_BUFFER_BYTES).use { bis ->
                     skipFully(bis, 84L)
                     var remaining = binaryCount
@@ -933,15 +1164,27 @@ object StreamingMeshProcessor {
                         readFully(bis, recBuf, batch * 50)
                         for (i in 0 until batch) {
                             val base = i * 50
-                            bounds.expand(recBB.getFloat(base + 12), recBB.getFloat(base + 16), recBB.getFloat(base + 20))
-                            bounds.expand(recBB.getFloat(base + 24), recBB.getFloat(base + 28), recBB.getFloat(base + 32))
-                            bounds.expand(recBB.getFloat(base + 36), recBB.getFloat(base + 40), recBB.getFloat(base + 44))
+                            val x0 = recBB.getFloat(base + 12); val y0 = recBB.getFloat(base + 16); val z0 = recBB.getFloat(base + 20)
+                            val x1 = recBB.getFloat(base + 24); val y1 = recBB.getFloat(base + 28); val z1 = recBB.getFloat(base + 32)
+                            val x2 = recBB.getFloat(base + 36); val y2 = recBB.getFloat(base + 40); val z2 = recBB.getFloat(base + 44)
+                            bounds.expand(x0, y0, z0)
+                            bounds.expand(x1, y1, z1)
+                            bounds.expand(x2, y2, z2)
+                            if (seen % sampleStep == 0L) {
+                                val area = triangleArea(x0, y0, z0, x1, y1, z1, x2, y2, z2)
+                                if (area > 0.0 && area.isFinite()) {
+                                    areaSampleSum += area
+                                    areaSampleCount++
+                                }
+                            }
+                            seen++
                         }
                         remaining -= batch.toLong()
                     }
                 }
             } else {
                 var vInTri = 0
+                val vx = FloatArray(3); val vy = FloatArray(3); val vz = FloatArray(3)
                 BufferedInputStream(FileInputStream(stlFile), IO_BUFFER_BYTES).bufferedReader(Charsets.UTF_8).use { reader ->
                     while (true) {
                         val line = reader.readLine() ?: break
@@ -949,8 +1192,16 @@ object StreamingMeshProcessor {
                         if (trimmed.startsWith("vertex", ignoreCase = true)) {
                             parseThreeFloatsAfterToken(trimmed, 6)?.let { (x, y, z) ->
                                 bounds.expand(x, y, z)
+                                vx[vInTri] = x; vy[vInTri] = y; vz[vInTri] = z
                                 vInTri++
                                 if (vInTri == 3) {
+                                    if (totalTris % 64L == 0L && areaSampleCount < 4096L) {
+                                        val area = triangleArea(vx[0], vy[0], vz[0], vx[1], vy[1], vz[1], vx[2], vy[2], vz[2])
+                                        if (area > 0.0 && area.isFinite()) {
+                                            areaSampleSum += area
+                                            areaSampleCount++
+                                        }
+                                    }
                                     totalTris++
                                     vInTri = 0
                                 }
@@ -971,12 +1222,14 @@ object StreamingMeshProcessor {
                 )
             }
             bounds.normalizeIfEmpty()
+            val estimatedTotalArea = if (areaSampleCount > 0L) (areaSampleSum / areaSampleCount.toDouble()) * totalTris.toDouble() else 0.0
 
             val outGlb = File(cacheDir, "${stlFile.nameWithoutExtension}_converted.glb")
             val stats = emitStlPass2(
                 stlFile = stlFile,
                 isAscii = isAscii,
                 totalTris = totalTris,
+                estimatedTotalArea = estimatedTotalArea,
                 bounds = bounds,
                 scratchDir = scratchDir,
                 outGlb = outGlb
@@ -1016,11 +1269,12 @@ object StreamingMeshProcessor {
         stlFile: File,
         isAscii: Boolean,
         totalTris: Long,
+        estimatedTotalArea: Double,
         bounds: MeshBounds,
         scratchDir: File,
         outGlb: File
     ): MeshStats {
-        val useCluster = totalTris > 600_000L
+        val useCluster = totalTris > DIRECT_TRIANGLE_LIMIT.toLong()
         if (!useCluster) {
             DirectStreamingGlbWriter(scratchDir).use { writer ->
                 forEachStlTriangle(stlFile, isAscii, totalTris) { nx, ny, nz, x0, y0, z0, x1, y1, z1, x2, y2, z2 ->
@@ -1044,10 +1298,18 @@ object StreamingMeshProcessor {
             }
         }
 
-        var gridRes = estimateInitialGridResolution(totalTris)
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris)
+        var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
+        var upwardRetries = 0
         while (true) {
             val isFloor = gridRes <= 64
-            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
+            val acc = SpatialClusterAccumulator(
+                bounds = bounds,
+                gridResolution = gridRes,
+                maxClusters = maxClusters,
+                forceNoOverflowFallback = isFloor,
+                scratchDir = scratchDir
+            )
             acc.startTriangleStream(scratchDir)
             try {
                 forEachStlTriangle(stlFile, isAscii, totalTris) { nx, ny, nz, x0, y0, z0, x1, y1, z1, x2, y2, z2 ->
@@ -1060,8 +1322,23 @@ object StreamingMeshProcessor {
                 }
                 if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
+                    gridRes = (gridRes * 0.82f).toInt().coerceAtLeast(64)
+                    upwardRetries = 1 // Do not bounce back up after overflow
                     continue
+                }
+                if (upwardRetries < 1 &&
+                    acc.emittedTriangles < (targetTris * 0.50).toLong() &&
+                    acc.clusterCount < (maxClusters * 0.50) &&
+                    gridRes < 48_000
+                ) {
+                    val ratio = sqrt((targetTris.toDouble() / acc.emittedTriangles.coerceAtLeast(1).toDouble()).coerceIn(1.2, 4.0))
+                    val finer = (gridRes * ratio).toInt().coerceAtMost(48_000)
+                    if (finer > gridRes + 16) {
+                        acc.cleanup()
+                        gridRes = finer
+                        upwardRetries++
+                        continue
+                    }
                 }
                 val outTris = acc.emittedTriangles
                 val outVerts = acc.clusterCount
@@ -1945,10 +2222,15 @@ object StreamingMeshProcessor {
      * quantized/float accessor support + triangle strip/fan conversion, AND full preservation of
      * COLOR_0 vertex colors, multi-materials, PBR factors, and embedded/external textures.
      */
-    fun simplifyUncompressedGlb(cacheDir: File, srcGlb: File, force: Boolean = false): File? {
+    fun simplifyUncompressedGlb(
+        cacheDir: File,
+        srcGlb: File,
+        force: Boolean = false,
+        emergencyFallback: Boolean = false
+    ): File? {
         val info = inspectGlbMetadata(srcGlb)
         if (!info.isValidGlb || !info.hasUncompressedAccessors) return null
-        if (!force && info.triangleCount <= DIRECT_TRIANGLE_LIMIT && srcGlb.length() <= 40L * 1024L * 1024L) {
+        if (!force && info.triangleCount <= DIRECT_TRIANGLE_LIMIT && srcGlb.length() <= 512L * 1024L * 1024L) {
             return null
         }
         val scratchDir = File(cacheDir, "glb_decim_${System.nanoTime()}").apply { mkdirs() }
@@ -2187,7 +2469,8 @@ object StreamingMeshProcessor {
                         generator = "MixedReality GLB Optimizer",
                         indexIsLong = true,
                         triHasMat = multiMat,
-                        materials = materialsList.ifEmpty { null }
+                        materials = materialsList.ifEmpty { null },
+                        emergencyFallback = emergencyFallback
                     )
                     outGlb
                 } finally {
@@ -2871,7 +3154,8 @@ object StreamingMeshProcessor {
         colors: MappedFloatTupleStore? = null,
         cornerColorFile: File? = null,
         triHasMat: Boolean = false,
-        materials: List<GlbMaterialSpec>? = null
+        materials: List<GlbMaterialSpec>? = null,
+        emergencyFallback: Boolean = false
     ): MeshStats {
         positions.sealForRead()
         normals?.sealForRead()
@@ -2881,7 +3165,11 @@ object StreamingMeshProcessor {
         val hasCornerColors = cornerColorFile != null && cornerColorFile.exists()
         val hasVertColors = hasCornerColors || (colors != null && colors.count == positions.count)
         val hasMultiMat = triHasMat && (materials?.size ?: 0) > 1
-        val needsCluster = totalVerts > DIRECT_TRIANGLE_LIMIT.toLong() || totalTris > DIRECT_TRIANGLE_LIMIT.toLong()
+        val needsCluster = if (emergencyFallback) {
+            totalTris > 100_000L || totalVerts > 250_000L
+        } else {
+            totalTris > DIRECT_TRIANGLE_LIMIT.toLong() || totalVerts > (DIRECT_TRIANGLE_LIMIT.toLong() * 3L)
+        }
         val triBytes = (if (indexIsLong) 24 else 12) + (if (triHasMat) 4 else 0)
         val batchRecords = 4096
         val readBuf = ByteArray(triBytes * batchRecords)
@@ -3088,17 +3376,22 @@ object StreamingMeshProcessor {
             }
         }
 
-        // Single-pass / adaptive spatial clustering for arbitrarily massive (30M..infinity) meshes
-        var gridRes = estimateInitialGridResolution(totalTris)
+        // Surface-preserving spatial clustering for >10M (30M..infinity) meshes
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris, emergencyFallback)
+        val estimatedTotalArea = estimateTotalAreaFromIndexedFile(positions, triIndexFile, totalTris, triBytes, indexIsLong)
+        var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
         val hasPerVertNorm = normals != null && normals.count == positions.count
+        var upwardRetries = 0
         while (true) {
             val isFloor = gridRes <= 64
             val acc = SpatialClusterAccumulator(
                 bounds = bounds,
                 gridResolution = gridRes,
+                maxClusters = maxClusters,
                 forceNoOverflowFallback = isFloor,
                 hasColors = hasVertColors,
-                hasMultiMaterial = hasMultiMat
+                hasMultiMaterial = hasMultiMat,
+                scratchDir = scratchDir
             )
             acc.startTriangleStream(scratchDir)
             val colBis = if (hasCornerColors) BufferedInputStream(FileInputStream(cornerColorFile!!), IO_BUFFER_BYTES) else null
@@ -3176,8 +3469,23 @@ object StreamingMeshProcessor {
                 }
                 if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
+                    gridRes = (gridRes * 0.82f).toInt().coerceAtLeast(64)
+                    upwardRetries = 1
                     continue
+                }
+                if (upwardRetries < 1 &&
+                    acc.emittedTriangles < (targetTris * 0.50).toLong() &&
+                    acc.clusterCount < (maxClusters * 0.50) &&
+                    gridRes < 48_000
+                ) {
+                    val ratio = sqrt((targetTris.toDouble() / acc.emittedTriangles.coerceAtLeast(1).toDouble()).coerceIn(1.2, 4.0))
+                    val finer = (gridRes * ratio).toInt().coerceAtMost(48_000)
+                    if (finer > gridRes + 16) {
+                        acc.cleanup()
+                        gridRes = finer
+                        upwardRetries++
+                        continue
+                    }
                 }
                 val outVerts = acc.clusterCount
                 val outTris = acc.emittedTriangles
@@ -3232,7 +3540,7 @@ object StreamingMeshProcessor {
         val readBuf = ByteArray(recBytes * 2048)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
 
-        if (totalVerts <= DIRECT_TRIANGLE_LIMIT.toLong() && totalTris <= DIRECT_TRIANGLE_LIMIT.toLong()) {
+        if (totalTris <= DIRECT_TRIANGLE_LIMIT.toLong() && totalVerts <= (DIRECT_TRIANGLE_LIMIT.toLong() * 3L)) {
             DirectStreamingGlbWriter(scratchDir, hasColors = hasColors, hasMultiMaterial = hasMultiMat).use { writer ->
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
                     while (true) {
@@ -3305,16 +3613,21 @@ object StreamingMeshProcessor {
             }
         }
 
-        // Spatial Clustering Pass for unbounded ("∞") OBJ meshes
-        var gridRes = estimateInitialGridResolution(totalTris)
+        // Spatial Clustering Pass for >10M ("∞") OBJ meshes (~9M-10M preserved triangles)
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris)
+        val estimatedTotalArea = estimateTotalAreaFromObjFile(positions, triRecordFile, totalTris, recBytes)
+        var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
+        var upwardRetries = 0
         while (true) {
             val isFloor = gridRes <= 64
             val acc = SpatialClusterAccumulator(
                 bounds = bounds,
                 gridResolution = gridRes,
+                maxClusters = maxClusters,
                 forceNoOverflowFallback = isFloor,
                 hasColors = hasColors,
-                hasMultiMaterial = hasMultiMat
+                hasMultiMaterial = hasMultiMat,
+                scratchDir = scratchDir
             )
             acc.startTriangleStream(scratchDir)
             try {
@@ -3381,8 +3694,23 @@ object StreamingMeshProcessor {
                 }
                 if (acc.overflowed && !isFloor) {
                     acc.cleanup()
-                    gridRes = (gridRes * 0.65f).toInt().coerceAtLeast(64)
+                    gridRes = (gridRes * 0.82f).toInt().coerceAtLeast(64)
+                    upwardRetries = 1
                     continue
+                }
+                if (upwardRetries < 1 &&
+                    acc.emittedTriangles < (targetTris * 0.50).toLong() &&
+                    acc.clusterCount < (maxClusters * 0.50) &&
+                    gridRes < 48_000
+                ) {
+                    val ratio = sqrt((targetTris.toDouble() / acc.emittedTriangles.coerceAtLeast(1).toDouble()).coerceIn(1.2, 4.0))
+                    val finer = (gridRes * ratio).toInt().coerceAtMost(48_000)
+                    if (finer > gridRes + 16) {
+                        acc.cleanup()
+                        gridRes = finer
+                        upwardRetries++
+                        continue
+                    }
                 }
                 val outVerts = acc.clusterCount
                 val outTris = acc.emittedTriangles
@@ -3998,12 +4326,134 @@ object StreamingMeshProcessor {
     // Low-Level Streaming Helpers
     // =========================================================================
 
-    private fun estimateInitialGridResolution(totalTris: Long): Int = when {
-        totalTris >= 80_000_000L -> 512
-        totalTris >= 30_000_000L -> 600
-        totalTris >= 15_000_000L -> 680
-        totalTris >= 5_000_000L -> 820
-        else -> 960
+    private fun triangleArea(
+        x0: Float, y0: Float, z0: Float,
+        x1: Float, y1: Float, z1: Float,
+        x2: Float, y2: Float, z2: Float
+    ): Double {
+        val ax = (x1 - x0).toDouble(); val ay = (y1 - y0).toDouble(); val az = (z1 - z0).toDouble()
+        val bx = (x2 - x0).toDouble(); val by = (y2 - y0).toDouble(); val bz = (z2 - z0).toDouble()
+        val cx = ay * bz - az * by
+        val cy = az * bx - ax * bz
+        val cz = ax * by - ay * bx
+        return 0.5 * kotlin.math.sqrt(cx * cx + cy * cy + cz * cz)
+    }
+
+    private fun estimateTotalAreaFromIndexedFile(
+        positions: MappedFloatTupleStore,
+        triFile: File,
+        totalTris: Long,
+        recBytes: Int,
+        indexIsLong: Boolean
+    ): Double {
+        if (totalTris <= 0L || !triFile.exists()) return 0.0
+        val sampleCount = minOf(totalTris, 2048L).toInt()
+        val step = maxOf(1L, totalTris / sampleCount)
+        val rec = ByteArray(24)
+        val bb = ByteBuffer.wrap(rec).order(ByteOrder.LITTLE_ENDIAN)
+        var areaSum = 0.0
+        var validSamples = 0L
+        runCatching {
+            RandomAccessFile(triFile, "r").use { raf ->
+                val len = raf.length()
+                for (s in 0 until sampleCount) {
+                    val off = s.toLong() * step * recBytes.toLong()
+                    if (off + 24L > len) break
+                    raf.seek(off)
+                    raf.readFully(rec, 0, if (indexIsLong) 24 else 12)
+                    val i0 = if (indexIsLong) bb.getLong(0) else bb.getInt(0).toLong()
+                    val i1 = if (indexIsLong) bb.getLong(8) else bb.getInt(4).toLong()
+                    val i2 = if (indexIsLong) bb.getLong(16) else bb.getInt(8).toLong()
+                    if (i0 in 0L until positions.count && i1 in 0L until positions.count && i2 in 0L until positions.count) {
+                        val area = triangleArea(
+                            positions.getX(i0), positions.getY(i0), positions.getZ(i0),
+                            positions.getX(i1), positions.getY(i1), positions.getZ(i1),
+                            positions.getX(i2), positions.getY(i2), positions.getZ(i2)
+                        )
+                        if (area > 0.0 && area.isFinite()) {
+                            areaSum += area
+                            validSamples++
+                        }
+                    }
+                }
+            }
+        }
+        return if (validSamples > 0L) (areaSum / validSamples.toDouble()) * totalTris.toDouble() else 0.0
+    }
+
+    private fun estimateTotalAreaFromObjFile(
+        positions: MappedFloatTupleStore,
+        triRecordFile: File,
+        totalTris: Long,
+        recBytes: Int
+    ): Double {
+        if (totalTris <= 0L || !triRecordFile.exists()) return 0.0
+        val sampleCount = minOf(totalTris, 2048L).toInt()
+        val step = maxOf(1L, totalTris / sampleCount)
+        val rec = ByteArray(recBytes)
+        val bb = ByteBuffer.wrap(rec).order(ByteOrder.LITTLE_ENDIAN)
+        var areaSum = 0.0
+        var validSamples = 0L
+        runCatching {
+            RandomAccessFile(triRecordFile, "r").use { raf ->
+                val len = raf.length()
+                for (s in 0 until sampleCount) {
+                    val off = s.toLong() * step * recBytes.toLong()
+                    if (off + recBytes.toLong() > len) break
+                    raf.seek(off)
+                    raf.readFully(rec)
+                    val v0 = bb.getLong(0)
+                    val v1 = bb.getLong(24)
+                    val v2 = bb.getLong(48)
+                    if (v0 in 0L until positions.count && v1 in 0L until positions.count && v2 in 0L until positions.count) {
+                        val area = triangleArea(
+                            positions.getX(v0), positions.getY(v0), positions.getZ(v0),
+                            positions.getX(v1), positions.getY(v1), positions.getZ(v1),
+                            positions.getX(v2), positions.getY(v2), positions.getZ(v2)
+                        )
+                        if (area > 0.0 && area.isFinite()) {
+                            areaSum += area
+                            validSamples++
+                        }
+                    }
+                }
+            }
+        }
+        return if (validSamples > 0L) (areaSum / validSamples.toDouble()) * totalTris.toDouble() else 0.0
+    }
+
+    internal fun estimateSurfaceAwareGridResolution(
+        bounds: MeshBounds,
+        estimatedTotalArea: Double,
+        targetTris: Long,
+        totalTris: Long
+    ): Int {
+        val sx = max(1e-6f, bounds.maxX - bounds.minX).toDouble()
+        val sy = max(1e-6f, bounds.maxY - bounds.minY).toDouble()
+        val sz = max(1e-6f, bounds.maxZ - bounds.minZ).toDouble()
+        val maxSpan = maxOf(sx, sy, sz)
+        val effectiveArea = if (estimatedTotalArea > 1e-12 && estimatedTotalArea.isFinite()) {
+            estimatedTotalArea
+        } else {
+            2.0 * (sx * sy + sy * sz + sz * sx)
+        }
+        if (effectiveArea <= 1e-12 || !effectiveArea.isFinite()) {
+            return estimateInitialGridResolution(totalTris, targetTris)
+        }
+        val cellSize = kotlin.math.sqrt((2.2 * effectiveArea) / targetTris.coerceAtLeast(10_000L).toDouble())
+        return if (cellSize > 1e-9 && cellSize.isFinite()) {
+            (maxSpan / cellSize).toInt().coerceIn(512, 48_000)
+        } else {
+            estimateInitialGridResolution(totalTris, targetTris)
+        }
+    }
+
+    private fun estimateInitialGridResolution(totalTris: Long, targetTris: Long = 9_000_000L): Int = when {
+        targetTris <= 3_500_000L -> 1536
+        totalTris >= 80_000_000L -> 2048
+        totalTris >= 30_000_000L -> 2400
+        totalTris >= 15_000_000L -> 2800
+        else -> 3200
     }
 
     internal fun formatCompact(n: Long): String = when {
