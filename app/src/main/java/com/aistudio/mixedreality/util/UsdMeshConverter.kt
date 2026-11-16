@@ -1,12 +1,9 @@
 package com.aistudio.mixedreality.util
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.util.Log
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
-import java.io.EOFException
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -17,7 +14,6 @@ import java.util.Locale
 import java.util.zip.ZipInputStream
 import kotlin.math.PI
 import kotlin.math.cos
-import kotlin.math.max
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -139,17 +135,20 @@ object UsdMeshConverter {
         val triIndexFile = File(scratchDir, "usd_tris.bin")
         val bounds = StreamingMeshProcessor.MeshBounds()
 
+        var ctxRef: UsdAccumContext? = null
+
         try {
             val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUF)
             val triBuf = ByteBuffer.allocate(65_536).order(ByteOrder.LITTLE_ENDIAN)
             val ctx = UsdAccumContext(
+                scratchDir = scratchDir,
                 positions = positions,
                 normals = normals,
                 uvs = uvs,
                 bounds = bounds,
                 triOut = triOut,
                 triBuf = triBuf
-            )
+            ).also { ctxRef = it }
 
             val assetMap = HashMap<String, File>()
             if (isZippedUsdz) {
@@ -200,7 +199,6 @@ object UsdMeshConverter {
 
             bounds.normalizeIfEmpty()
 
-            val preparedTex = ctx.primaryTextureFile?.let { prepareMobileTexture(scratchDir, it) }
             val outGlb = File(cacheDir, "${usdFile.nameWithoutExtension}_converted.glb")
             val formatLabel = when (usdFile.extension.lowercase(Locale.US)) {
                 "usdc" -> "USDC"
@@ -208,10 +206,13 @@ object UsdMeshConverter {
                 else -> "USDZ"
             }
 
+            val resolvedColors = ctx.colors?.takeIf { it.count == positions.count }
+            val resolvedMats = if (ctx.materials.isNotEmpty()) ctx.materials.toList() else null
             val stats = StreamingMeshProcessor.emitIndexedDiskTrianglesToGlb(
                 positions = positions,
                 normals = if (normals.count == positions.count) normals else null,
                 uvs = if (uvs.count == positions.count) uvs else null,
+                colors = resolvedColors,
                 triIndexFile = triIndexFile,
                 totalVerts = positions.count,
                 totalTris = ctx.totalTriangles,
@@ -220,11 +221,8 @@ object UsdMeshConverter {
                 outGlb = outGlb,
                 generator = "MixedReality OpenUSD Engine",
                 indexIsLong = true,
-                baseColorFactor = ctx.primaryDiffuseColor,
-                metallicFactor = ctx.primaryMetallic,
-                roughnessFactor = ctx.primaryRoughness,
-                textureFile = preparedTex?.first,
-                textureMime = preparedTex?.second
+                triHasMat = true,
+                materials = resolvedMats
             )
 
             val note = if (stats.wasSimplified) {
@@ -250,6 +248,7 @@ object UsdMeshConverter {
             positions.close()
             normals.close()
             uvs.close()
+            ctxRef?.colors?.close()
             runCatching { scratchDir.deleteRecursively() }
         }
     }
@@ -434,33 +433,33 @@ object UsdMeshConverter {
                 childrenByParent.getOrPut(parent) { mutableListOf() }.add(pp)
             }
 
-            // Collect materials: materialPath -> MaterialInfo(diffuseColor, metallic, roughness, textureFile)
+            // Collect all Material prims with shader-graph diffuse texture + PBR extraction
             val materials = HashMap<String, UsdMaterialInfo>()
             for (pp in allPrimPaths) {
                 val pf = pathFields[pp] ?: continue
                 val typeTok = pf["typeName"]?.let { reader.readToken(it) }
                 if (typeTok == "Material") {
-                    val matInfo = extractCrateMaterial(pp, childrenByParent, pathFields, reader, file, rootDir, assetMap)
-                    materials[pp] = matInfo
-                    if (matInfo.textureFile != null && ctx.primaryTextureFile == null) {
-                        ctx.primaryTextureFile = matInfo.textureFile
-                    }
-                    if (ctx.primaryDiffuseColor == null && matInfo.diffuseColor != null) {
-                        ctx.primaryDiffuseColor = matInfo.diffuseColor
-                        ctx.primaryMetallic = matInfo.metallic
-                        ctx.primaryRoughness = matInfo.roughness
-                    }
+                    materials[pp] = extractCrateMaterial(pp, childrenByParent, pathFields, paths, reader, file, rootDir, assetMap)
                 }
             }
 
-            // Recursive traversal over prim tree applying local Xforms, references/payloads, and streaming Meshes
-            fun walkPrim(primPath: String, worldMat: DoubleArray) {
+            fun resolveBoundMaterial(primPath: String): UsdMaterialInfo? {
+                val bindPaths = pathFields["$primPath.material:binding"]?.get("targetPaths")?.let { reader.readPathList(it, paths) }
+                    ?: pathFields["$primPath.material:binding:preview"]?.get("targetPaths")?.let { reader.readPathList(it, paths) }
+                val target = bindPaths?.firstOrNull() ?: return null
+                return materials[target] ?: materials[target.substringBefore('.')]
+            }
+
+            // Recursive traversal over prim tree applying local Xforms, inherited materials, GeomSubsets, and Meshes
+            fun walkPrim(primPath: String, worldMat: DoubleArray, inheritedMat: UsdMaterialInfo?) {
                 val pf = pathFields[primPath] ?: emptyMap()
                 val localXform = readCratePrimXform(primPath, pf, pathFields, reader)
                 val resetStack = pf["xformOpOrder"]?.let { rep ->
                     reader.readTokenArray(rep).any { it == "!resetXformStack!" }
                 } ?: false
                 val curWorld = if (resetStack) mulMat4(baseMat, localXform) else mulMat4(worldMat, localXform)
+
+                val activeMat = resolveBoundMaterial(primPath) ?: inheritedMat
 
                 // Check references / payload pointing to another USD file in the archive
                 for (arcField in listOf("references", "payload")) {
@@ -473,85 +472,167 @@ object UsdMeshConverter {
                     }
                 }
 
-                // Material binding -> update primary material appearance if not already set
-                pathFields["$primPath.material:binding"]?.get("targetPaths")?.let { rep ->
-                    val target = reader.readPathList(rep, paths).firstOrNull()
-                    val mInfo = target?.let { materials[it] }
-                    if (mInfo != null) {
-                        if (ctx.primaryTextureFile == null && mInfo.textureFile != null) ctx.primaryTextureFile = mInfo.textureFile
-                        if (ctx.primaryDiffuseColor == null && mInfo.diffuseColor != null) {
-                            ctx.primaryDiffuseColor = mInfo.diffuseColor
-                            ctx.primaryMetallic = mInfo.metallic
-                            ctx.primaryRoughness = mInfo.roughness
-                        }
-                    }
-                }
-
                 val typeName = pf["typeName"]?.let { reader.readToken(it) }
                 val hasPointsProp = pathFields.containsKey("$primPath.points") && pathFields.containsKey("$primPath.faceVertexIndices")
                 if (typeName == "Mesh" || hasPointsProp) {
-                    emitCrateMesh(primPath, pathFields, reader, curWorld, ctx)
+                    emitCrateMesh(
+                        primPath = primPath,
+                        childrenByParent = childrenByParent,
+                        pathFields = pathFields,
+                        paths = paths,
+                        reader = reader,
+                        worldMat = curWorld,
+                        boundMat = activeMat,
+                        materials = materials,
+                        ctx = ctx
+                    )
                 }
 
                 val children = childrenByParent[primPath] ?: return
-                for (child in children) walkPrim(child, curWorld)
+                for (child in children) {
+                    val childType = pathFields[child]?.get("typeName")?.let { reader.readToken(it) }
+                    if (childType != "GeomSubset") {
+                        walkPrim(child, curWorld, activeMat)
+                    }
+                }
             }
 
             val topChildren = childrenByParent["/"] ?: emptyList()
-            for (rootPrim in topChildren) walkPrim(rootPrim, baseMat)
+            for (rootPrim in topChildren) walkPrim(rootPrim, baseMat, null)
         }
+    }
+
+    private fun isSupportedTextureFile(file: File): Boolean {
+        val ext = file.extension.lowercase(Locale.US)
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp" || ext == "bmp"
+    }
+
+    private fun isNonDiffuseTextureName(name: String): Boolean {
+        val low = name.lowercase(Locale.US)
+        return low.contains("normal") || low.contains("_nrm") || low.contains("norm") ||
+            low.contains("rough") || low.contains("metal") || low.contains("occlusion") ||
+            low.contains("_ao") || low.contains("bump") || low.contains("height") ||
+            low.contains("disp") || low.contains("opacity") || low.contains("emissive")
     }
 
     private fun extractCrateMaterial(
         matPath: String,
         childrenByParent: Map<String, List<String>>,
         pathFields: Map<String, Map<String, Long>>,
+        paths: List<String>,
         reader: CrateValueReader,
         usdFile: File,
         rootDir: File,
         assetMap: Map<String, File>
     ): UsdMaterialInfo {
         var diffuse: FloatArray? = null
+        var emissive: FloatArray? = null
+        var opacity = 1f
         var metallic = 0.1f
         var roughness = 0.7f
         var texFile: File? = null
+        var texVarname: String? = null
 
+        val descendants = mutableListOf<String>()
         val queue = ArrayDeque<String>()
         queue.add(matPath)
         while (queue.isNotEmpty()) {
             val p = queue.removeFirst()
+            descendants.add(p)
             childrenByParent[p]?.forEach { queue.add(it) }
-            val shaderId = pathFields["$p.info:id"]?.let { getCrateAttrValueRep(it) }?.let { reader.readToken(it) }
-            if (shaderId == "UsdPreviewSurface" || pathFields.containsKey("$p.inputs:diffuseColor")) {
-                pathFields["$p.inputs:diffuseColor"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
-                    val arr = reader.readVec3ScalarOrArray(rep)
-                    if (arr != null && arr.size >= 3) {
-                        diffuse = floatArrayOf(arr[0], arr[1], arr[2], 1f)
-                    }
-                }
-                pathFields["$p.inputs:metallic"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
-                    reader.readFloatScalar(rep)?.let { metallic = it }
-                }
-                pathFields["$p.inputs:roughness"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
-                    reader.readFloatScalar(rep)?.let { roughness = it }
-                }
-            }
-            if (shaderId == "UsdUVTexture" || pathFields.containsKey("$p.inputs:file")) {
-                pathFields["$p.inputs:file"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
-                    for (asset in reader.readAssetPaths(rep)) {
-                        val candidate = resolveUsdAsset(asset, usdFile, rootDir, assetMap)
-                        if (candidate != null && (candidate.extension.equals("png", true) ||
-                                candidate.extension.equals("jpg", true) ||
-                                candidate.extension.equals("jpeg", true))
-                        ) {
-                            texFile = candidate
-                            break
+        }
+
+        fun resolveTextureFromNode(texNodePath: String): File? {
+            val rep = pathFields["$texNodePath.inputs:file"]?.let { getCrateAttrValueRep(it) } ?: return null
+            for (asset in reader.readAssetPaths(rep)) {
+                val candidate = resolveUsdAsset(asset, usdFile, rootDir, assetMap)
+                if (candidate != null && isSupportedTextureFile(candidate)) {
+                    // Check wired UV reader varname on this UsdUVTexture's inputs:st
+                    pathFields["$texNodePath.inputs:st"]?.get("connectionPaths")?.let { stRep ->
+                        val readerPath = reader.readPathList(stRep, paths).firstOrNull()?.substringBefore('.')
+                        if (readerPath != null) {
+                            pathFields["$readerPath.inputs:varname"]?.let { getCrateAttrValueRep(it) }
+                                ?.let { vRep -> texVarname = reader.readToken(vRep) }
                         }
                     }
+                    return candidate
                 }
             }
+            return null
         }
-        return UsdMaterialInfo(diffuse, metallic, roughness, texFile)
+
+        // 1. Trace outputs:surface.connect from the Material prim to the exact UsdPreviewSurface shader
+        val surfaceShaderPath = pathFields["$matPath.outputs:surface"]?.get("connectionPaths")
+            ?.let { reader.readPathList(it, paths).firstOrNull()?.substringBefore('.') }
+            ?: descendants.firstOrNull {
+                val sid = pathFields["$it.info:id"]?.let { r -> getCrateAttrValueRep(r) }?.let { r -> reader.readToken(r) }
+                sid == "UsdPreviewSurface" || pathFields.containsKey("$it.inputs:diffuseColor")
+            }
+
+        if (surfaceShaderPath != null) {
+            val diffConn = pathFields["$surfaceShaderPath.inputs:diffuseColor"]?.get("connectionPaths")
+                ?.let { reader.readPathList(it, paths).firstOrNull()?.substringBefore('.') }
+            if (diffConn != null) {
+                texFile = resolveTextureFromNode(diffConn)
+            }
+            if (texFile == null) {
+                pathFields["$surfaceShaderPath.inputs:diffuseColor"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
+                    val arr = reader.readVec3ScalarOrArray(rep)
+                    if (arr != null && arr.size >= 3) {
+                        diffuse = floatArrayOf(arr[0].coerceIn(0f, 1f), arr[1].coerceIn(0f, 1f), arr[2].coerceIn(0f, 1f), 1f)
+                    }
+                }
+            }
+            pathFields["$surfaceShaderPath.inputs:emissiveColor"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
+                val arr = reader.readVec3ScalarOrArray(rep)
+                if (arr != null && arr.size >= 3 && (arr[0] > 0.001f || arr[1] > 0.001f || arr[2] > 0.001f)) {
+                    emissive = floatArrayOf(arr[0].coerceIn(0f, 1f), arr[1].coerceIn(0f, 1f), arr[2].coerceIn(0f, 1f))
+                }
+            }
+            pathFields["$surfaceShaderPath.inputs:opacity"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
+                reader.readFloatScalar(rep)?.let { opacity = it.coerceIn(0f, 1f) }
+            }
+            pathFields["$surfaceShaderPath.inputs:metallic"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
+                reader.readFloatScalar(rep)?.let { metallic = it.coerceIn(0f, 1f) }
+            }
+            pathFields["$surfaceShaderPath.inputs:roughness"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
+                reader.readFloatScalar(rep)?.let { roughness = it.coerceIn(0.05f, 1f) }
+            }
+        }
+
+        // 2. Fallback scan if no diffuseColor.connect existed: find a diffuse-like UsdUVTexture (never overwrite with normal/roughness)
+        if (texFile == null) {
+            var fallbackTex: File? = null
+            for (p in descendants) {
+                val sid = pathFields["$p.info:id"]?.let { getCrateAttrValueRep(it) }?.let { reader.readToken(it) }
+                if (sid == "UsdUVTexture" || pathFields.containsKey("$p.inputs:file")) {
+                    val cand = resolveTextureFromNode(p) ?: continue
+                    val nodeName = p.substringAfterLast('/')
+                    if (!isNonDiffuseTextureName(nodeName) && !isNonDiffuseTextureName(cand.nameWithoutExtension)) {
+                        texFile = cand
+                        diffuse = null // Let baseColorTexture supply color cleanly without multiplying fallback gray
+                        break
+                    } else if (fallbackTex == null) {
+                        fallbackTex = cand
+                    }
+                }
+            }
+            if (texFile == null && fallbackTex != null) {
+                texFile = fallbackTex
+                diffuse = null
+            }
+        }
+
+        return UsdMaterialInfo(
+            key = matPath,
+            diffuseColor = if (texFile != null) null else diffuse,
+            emissiveColor = emissive,
+            opacity = opacity,
+            metallic = metallic,
+            roughness = roughness,
+            textureFile = texFile,
+            texVarname = texVarname
+        )
     }
 
     private fun readCratePrimXform(
@@ -563,7 +644,6 @@ object UsdMeshConverter {
         val opOrderRep = pf["xformOpOrder"] ?: pathFields["$primPath.xformOpOrder"]?.let { getCrateAttrValueRep(it) }
         val ops = opOrderRep?.let { reader.readTokenArray(it) }
         if (ops.isNullOrEmpty()) {
-            // Check direct xformOp:transform even if xformOpOrder omitted
             val directMatRep = pathFields["$primPath.xformOp:transform"]?.let { getCrateAttrValueRep(it) }
             if (directMatRep != null) {
                 reader.readMatrix4d(directMatRep)?.let { return it }
@@ -611,9 +691,13 @@ object UsdMeshConverter {
 
     private fun emitCrateMesh(
         primPath: String,
+        childrenByParent: Map<String, List<String>>,
         pathFields: Map<String, Map<String, Long>>,
+        paths: List<String>,
         reader: CrateValueReader,
         worldMat: DoubleArray,
+        boundMat: UsdMaterialInfo?,
+        materials: Map<String, UsdMaterialInfo>,
         ctx: UsdAccumContext
     ) {
         val ptsRep = pathFields["$primPath.points"]?.let { getCrateAttrValueRep(it) } ?: return
@@ -626,17 +710,26 @@ object UsdMeshConverter {
 
         val faceCounts = reader.readIntArray(countsRep)
         val faceIndices = reader.readIntArray(idxRep) ?: return
+        val numFaces = faceCounts?.size ?: (faceIndices.size / 3)
 
         val orientation = pathFields["$primPath.orientation"]?.let { getCrateAttrValueRep(it) }?.let { reader.readToken(it) } ?: "rightHanded"
         val isLeftHanded = orientation.equals("leftHanded", ignoreCase = true)
 
-        val uvField = pathFields["$primPath.primvars:st"]
-            ?: pathFields["$primPath.primvars:UVMap"]
-            ?: pathFields["$primPath.primvars:uv"]
+        val uvCandidates = buildList {
+            boundMat?.texVarname?.takeIf { it.isNotBlank() }?.let { add(it) }
+            addAll(listOf("st", "st0", "UVMap", "uv", "uv0", "map1", "texCoord", "Texture_map"))
+        }
+        var uvField: Map<String, Long>? = null
+        var uvIdxField: Map<String, Long>? = null
+        for (cand in uvCandidates) {
+            val f = pathFields["$primPath.primvars:$cand"]
+            if (f != null) {
+                uvField = f
+                uvIdxField = pathFields["$primPath.primvars:$cand:indices"]
+                break
+            }
+        }
         val uvArray = uvField?.let { getCrateAttrValueRep(it) }?.let { reader.readFloatVecArray(it, 2) }
-        val uvIdxField = pathFields["$primPath.primvars:st:indices"]
-            ?: pathFields["$primPath.primvars:UVMap:indices"]
-            ?: pathFields["$primPath.primvars:uv:indices"]
         val uvIndices = uvIdxField?.let { getCrateAttrValueRep(it) }?.let { reader.readIntArray(it) }
         val uvInterp = uvField?.get("interpolation")?.let { reader.readToken(it) } ?: ""
 
@@ -644,18 +737,68 @@ object UsdMeshConverter {
         val nrmArray = nrmField?.let { getCrateAttrValueRep(it) }?.let { reader.readFloatVecArray(it, 3) }
         val nrmInterp = nrmField?.get("interpolation")?.let { reader.readToken(it) } ?: ""
 
-        // Capture primvars:displayColor if no material diffuse color set yet
-        if (ctx.primaryDiffuseColor == null) {
-            pathFields["$primPath.primvars:displayColor"]?.let { getCrateAttrValueRep(it) }?.let { rep ->
-                val col = reader.readFloatVecArray(rep, 3)
-                if (col != null && col.size >= 3) {
-                    ctx.primaryDiffuseColor = floatArrayOf(col[0], col[1], col[2], 1f)
+        val dcField = pathFields["$primPath.primvars:displayColor"]
+        val dcArray = dcField?.let { getCrateAttrValueRep(it) }?.let { reader.readFloatVecArray(it, 3) }
+        val dcIndices = pathFields["$primPath.primvars:displayColor:indices"]
+            ?.let { getCrateAttrValueRep(it) }?.let { reader.readIntArray(it) }
+        val dcInterp = dcField?.get("interpolation")?.let { reader.readToken(it) } ?: "constant"
+
+        val doField = pathFields["$primPath.primvars:displayOpacity"]
+        val doArray = doField?.let { getCrateAttrValueRep(it) }?.let { reader.readFloatArray(it) }
+
+        // If boundMat has no diffuse/texture and mesh has constant displayColor, bake constant displayColor into material
+        var effectiveMat = boundMat
+        var perVertexDisplayColors: FloatArray? = null
+        var perVertexDisplayInterp = ""
+        var perVertexDisplayIndices: IntArray? = null
+        if (dcArray != null && dcArray.size >= 3) {
+            if (dcArray.size == 3 && dcIndices == null && (dcInterp == "constant" || vertCount > 1) &&
+                effectiveMat?.diffuseColor == null && effectiveMat?.textureFile == null
+            ) {
+                val baseKey = effectiveMat?.key ?: "__const_dc_${dcArray[0]}_${dcArray[1]}_${dcArray[2]}"
+                effectiveMat = UsdMaterialInfo(
+                    key = baseKey,
+                    diffuseColor = floatArrayOf(dcArray[0].coerceIn(0f, 1f), dcArray[1].coerceIn(0f, 1f), dcArray[2].coerceIn(0f, 1f), 1f),
+                    emissiveColor = effectiveMat?.emissiveColor,
+                    opacity = doArray?.firstOrNull()?.coerceIn(0f, 1f) ?: (effectiveMat?.opacity ?: 1f),
+                    metallic = effectiveMat?.metallic ?: 0.1f,
+                    roughness = effectiveMat?.roughness ?: 0.7f,
+                    textureFile = null
+                )
+            } else {
+                perVertexDisplayColors = dcArray
+                perVertexDisplayInterp = dcInterp
+                perVertexDisplayIndices = dcIndices
+            }
+        }
+
+        val defaultMatId = ctx.registerMaterial(effectiveMat)
+        var faceMatIds: IntArray? = null
+        val children = childrenByParent[primPath]
+        if (!children.isNullOrEmpty() && numFaces > 0) {
+            for (child in children) {
+                val cFields = pathFields[child] ?: continue
+                if (cFields["typeName"]?.let { reader.readToken(it) } != "GeomSubset") continue
+                val subBind = (pathFields["$child.material:binding"]?.get("targetPaths")
+                    ?: pathFields["$child.material:binding:preview"]?.get("targetPaths"))
+                    ?.let { reader.readPathList(it, paths).firstOrNull() }
+                    ?: continue
+                val subMatInfo = materials[subBind] ?: materials[subBind.substringBefore('.')] ?: continue
+                val subIdx = pathFields["$child.indices"]?.let { getCrateAttrValueRep(it) }?.let { reader.readIntArray(it) }
+                    ?: continue
+                if (faceMatIds == null) faceMatIds = IntArray(numFaces) { defaultMatId }
+                val subMatId = ctx.registerMaterial(subMatInfo)
+                for (fi in subIdx) {
+                    if (fi in 0 until numFaces) faceMatIds[fi] = subMatId
                 }
             }
         }
 
+        val hasNonVertexColor = perVertexDisplayColors != null &&
+            (perVertexDisplayIndices != null || perVertexDisplayInterp == "faceVarying" || perVertexDisplayInterp == "uniform")
         val canUseSharedVerts = (uvArray == null || uvIndices == null && uvInterp != "faceVarying") &&
-            (nrmArray == null || nrmInterp != "faceVarying")
+            (nrmArray == null || nrmInterp != "faceVarying") &&
+            !hasNonVertexColor
 
         emitUsdMeshToContext(
             points = points,
@@ -667,6 +810,12 @@ object UsdMeshConverter {
             uvArray = uvArray,
             uvIndices = uvIndices,
             uvInterp = uvInterp,
+            colorArray = perVertexDisplayColors,
+            colorIndices = perVertexDisplayIndices,
+            colorInterp = perVertexDisplayInterp,
+            opacityArray = doArray,
+            defaultMatId = defaultMatId,
+            faceMatIds = faceMatIds,
             worldMat = worldMat,
             canUseSharedVerts = canUseSharedVerts,
             ctx = ctx
@@ -1025,8 +1174,7 @@ object UsdMeshConverter {
             return if (isInlined(rep)) {
                 val p = payload(rep).toInt()
                 when (t) {
-                    T_FLOAT -> java.lang.Float.intBitsToFloat(p)
-                    T_DOUBLE -> p.toDouble().toFloat()
+                    T_FLOAT, T_DOUBLE -> java.lang.Float.intBitsToFloat(p)
                     T_HALF -> halfBitsToFloat(p and 0xFFFF)
                     T_INT -> p.toFloat()
                     else -> null
@@ -1050,7 +1198,6 @@ object UsdMeshConverter {
             if (isArray(rep)) return readFloatVecArray(rep, 3)
             val t = typeEnum(rep)
             if (isInlined(rep)) {
-                // Vec3i or packed half3/float-int can be inlined
                 val p = payload(rep)
                 return when (t) {
                     T_VEC3H -> floatArrayOf(
@@ -1063,10 +1210,11 @@ object UsdMeshConverter {
                         ((p ushr 16) and 0xFFFFL).toShort().toFloat(),
                         ((p ushr 32) and 0xFFFFL).toShort().toFloat()
                     )
+                    // OpenUSD Crate packs inline Vec3f/Vec3d as 3 signed int8 bytes in payload bits 0..23
                     T_VEC3F, T_VEC3D -> floatArrayOf(
-                        ((p and 0xFFFFL).toShort().toInt()).toFloat(),
-                        (((p ushr 16) and 0xFFFFL).toShort().toInt()).toFloat(),
-                        (((p ushr 32) and 0xFFFFL).toShort().toInt()).toFloat()
+                        (p and 0xFFL).toByte().toFloat(),
+                        ((p ushr 8) and 0xFFL).toByte().toFloat(),
+                        ((p ushr 16) and 0xFFL).toByte().toFloat()
                     )
                     else -> null
                 }
@@ -1180,6 +1328,8 @@ object UsdMeshConverter {
                 }
             }
         }
+
+        fun readFloatArray(rawRep: Long): FloatArray? = readFloatVecArray(rawRep, 1)
 
         fun readFloatVecArray(rawRep: Long, dims: Int): FloatArray? {
             val rep = unwrapTimeSampleRep(rawRep)
@@ -1447,28 +1597,160 @@ object UsdMeshConverter {
             }
         }
 
-        // Extract diffuseColor / texture file across UsdPreviewSurface blocks
-        if (ctx.primaryDiffuseColor == null) {
-            Regex("""inputs:diffuseColor\s*=\s*\(\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*\)""")
-                .find(text)?.let { mc ->
-                    ctx.primaryDiffuseColor = floatArrayOf(
-                        mc.groupValues[1].toFloatOrNull() ?: 0.85f,
-                        mc.groupValues[2].toFloatOrNull() ?: 0.85f,
-                        mc.groupValues[3].toFloatOrNull() ?: 0.85f,
-                        1f
-                    )
+        // Pre-collect all Material blocks by full prim path (e.g. /Root/Mat) and short name
+        val materials = collectUsdaMaterials(text, 0, text.length, "", file, rootDir, assetMap)
+
+        // Walk prim blocks iteratively by brace depth so nested Xforms and inherited materials compose accurately
+        parseUsdaBlocks(text, 0, text.length, baseMat, null, materials, file, rootDir, assetMap, ctx, visited, depth)
+    }
+
+    private fun collectUsdaMaterials(
+        text: String,
+        start: Int,
+        end: Int,
+        parentPath: String,
+        file: File,
+        rootDir: File,
+        assetMap: Map<String, File>
+    ): Map<String, UsdMaterialInfo> {
+        val out = HashMap<String, UsdMaterialInfo>()
+        val defRegex = Regex("""\b(def|over|class)\s+([A-Za-z0-9_]*)\s*"([^"]+)"(?:\s*\((.*?)\))?\s*\{""", setOf(RegexOption.DOT_MATCHES_ALL))
+        var pos = start
+        while (pos < end) {
+            val m = defRegex.find(text, pos) ?: break
+            if (m.range.first >= end) break
+            val primType = m.groupValues[2]
+            val primName = m.groupValues[3]
+            val primPath = "$parentPath/$primName"
+            val openBrace = m.range.last
+            val closeBrace = findMatchingBrace(text, openBrace, end)
+            if (closeBrace <= openBrace) break
+            val childRanges = collectImmediateChildPrimRanges(text, openBrace + 1, closeBrace)
+            if (primType == "Material") {
+                val info = parseUsdaMaterialBlock(text, primPath, openBrace + 1, closeBrace, childRanges, file, rootDir, assetMap)
+                out[primPath] = info
+                out.putIfAbsent(primName, info)
+            } else {
+                for (r in childRanges) {
+                    out.putAll(collectUsdaMaterials(text, r.first, r.last + 1, primPath, file, rootDir, assetMap))
                 }
+            }
+            pos = closeBrace + 1
         }
-        if (ctx.primaryTextureFile == null) {
-            Regex("""inputs:file\s*=\s*@([^@]+)@""").find(text)?.let { mt ->
-                resolveUsdAsset(mt.groupValues[1], file, rootDir, assetMap)?.let { tf ->
-                    ctx.primaryTextureFile = tf
+        return out
+    }
+
+    private fun parseUsdaMaterialBlock(
+        text: String,
+        matPath: String,
+        bodyStart: Int,
+        bodyEnd: Int,
+        childRanges: List<IntRange>,
+        file: File,
+        rootDir: File,
+        assetMap: Map<String, File>
+    ): UsdMaterialInfo {
+        val headerRegex = Regex("""\b(def|over|class)\s+([A-Za-z0-9_]*)\s*"([^"]+)"(?:\s*\((.*?)\))?\s*\{""", setOf(RegexOption.DOT_MATCHES_ALL))
+        val ownBody = buildString {
+            var cur = bodyStart
+            for (r in childRanges) {
+                if (r.first > cur) append(text, cur, r.first)
+                cur = r.last + 1
+            }
+            if (cur < bodyEnd) append(text, cur, bodyEnd)
+        }
+
+        val shaders = LinkedHashMap<String, String>()
+        for (r in childRanges) {
+            val m = headerRegex.find(text, r.first)
+            if (m != null && m.range.first <= r.last) {
+                val shName = m.groupValues[3]
+                val shOpen = m.range.last
+                val shClose = (r.last).coerceAtMost(bodyEnd)
+                if (shClose > shOpen) {
+                    shaders["$matPath/$shName"] = text.substring(shOpen + 1, shClose)
+                    shaders[shName] = text.substring(shOpen + 1, shClose)
                 }
             }
         }
 
-        // Walk prim blocks iteratively by brace depth so nested Xforms compose matrices accurately
-        parseUsdaBlocks(text, 0, text.length, baseMat, file, rootDir, assetMap, ctx, visited, depth)
+        val surfConnTarget = Regex("""outputs:surface\.connect\s*=\s*<([^.>]+)""").find(ownBody)?.groupValues?.get(1)
+        val pbrBody = surfConnTarget?.let { shaders[it] ?: shaders[it.substringAfterLast('/')] }
+            ?: shaders.values.firstOrNull { it.contains("UsdPreviewSurface") || it.contains("inputs:diffuseColor") }
+            ?: ownBody
+
+        val diffConnTarget = Regex("""inputs:diffuseColor\.connect\s*=\s*<([^.>]+)""").find(pbrBody)?.groupValues?.get(1)
+        var texFile: File? = null
+        var texVarname: String? = null
+
+        fun tryExtractTextureFromShaderBody(sBody: String): File? {
+            val fRef = Regex("""inputs:file\s*=\s*@([^@]+)@""").find(sBody)?.groupValues?.get(1) ?: return null
+            val cand = resolveUsdAsset(fRef, file, rootDir, assetMap) ?: return null
+            if (!isSupportedTextureFile(cand)) return null
+            val stTarget = Regex("""inputs:st\.connect\s*=\s*<([^.>]+)""").find(sBody)?.groupValues?.get(1)
+            if (stTarget != null) {
+                val readerBody = shaders[stTarget] ?: shaders[stTarget.substringAfterLast('/')]
+                if (readerBody != null) {
+                    Regex("""inputs:varname\s*=\s*"([^"]+)"""").find(readerBody)?.groupValues?.get(1)?.let { texVarname = it }
+                }
+            }
+            return cand
+        }
+
+        if (diffConnTarget != null) {
+            val texBody = shaders[diffConnTarget] ?: shaders[diffConnTarget.substringAfterLast('/')]
+            if (texBody != null) texFile = tryExtractTextureFromShaderBody(texBody)
+        }
+        if (texFile == null) {
+            var fallbackTex: File? = null
+            for ((shKey, shBody) in shaders) {
+                if (shBody.contains("inputs:file")) {
+                    val cand = tryExtractTextureFromShaderBody(shBody) ?: continue
+                    if (!isNonDiffuseTextureName(shKey) && !isNonDiffuseTextureName(cand.nameWithoutExtension)) {
+                        texFile = cand
+                        break
+                    } else if (fallbackTex == null) {
+                        fallbackTex = cand
+                    }
+                }
+            }
+            if (texFile == null) texFile = fallbackTex
+        }
+
+        val diffuse = if (texFile == null) {
+            Regex("""inputs:diffuseColor\s*=\s*\(\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*\)""")
+                .find(pbrBody)?.let { mc ->
+                    floatArrayOf(
+                        (mc.groupValues[1].toFloatOrNull() ?: 1f).coerceIn(0f, 1f),
+                        (mc.groupValues[2].toFloatOrNull() ?: 1f).coerceIn(0f, 1f),
+                        (mc.groupValues[3].toFloatOrNull() ?: 1f).coerceIn(0f, 1f),
+                        1f
+                    )
+                }
+        } else null
+
+        val emissive = Regex("""inputs:emissiveColor\s*=\s*\(\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*,\s*([0-9eE.+\-]+)\s*\)""")
+            .find(pbrBody)?.let { mc ->
+                val r = (mc.groupValues[1].toFloatOrNull() ?: 0f).coerceIn(0f, 1f)
+                val g = (mc.groupValues[2].toFloatOrNull() ?: 0f).coerceIn(0f, 1f)
+                val b = (mc.groupValues[3].toFloatOrNull() ?: 0f).coerceIn(0f, 1f)
+                if (r > 0.001f || g > 0.001f || b > 0.001f) floatArrayOf(r, g, b) else null
+            }
+
+        val opacity = Regex("""inputs:opacity\s*=\s*([0-9eE.+\-]+)""").find(pbrBody)?.groupValues?.get(1)?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 1f
+        val metallic = Regex("""inputs:metallic\s*=\s*([0-9eE.+\-]+)""").find(pbrBody)?.groupValues?.get(1)?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 0.1f
+        val roughness = Regex("""inputs:roughness\s*=\s*([0-9eE.+\-]+)""").find(pbrBody)?.groupValues?.get(1)?.toFloatOrNull()?.coerceIn(0.05f, 1f) ?: 0.7f
+
+        return UsdMaterialInfo(
+            key = matPath,
+            diffuseColor = diffuse,
+            emissiveColor = emissive,
+            opacity = opacity,
+            metallic = metallic,
+            roughness = roughness,
+            textureFile = texFile,
+            texVarname = texVarname
+        )
     }
 
     private fun parseUsdaBlocks(
@@ -1476,6 +1758,8 @@ object UsdMeshConverter {
         start: Int,
         end: Int,
         worldMat: DoubleArray,
+        inheritedMat: UsdMaterialInfo?,
+        materials: Map<String, UsdMaterialInfo>,
         file: File,
         rootDir: File,
         assetMap: Map<String, File>,
@@ -1484,6 +1768,7 @@ object UsdMeshConverter {
         depth: Int
     ) {
         val defRegex = Regex("""\b(def|over|class)\s+([A-Za-z0-9_]*)\s*"([^"]+)"(?:\s*\((.*?)\))?\s*\{""", setOf(RegexOption.DOT_MATCHES_ALL))
+        val bindRegex = Regex("""rel\s+material:binding(?::preview)?\s*=\s*<([^>]+)>""")
         var pos = start
         while (pos < end) {
             val m = defRegex.find(text, pos) ?: break
@@ -1494,7 +1779,6 @@ object UsdMeshConverter {
             val closeBrace = findMatchingBrace(text, openBrace, end)
             if (closeBrace <= openBrace) break
 
-            // Extract child sub-blocks' ranges vs current prim's own body
             val childRanges = collectImmediateChildPrimRanges(text, openBrace + 1, closeBrace)
             val ownBody = buildString {
                 var cur = openBrace + 1
@@ -1505,23 +1789,37 @@ object UsdMeshConverter {
                 if (cur < closeBrace) append(text, cur, closeBrace)
             }
 
-            // Compute this prim's local xform
+            val boundTarget = bindRegex.find(ownBody)?.groupValues?.get(1)
+            val activeMat = if (boundTarget != null) {
+                materials[boundTarget] ?: materials[boundTarget.substringAfterLast('/')] ?: inheritedMat
+            } else inheritedMat
+
             val localXform = parseUsdaXform(ownBody)
             val primWorld = mulMat4(worldMat, localXform)
 
-            // Resolve references / payload metadata
             Regex("""@([^@]+)@""").findAll(metaBlock).forEach { ref ->
                 resolveUsdAsset(ref.groupValues[1], file, rootDir, assetMap)?.let { refF ->
                     processAnyUsdLayer(refF, rootDir, assetMap, primWorld, ctx, visited, depth + 1)
                 }
             }
 
-            if (primType == "Mesh" || (ownBody.contains("points") && ownBody.contains("faceVertexIndices"))) {
-                emitUsdaMeshBody(ownBody, primWorld, ctx)
+            val geomSubsetBodies = mutableListOf<String>()
+            val nonSubsetChildren = mutableListOf<IntRange>()
+            for (r in childRanges) {
+                val cm = defRegex.find(text, r.first)
+                if (cm != null && cm.range.first <= r.last && cm.groupValues[2] == "GeomSubset") {
+                    geomSubsetBodies.add(text.substring(r.first, r.last + 1))
+                } else {
+                    nonSubsetChildren.add(r)
+                }
             }
 
-            for (r in childRanges) {
-                parseUsdaBlocks(text, r.first, r.last + 1, primWorld, file, rootDir, assetMap, ctx, visited, depth)
+            if (primType == "Mesh" || (ownBody.contains("points") && ownBody.contains("faceVertexIndices"))) {
+                emitUsdaMeshBody(ownBody, geomSubsetBodies, primWorld, activeMat, materials, ctx)
+            }
+
+            for (r in nonSubsetChildren) {
+                parseUsdaBlocks(text, r.first, r.last + 1, primWorld, activeMat, materials, file, rootDir, assetMap, ctx, visited, depth)
             }
             pos = closeBrace + 1
         }
@@ -1655,34 +1953,102 @@ object UsdMeshConverter {
         return acc
     }
 
-    private fun emitUsdaMeshBody(body: String, worldMat: DoubleArray, ctx: UsdAccumContext) {
+    private fun emitUsdaMeshBody(
+        body: String,
+        geomSubsets: List<String>,
+        worldMat: DoubleArray,
+        boundMat: UsdMaterialInfo?,
+        materials: Map<String, UsdMaterialInfo>,
+        ctx: UsdAccumContext
+    ) {
         val pointsStr = extractUsdaArrayBlock(body, "points") ?: return
         val countsStr = extractUsdaArrayBlock(body, "faceVertexCounts")
         val indicesStr = extractUsdaArrayBlock(body, "faceVertexIndices") ?: return
 
         val points = extractFloatList(pointsStr)
         if (points.size < 3) return
+        val vertCount = points.size / 3
         val faceCounts = if (countsStr != null) extractIntList(countsStr) else null
         val faceIndices = extractIntList(indicesStr)
         if (faceIndices.size < 3) return
+        val numFaces = faceCounts?.size ?: (faceIndices.size / 3)
 
         val leftHanded = Regex("""orientation\s*=\s*"leftHanded"""").containsMatchIn(body)
         val nrmStr = extractUsdaArrayBlock(body, "normals") ?: extractUsdaArrayBlock(body, "primvars:normals")
         val nrmArray = nrmStr?.let { extractFloatList(it) }
-        val uvStr = extractUsdaArrayBlock(body, "primvars:st") ?: extractUsdaArrayBlock(body, "primvars:uv")
+
+        val uvCandidates = buildList {
+            boundMat?.texVarname?.takeIf { it.isNotBlank() }?.let { add(it) }
+            addAll(listOf("st", "st0", "UVMap", "uv", "uv0", "map1", "texCoord", "Texture_map"))
+        }
+        var uvNameUsed = "st"
+        var uvStr: String? = null
+        var uvIdxStr: String? = null
+        for (cand in uvCandidates) {
+            val s = extractUsdaArrayBlock(body, "primvars:$cand")
+            if (s != null) {
+                uvStr = s
+                uvNameUsed = cand
+                uvIdxStr = extractUsdaArrayBlock(body, "primvars:$cand:indices")
+                break
+            }
+        }
         val uvArray = uvStr?.let { extractFloatList(it) }
-        val uvIdxStr = extractUsdaArrayBlock(body, "primvars:st:indices") ?: extractUsdaArrayBlock(body, "primvars:uv:indices")
         val uvIndices = uvIdxStr?.let { extractIntList(it) }
 
-        if (ctx.primaryDiffuseColor == null) {
-            extractUsdaArrayBlock(body, "primvars:displayColor")?.let { cStr ->
-                val c = extractFloatList(cStr)
-                if (c.size >= 3) ctx.primaryDiffuseColor = floatArrayOf(c[0], c[1], c[2], 1f)
+        val dcArray = extractUsdaArrayBlock(body, "primvars:displayColor")?.let { extractFloatList(it) }
+        val dcIndices = extractUsdaArrayBlock(body, "primvars:displayColor:indices")?.let { extractIntList(it) }
+        val dcInterp = Regex("""primvars:displayColor\b[^=]*=\s*\[[^\]]*]\s*\([^)]*interpolation\s*=\s*"([^"]+)"""", RegexOption.DOT_MATCHES_ALL)
+            .find(body)?.groupValues?.get(1) ?: "constant"
+        val doArray = extractUsdaArrayBlock(body, "primvars:displayOpacity")?.let { extractFloatList(it) }
+
+        var effectiveMat = boundMat
+        var perVertexDisplayColors: FloatArray? = null
+        var perVertexDisplayInterp = ""
+        var perVertexDisplayIndices: IntArray? = null
+        if (dcArray != null && dcArray.size >= 3) {
+            if (dcArray.size == 3 && dcIndices == null && (dcInterp == "constant" || vertCount > 1) &&
+                effectiveMat?.diffuseColor == null && effectiveMat?.textureFile == null
+            ) {
+                effectiveMat = UsdMaterialInfo(
+                    key = effectiveMat?.key ?: "__const_dc_${dcArray[0]}_${dcArray[1]}_${dcArray[2]}",
+                    diffuseColor = floatArrayOf(dcArray[0].coerceIn(0f, 1f), dcArray[1].coerceIn(0f, 1f), dcArray[2].coerceIn(0f, 1f), 1f),
+                    emissiveColor = effectiveMat?.emissiveColor,
+                    opacity = doArray?.firstOrNull()?.coerceIn(0f, 1f) ?: (effectiveMat?.opacity ?: 1f),
+                    metallic = effectiveMat?.metallic ?: 0.1f,
+                    roughness = effectiveMat?.roughness ?: 0.7f,
+                    textureFile = null
+                )
+            } else {
+                perVertexDisplayColors = dcArray
+                perVertexDisplayInterp = dcInterp
+                perVertexDisplayIndices = dcIndices
             }
         }
 
-        val uvFaceVarying = Regex("""primvars:(?:st|uv)\b.*?(?:\(\s*interpolation\s*=\s*"faceVarying")""").containsMatchIn(body) || uvIndices != null
-        val nrmFaceVarying = Regex("""normals\b.*?(?:\(\s*interpolation\s*=\s*"faceVarying")""").containsMatchIn(body)
+        val defaultMatId = ctx.registerMaterial(effectiveMat)
+        var faceMatIds: IntArray? = null
+        if (geomSubsets.isNotEmpty() && numFaces > 0) {
+            val subBindRegex = Regex("""rel\s+material:binding(?::preview)?\s*=\s*<([^>]+)>""")
+            for (subBody in geomSubsets) {
+                val target = subBindRegex.find(subBody)?.groupValues?.get(1) ?: continue
+                val subMatInfo = materials[target] ?: materials[target.substringAfterLast('/')] ?: continue
+                val subIdxStr = extractUsdaArrayBlock(subBody, "indices") ?: continue
+                val subIdx = extractIntList(subIdxStr)
+                if (faceMatIds == null) faceMatIds = IntArray(numFaces) { defaultMatId }
+                val subMatId = ctx.registerMaterial(subMatInfo)
+                for (fi in subIdx) {
+                    if (fi in 0 until numFaces) faceMatIds[fi] = subMatId
+                }
+            }
+        }
+
+        val uvFaceVarying = Regex("""primvars:${Regex.escape(uvNameUsed)}\b[^=]*=\s*\[[^\]]*]\s*\([^)]*interpolation\s*=\s*"faceVarying"""", RegexOption.DOT_MATCHES_ALL)
+            .containsMatchIn(body) || uvIndices != null
+        val nrmFaceVarying = Regex("""normals\b[^=]*=\s*\[[^\]]*]\s*\([^)]*interpolation\s*=\s*"faceVarying"""", RegexOption.DOT_MATCHES_ALL)
+            .containsMatchIn(body)
+        val hasNonVertexColor = perVertexDisplayColors != null &&
+            (perVertexDisplayIndices != null || perVertexDisplayInterp == "faceVarying" || perVertexDisplayInterp == "uniform")
 
         emitUsdMeshToContext(
             points = points,
@@ -1694,8 +2060,14 @@ object UsdMeshConverter {
             uvArray = uvArray,
             uvIndices = uvIndices,
             uvInterp = if (uvFaceVarying) "faceVarying" else "vertex",
+            colorArray = perVertexDisplayColors,
+            colorIndices = perVertexDisplayIndices,
+            colorInterp = perVertexDisplayInterp,
+            opacityArray = doArray,
+            defaultMatId = defaultMatId,
+            faceMatIds = faceMatIds,
             worldMat = worldMat,
-            canUseSharedVerts = !uvFaceVarying && !nrmFaceVarying,
+            canUseSharedVerts = !uvFaceVarying && !nrmFaceVarying && !hasNonVertexColor,
             ctx = ctx
         )
     }
@@ -1781,6 +2153,12 @@ object UsdMeshConverter {
         uvArray: FloatArray?,
         uvIndices: IntArray?,
         uvInterp: String,
+        colorArray: FloatArray?,
+        colorIndices: IntArray?,
+        colorInterp: String,
+        opacityArray: FloatArray?,
+        defaultMatId: Int,
+        faceMatIds: IntArray?,
         worldMat: DoubleArray,
         canUseSharedVerts: Boolean,
         ctx: UsdAccumContext
@@ -1788,8 +2166,10 @@ object UsdMeshConverter {
         val rawVertCount = points.size / 3
         val hasNorm = nrmArray != null && nrmArray.size >= 3
         val hasUv = uvArray != null && uvArray.size >= 2
+        val hasCol = colorArray != null && colorArray.size >= 3
+        val colorStore = if (hasCol) ctx.ensureColorsFor(ctx.positions.count) else ctx.colors
 
-        fun putCornerVertex(vIdx: Int, fvCorner: Int): Long {
+        fun putCornerVertex(vIdx: Int, fvCorner: Int, faceIdx: Int): Long {
             val base = vIdx * 3
             val px = points[base]; val py = points[base + 1]; val pz = points[base + 2]
             val wx = (worldMat[0] * px + worldMat[4] * py + worldMat[8] * pz + worldMat[12]).toFloat()
@@ -1817,7 +2197,6 @@ object UsdMeshConverter {
                 val uiRaw = if (uvIndices != null && fvCorner in uvIndices.indices) uvIndices[fvCorner]
                 else if (uvInterp == "faceVarying") fvCorner else vIdx
                 if (uiRaw * 2 + 1 < uvArray.size && uiRaw >= 0) {
-                    // OpenUSD UV (0,0)=bottom-left vs glTF (0,0)=top-left
                     ctx.uvs.add2(uvArray[uiRaw * 2], 1f - uvArray[uiRaw * 2 + 1])
                 } else {
                     ctx.uvs.add2(0f, 0f)
@@ -1825,16 +2204,42 @@ object UsdMeshConverter {
             } else {
                 ctx.uvs.add2(0f, 0f)
             }
+
+            if (colorStore != null) {
+                if (hasCol) {
+                    val ciRaw = when {
+                        colorIndices != null && fvCorner in colorIndices.indices -> colorIndices[fvCorner]
+                        colorInterp == "faceVarying" -> fvCorner
+                        colorInterp == "uniform" -> faceIdx
+                        colorInterp == "constant" -> 0
+                        else -> vIdx
+                    }
+                    val ci3 = if (ciRaw >= 0 && ciRaw * 3 + 2 < colorArray!!.size) ciRaw * 3 else 0
+                    val a = if (opacityArray != null && opacityArray.isNotEmpty()) {
+                        opacityArray.getOrElse(ciRaw.coerceAtLeast(0)) { opacityArray[0] }.coerceIn(0f, 1f)
+                    } else 1f
+                    colorStore.add4(
+                        colorArray!![ci3].coerceIn(0f, 1f),
+                        colorArray[ci3 + 1].coerceIn(0f, 1f),
+                        colorArray[ci3 + 2].coerceIn(0f, 1f),
+                        a
+                    )
+                } else {
+                    colorStore.add4(1f, 1f, 1f, 1f)
+                }
+            }
             return outIdx
         }
 
         if (canUseSharedVerts && faceCounts != null) {
             val baseVertexOffset = ctx.positions.count
-            for (v in 0 until rawVertCount) putCornerVertex(v, v)
+            for (v in 0 until rawVertCount) putCornerVertex(v, v, 0)
 
             var cursor = 0
-            for (cnt in faceCounts) {
+            for (fIdx in faceCounts.indices) {
+                val cnt = faceCounts[fIdx]
                 if (cursor + cnt > faceIndices.size) break
+                val fMatId = if (faceMatIds != null && fIdx < faceMatIds.size) faceMatIds[fIdx] else defaultMatId
                 if (cnt >= 3) {
                     val i0 = faceIndices[cursor]
                     if (i0 in 0 until rawVertCount) {
@@ -1845,7 +2250,7 @@ object UsdMeshConverter {
                                 val a = baseVertexOffset + i0.toLong()
                                 val b = baseVertexOffset + (if (isLeftHanded) i2 else i1).toLong()
                                 val c = baseVertexOffset + (if (isLeftHanded) i1 else i2).toLong()
-                                ctx.emitTriangle(a, b, c)
+                                ctx.emitTriangle(a, b, c, fMatId)
                             }
                         }
                     }
@@ -1855,20 +2260,22 @@ object UsdMeshConverter {
         } else {
             val counts = faceCounts ?: IntArray(faceIndices.size / 3) { 3 }
             var cursor = 0
-            for (cnt in counts) {
+            for (fIdx in counts.indices) {
+                val cnt = counts[fIdx]
                 if (cursor + cnt > faceIndices.size) break
+                val fMatId = if (faceMatIds != null && fIdx < faceMatIds.size) faceMatIds[fIdx] else defaultMatId
                 if (cnt >= 3) {
                     val r0 = faceIndices[cursor]
                     if (r0 in 0 until rawVertCount) {
-                        val c0 = putCornerVertex(r0, cursor)
+                        val c0 = putCornerVertex(r0, cursor, fIdx)
                         for (k in 1 until cnt - 1) {
                             val r1 = faceIndices[cursor + k]
                             val r2 = faceIndices[cursor + k + 1]
                             if (r1 in 0 until rawVertCount && r2 in 0 until rawVertCount) {
-                                val c1 = putCornerVertex(r1, cursor + k)
-                                val c2 = putCornerVertex(r2, cursor + k + 1)
-                                if (isLeftHanded) ctx.emitTriangle(c0, c2, c1)
-                                else ctx.emitTriangle(c0, c1, c2)
+                                val c1 = putCornerVertex(r1, cursor + k, fIdx)
+                                val c2 = putCornerVertex(r2, cursor + k + 1, fIdx)
+                                if (isLeftHanded) ctx.emitTriangle(c0, c2, c1, fMatId)
+                                else ctx.emitTriangle(c0, c1, c2, fMatId)
                             }
                         }
                     }
@@ -1878,32 +2285,8 @@ object UsdMeshConverter {
         }
     }
 
-    // =========================================================================
-    // Texture Helper & Helpers
-    // =========================================================================
-
-    private fun prepareMobileTexture(scratchDir: File, rawTex: File): Pair<File, String>? {
-        if (!rawTex.exists() || rawTex.length() <= 0L) return null
-        return runCatching {
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(rawTex.absolutePath, opts)
-            val maxDim = max(opts.outWidth, opts.outHeight)
-            if (maxDim <= 1024 && (rawTex.extension.equals("png", true) || rawTex.extension.equals("jpg", true) || rawTex.extension.equals("jpeg", true))) {
-                val mime = if (rawTex.extension.equals("png", true)) "image/png" else "image/jpeg"
-                return@runCatching rawTex to mime
-            }
-            var sample = 1
-            while (maxDim / sample > 1536) sample *= 2
-            val dec = BitmapFactory.Options().apply { inSampleSize = sample }
-            val bmp = BitmapFactory.decodeFile(rawTex.absolutePath, dec) ?: return@runCatching null
-            val out = File(scratchDir, "usd_tex_${System.nanoTime()}.jpg")
-            FileOutputStream(out).use { fos -> bmp.compress(Bitmap.CompressFormat.JPEG, 88, fos) }
-            bmp.recycle()
-            out to "image/jpeg"
-        }.getOrNull()
-    }
-
     private class UsdAccumContext(
+        val scratchDir: File,
         val positions: StreamingMeshProcessor.MappedFloatTupleStore,
         val normals: StreamingMeshProcessor.MappedFloatTupleStore,
         val uvs: StreamingMeshProcessor.MappedFloatTupleStore,
@@ -1911,15 +2294,70 @@ object UsdMeshConverter {
         val triOut: BufferedOutputStream,
         val triBuf: ByteBuffer
     ) {
+        var colors: StreamingMeshProcessor.MappedFloatTupleStore? = null
         var totalTriangles: Long = 0L
-        var primaryDiffuseColor: FloatArray? = null
-        var primaryMetallic: Float = 0.1f
-        var primaryRoughness: Float = 0.7f
-        var primaryTextureFile: File? = null
+        val materials = mutableListOf<StreamingMeshProcessor.GlbMaterialSpec>()
+        private val matKeyToId = HashMap<String, Int>()
+        private val texPrepCache = HashMap<String, Pair<File, String>?>()
 
-        fun emitTriangle(a: Long, b: Long, c: Long) {
+        fun ensureColorsFor(prevVertCount: Long): StreamingMeshProcessor.MappedFloatTupleStore {
+            colors?.let { return it }
+            val store = StreamingMeshProcessor.MappedFloatTupleStore(4, scratchDir, "usd_col")
+            var i = 0L
+            while (i < prevVertCount) {
+                store.add4(1f, 1f, 1f, 1f)
+                i++
+            }
+            colors = store
+            return store
+        }
+
+        fun registerMaterial(info: UsdMaterialInfo?): Int {
+            val key = info?.key ?: "__default__"
+            matKeyToId[key]?.let { return it }
+            val id = materials.size
+            if (info == null) {
+                materials.add(
+                    StreamingMeshProcessor.GlbMaterialSpec(
+                        baseColorFactor = floatArrayOf(1f, 1f, 1f, 1f),
+                        metallicFactor = 0.1f,
+                        roughnessFactor = 0.7f,
+                        doubleSided = true
+                    )
+                )
+            } else {
+                val prep = info.textureFile?.let { raw ->
+                    texPrepCache.getOrPut(raw.absolutePath) {
+                        StreamingMeshProcessor.prepareMobileTextureFile(scratchDir, raw, maxEdge = 1536)
+                    }
+                }
+                val dc = info.diffuseColor
+                val baseColor = if (dc != null) {
+                    floatArrayOf(dc[0], dc[1], dc[2], info.opacity.coerceIn(0f, 1f))
+                } else {
+                    floatArrayOf(1f, 1f, 1f, info.opacity.coerceIn(0f, 1f))
+                }
+                materials.add(
+                    StreamingMeshProcessor.GlbMaterialSpec(
+                        baseColorFactor = baseColor,
+                        metallicFactor = info.metallic.coerceIn(0f, 1f),
+                        roughnessFactor = info.roughness.coerceIn(0.05f, 1f),
+                        emissiveFactor = info.emissiveColor,
+                        doubleSided = true,
+                        alphaMode = if (info.opacity < 0.99f) "BLEND" else "OPAQUE",
+                        unlit = false,
+                        textureFile = prep?.first,
+                        textureMime = prep?.second
+                    )
+                )
+            }
+            matKeyToId[key] = id
+            return id
+        }
+
+        fun emitTriangle(a: Long, b: Long, c: Long, matId: Int) {
             if (a == b || b == c || a == c) return
-            if (triBuf.remaining() < 24) {
+            if (triBuf.remaining() < 28) {
                 val p = triBuf.position()
                 if (p > 0) {
                     triOut.write(triBuf.array(), 0, p)
@@ -1929,15 +2367,20 @@ object UsdMeshConverter {
             triBuf.putLong(a)
             triBuf.putLong(b)
             triBuf.putLong(c)
+            triBuf.putInt(matId)
             totalTriangles++
         }
     }
 
     private data class UsdMaterialInfo(
+        val key: String,
         val diffuseColor: FloatArray?,
+        val emissiveColor: FloatArray?,
+        val opacity: Float,
         val metallic: Float,
         val roughness: Float,
-        val textureFile: File?
+        val textureFile: File?,
+        val texVarname: String? = null
     )
 
     private fun sanitizeZipEntryPath(name: String): String? {

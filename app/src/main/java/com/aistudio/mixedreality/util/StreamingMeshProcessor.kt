@@ -5,8 +5,8 @@ import android.graphics.BitmapFactory
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import org.xmlpull.v1.XmlPullParser
-import org.xmlpull.v1.XmlPullParserFactory
+import org.xml.sax.Attributes
+import org.xml.sax.helpers.DefaultHandler
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -14,8 +14,10 @@ import java.io.EOFException
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FilterInputStream
 import java.io.InputStream
 import java.io.RandomAccessFile
+import javax.xml.parsers.SAXParserFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
@@ -69,6 +71,63 @@ object StreamingMeshProcessor {
     ) {
         val isHeavyForMobile: Boolean
             get() = triangleCount > 250_000L || vertexCount > 250_000L || binByteLength > 2_000_000L
+    }
+
+    data class GlbMaterialSpec(
+        val baseColorFactor: FloatArray = floatArrayOf(1f, 1f, 1f, 1f),
+        val metallicFactor: Float = 0.1f,
+        val roughnessFactor: Float = 0.7f,
+        val emissiveFactor: FloatArray? = null,
+        val doubleSided: Boolean = true,
+        val alphaMode: String = "OPAQUE",
+        val unlit: Boolean = false,
+        val textureFile: File? = null,
+        val textureMime: String? = null
+    )
+
+    internal fun srgbToLinear(c: Float): Float {
+        val v = c.coerceIn(0f, 1f)
+        return if (v <= 0.04045f) v / 12.92f else Math.pow(((v + 0.055f) / 1.055f).toDouble(), 2.4).toFloat()
+    }
+
+    internal fun linearToUByte(v: Float): Byte =
+        (v.coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255).toByte()
+
+    internal fun prepareMobileTextureFile(scratchDir: File, rawTex: File, maxEdge: Int = 1536): Pair<File, String>? {
+        if (!rawTex.exists() || rawTex.length() <= 0L) return null
+        val ext = rawTex.extension.lowercase(Locale.US)
+        val rawMime = when (ext) {
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            else -> "image/jpeg"
+        }
+        return runCatching {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(rawTex.absolutePath, opts)
+            val maxDim = max(opts.outWidth, opts.outHeight)
+            if (maxDim <= 0) {
+                return@runCatching if (ext in setOf("png", "jpg", "jpeg")) rawTex to rawMime else null
+            }
+            if (maxDim <= maxEdge && (ext == "png" || ext == "jpg" || ext == "jpeg")) {
+                return@runCatching rawTex to rawMime
+            }
+            var sample = 1
+            while (maxDim / sample > maxEdge) sample *= 2
+            val dec = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = BitmapFactory.decodeFile(rawTex.absolutePath, dec)
+                ?: return@runCatching if (ext in setOf("png", "jpg", "jpeg")) rawTex to rawMime else null
+            val hasAlpha = bmp.hasAlpha()
+            val outExt = if (hasAlpha) "png" else "jpg"
+            val outMime = if (hasAlpha) "image/png" else "image/jpeg"
+            val outFmt = if (hasAlpha) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val out = File(scratchDir, "mob_tex_${System.nanoTime()}.$outExt")
+            FileOutputStream(out).use { fos -> bmp.compress(outFmt, 88, fos) }
+            bmp.recycle()
+            out to outMime
+        }.getOrElse {
+            if (ext in setOf("png", "jpg", "jpeg")) rawTex to rawMime else null
+        }
     }
 
     internal class MeshBounds(
@@ -182,6 +241,31 @@ object StreamingMeshProcessor {
             count++
         }
 
+        fun add4(r: Float, g: Float, b: Float, a: Float) {
+            if (!spilledToDisk) {
+                val idx = count.toInt()
+                if (idx < ramCapacityEntries) {
+                    val arr = ensureRamCapacity(idx + 1)
+                    val base = idx * 4
+                    arr[base] = r
+                    arr[base + 1] = g
+                    arr[base + 2] = b
+                    arr[base + 3] = a
+                    count++
+                    return
+                }
+                spillRamToDisk()
+            }
+            val bos = writeStream!!
+            val bb = writeBuf!!
+            if (bb.remaining() < 16) flushWriteBuffer(bos, bb)
+            bb.putFloat(r)
+            bb.putFloat(g)
+            bb.putFloat(b)
+            bb.putFloat(a)
+            count++
+        }
+
         fun sealForRead() {
             if (sealed) return
             sealed = true
@@ -205,6 +289,10 @@ object StreamingMeshProcessor {
         fun getZ(idx: Long): Float = readComponent(idx, 2)
         fun getU(idx: Long): Float = readComponent(idx, 0)
         fun getV(idx: Long): Float = readComponent(idx, 1)
+        fun getR(idx: Long): Float = readComponent(idx, 0)
+        fun getG(idx: Long): Float = readComponent(idx, 1)
+        fun getB(idx: Long): Float = readComponent(idx, 2)
+        fun getA(idx: Long): Float = readComponent(idx, 3)
 
         fun getX(idx: Int): Float = readComponent(idx.toLong(), 0)
         fun getY(idx: Int): Float = readComponent(idx.toLong(), 1)
@@ -348,13 +436,15 @@ object StreamingMeshProcessor {
     /**
      * Streaming spatial vertex clustering engine that converts arbitrarily large triangle streams
      * (30M, 100M, infinity polygons/vertices) into a crisp, watertight-oriented GLB mesh well within
-     * mobile GPU/VRAM budgets while growing arrays lazily instead of reserving 66 MB up front.
+     * mobile GPU/VRAM budgets while preserving material seams, COLOR_0 vertex colors, and textures.
      */
     private class SpatialClusterAccumulator(
         private val bounds: MeshBounds,
         private val gridResolution: Int,
         private val maxClusters: Int = CLUSTER_MAX_VERTICES,
-        private val forceNoOverflowFallback: Boolean = false
+        private val forceNoOverflowFallback: Boolean = false,
+        private val hasColors: Boolean = false,
+        private val hasMultiMaterial: Boolean = false
     ) {
         private val tableMask = CLUSTER_HASH_TABLE_SIZE - 1
         private var hashKeys = LongArray(CLUSTER_HASH_TABLE_SIZE) { -1L }
@@ -369,6 +459,10 @@ object StreamingMeshProcessor {
         private var normZ = FloatArray(capacity)
         private var sumU = FloatArray(capacity)
         private var sumV = FloatArray(capacity)
+        private var sumR = if (hasColors) FloatArray(capacity) else null
+        private var sumG = if (hasColors) FloatArray(capacity) else null
+        private var sumB = if (hasColors) FloatArray(capacity) else null
+        private var sumA = if (hasColors) FloatArray(capacity) else null
         private var counts = IntArray(capacity)
 
         var clusterCount = 0
@@ -405,6 +499,10 @@ object StreamingMeshProcessor {
             normZ = normZ.copyOf(nextCap)
             sumU = sumU.copyOf(nextCap)
             sumV = sumV.copyOf(nextCap)
+            sumR = sumR?.copyOf(nextCap)
+            sumG = sumG?.copyOf(nextCap)
+            sumB = sumB?.copyOf(nextCap)
+            sumA = sumA?.copyOf(nextCap)
             counts = counts.copyOf(nextCap)
             capacity = nextCap
         }
@@ -412,25 +510,26 @@ object StreamingMeshProcessor {
         fun getOrAssignCluster(
             px: Float, py: Float, pz: Float,
             nx: Float, ny: Float, nz: Float,
-            u: Float, v: Float
+            u: Float, v: Float,
+            r: Float = 1f, g: Float = 1f, b: Float = 1f, a: Float = 1f,
+            matId: Int = 0
         ): Int {
-            val gx = ((px - bounds.minX) * invCellSize).toInt().coerceIn(0, 1_048_575).toLong()
-            val gy = ((py - bounds.minY) * invCellSize).toInt().coerceIn(0, 1_048_575).toLong()
-            val gz = ((pz - bounds.minZ) * invCellSize).toInt().coerceIn(0, 1_048_575).toLong()
-            val key = (gx shl 40) or (gy shl 20) or gz
+            val gx = ((px - bounds.minX) * invCellSize).toInt().coerceIn(0, 1023).toLong()
+            val gy = ((py - bounds.minY) * invCellSize).toInt().coerceIn(0, 1023).toLong()
+            val gz = ((pz - bounds.minZ) * invCellSize).toInt().coerceIn(0, 1023).toLong()
+            val key = ((matId.toLong() and 0xFFFFL) shl 32) or (gx shl 20) or (gy shl 10) or gz
 
             var slot = mix64(key) and tableMask
             while (true) {
                 val existing = hashKeys[slot]
                 if (existing == key) {
                     val cId = hashVals[slot]
-                    accumulate(cId, px, py, pz, nx, ny, nz, u, v)
+                    accumulate(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
                     return cId
                 }
                 if (existing == -1L) {
                     if (clusterCount >= maxClusters) {
                         if (forceNoOverflowFallback) {
-                            // Quantize key down safely into an existing bucket rather than discarding geometry
                             val foldedId = (mix64(key) and 0x7FFF_FFFF) % maxClusters
                             return foldedId
                         }
@@ -441,7 +540,7 @@ object StreamingMeshProcessor {
                     if (cId >= capacity) growArrays(cId + 1)
                     hashKeys[slot] = key
                     hashVals[slot] = cId
-                    accumulate(cId, px, py, pz, nx, ny, nz, u, v)
+                    accumulate(cId, px, py, pz, nx, ny, nz, u, v, r, g, b, a)
                     return cId
                 }
                 slot = (slot + 1) and tableMask
@@ -452,7 +551,8 @@ object StreamingMeshProcessor {
             cId: Int,
             px: Float, py: Float, pz: Float,
             nx: Float, ny: Float, nz: Float,
-            u: Float, v: Float
+            u: Float, v: Float,
+            r: Float, g: Float, b: Float, a: Float
         ) {
             sumX[cId] += px
             sumY[cId] += py
@@ -462,20 +562,28 @@ object StreamingMeshProcessor {
             normZ[cId] += nz
             sumU[cId] += u
             sumV[cId] += v
+            if (hasColors) {
+                sumR!![cId] += r
+                sumG!![cId] += g
+                sumB!![cId] += b
+                sumA!![cId] += a
+            }
             counts[cId]++
         }
 
-        fun addTriangle(c0: Int, c1: Int, c2: Int) {
+        fun addTriangle(c0: Int, c1: Int, c2: Int, matId: Int = 0) {
             if (c0 < 0 || c1 < 0 || c2 < 0) return
             if (c0 == c1 || c1 == c2 || c2 == c0) return
             val out = triFos ?: return
-            if (triChunk.remaining() < 12) {
+            val recBytes = if (hasMultiMaterial) 16 else 12
+            if (triChunk.remaining() < recBytes) {
                 out.write(triChunk.array(), 0, triChunk.position())
                 triChunk.clear()
             }
             triChunk.putInt(c0)
             triChunk.putInt(c1)
             triChunk.putInt(c2)
+            if (hasMultiMaterial) triChunk.putInt(matId)
             emittedTriangles++
         }
 
@@ -485,7 +593,8 @@ object StreamingMeshProcessor {
             metallicFactor: Float = 0.1f,
             roughnessFactor: Float = 0.7f,
             textureFile: File? = null,
-            textureMime: String? = null
+            textureMime: String? = null,
+            materials: List<GlbMaterialSpec>? = null
         ): MeshBounds {
             triFos?.let { out ->
                 if (triChunk.position() > 0) {
@@ -498,6 +607,7 @@ object StreamingMeshProcessor {
             triFos = null
 
             val finalBounds = MeshBounds()
+            val sr = sumR; val sg = sumG; val sb = sumB; val sa = sumA
 
             for (i in 0 until clusterCount) {
                 val inv = 1f / counts[i].coerceAtLeast(1).toFloat()
@@ -521,6 +631,12 @@ object StreamingMeshProcessor {
 
                 sumU[i] *= inv
                 sumV[i] *= inv
+                if (hasColors && sr != null && sg != null && sb != null && sa != null) {
+                    sr[i] *= inv
+                    sg[i] *= inv
+                    sb[i] *= inv
+                    sa[i] *= inv
+                }
             }
             finalBounds.normalizeIfEmpty()
 
@@ -528,88 +644,71 @@ object StreamingMeshProcessor {
             hashVals = IntArray(0)
             counts = IntArray(0)
 
-            val texBytes = if (textureFile != null && textureFile.exists() && textureFile.length() in 1L..24_000_000L) {
-                runCatching { textureFile.readBytes() }.getOrNull()
-            } else null
+            val resolvedMats = resolveMaterialList(materials, baseColorFactor, metallicFactor, roughnessFactor, textureFile, textureMime, hasColors)
+            val tFile = triFile
+            val useIntIndices = clusterCount > 65535 || (emittedTriangles * 3) > 65535
 
-            val indexCount = emittedTriangles * 3
-            val useIntIndices = clusterCount > 65535 || indexCount > 65535
             val posBytes = clusterCount.toLong() * 3L * 4L
             val normBytes = clusterCount.toLong() * 3L * 4L
             val uvBytes = clusterCount.toLong() * 2L * 4L
-            val idxBytes = if (useIntIndices) indexCount.toLong() * 4L else indexCount.toLong() * 2L
-            val rawGeoBytes = posBytes + normBytes + uvBytes + idxBytes
-            val texPrePad = if (texBytes != null) ((4L - (rawGeoBytes % 4L)) % 4L).toInt() else 0
-            val totalBinBytes = rawGeoBytes + texPrePad + (texBytes?.size?.toLong() ?: 0L)
-            val binPadding = ((4L - (totalBinBytes % 4L)) % 4L).toInt()
-            val paddedBinBytes = totalBinBytes + binPadding
+            val colorBytes = if (hasColors) clusterCount.toLong() * 4L else 0L
+            val vertDataBytes = posBytes + normBytes + uvBytes + colorBytes
 
-            val jsonBytes = buildStandardGlbJson(
+            val scratchDir = tFile?.parentFile ?: outGlb.parentFile ?: File(".")
+            val plan = planGroupedGlbLayout(
                 vertCount = clusterCount,
-                indexCount = indexCount,
+                vertDataBytes = vertDataBytes,
+                hasColors = hasColors,
                 useIntIndices = useIntIndices,
+                triFile = tFile,
+                hasMatInTri = hasMultiMaterial,
+                totalTriangles = emittedTriangles,
+                materials = resolvedMats
+            )
+
+            val jsonBytes = buildMultiMaterialGlbJson(
+                vertCount = clusterCount,
                 posByteLength = posBytes,
                 normByteLength = normBytes,
                 uvByteLength = uvBytes,
-                indexByteLength = idxBytes,
-                totalBinaryLength = totalBinBytes,
+                colorByteLength = colorBytes,
+                useIntIndices = useIntIndices,
                 bounds = finalBounds,
                 generator = "MixedReality Streaming Cluster Engine",
-                baseColorFactor = baseColorFactor,
-                metallicFactor = metallicFactor,
-                roughnessFactor = roughnessFactor,
-                textureOffset = rawGeoBytes + texPrePad,
-                textureByteLength = texBytes?.size ?: 0,
-                textureMimeType = textureMime
+                plan = plan
             )
             val jsonPadding = (4 - (jsonBytes.size % 4)) % 4
             val paddedJsonLen = jsonBytes.size + jsonPadding
-            val totalGlbLen = (12L + 8L + paddedJsonLen + 8L + paddedBinBytes).toInt()
+            val totalGlbLen = (12L + 8L + paddedJsonLen + 8L + plan.paddedBinBytes).toInt()
 
             outGlb.parentFile?.mkdirs()
             val writeBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
             BufferedOutputStream(FileOutputStream(outGlb), IO_BUFFER_BYTES).use { bos ->
-                writeGlbHeaders(bos, writeBuf, totalGlbLen, jsonBytes, paddedJsonLen, jsonPadding, paddedBinBytes.toInt())
+                writeGlbHeaders(bos, writeBuf, totalGlbLen, jsonBytes, paddedJsonLen, jsonPadding, plan.paddedBinBytes.toInt())
 
-                for (i in 0 until clusterCount) {
-                    putFloat3Checked(bos, writeBuf, sumX[i], sumY[i], sumZ[i])
-                }
-                for (i in 0 until clusterCount) {
-                    putFloat3Checked(bos, writeBuf, normX[i], normY[i], normZ[i])
-                }
-                for (i in 0 until clusterCount) {
-                    putFloat2Checked(bos, writeBuf, sumU[i], sumV[i])
-                }
-
-                val tFile = triFile
-                if (tFile != null && tFile.exists() && emittedTriangles > 0) {
-                    val readChunk = ByteArray(65_536 * 3)
-                    val readBB = ByteBuffer.wrap(readChunk).order(ByteOrder.LITTLE_ENDIAN)
-                    BufferedInputStream(FileInputStream(tFile), IO_BUFFER_BYTES).use { bis ->
-                        while (true) {
-                            val read = bis.read(readChunk)
-                            if (read <= 0) break
-                            var off = 0
-                            while (off + 4 <= read) {
-                                val idx = readBB.getInt(off)
-                                if (useIntIndices) {
-                                    if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
-                                    writeBuf.putInt(idx)
-                                } else {
-                                    if (writeBuf.remaining() < 2) flushWriteBuf(bos, writeBuf)
-                                    writeBuf.putShort(idx.toShort())
-                                }
-                                off += 4
-                            }
-                        }
+                for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, sumX[i], sumY[i], sumZ[i])
+                for (i in 0 until clusterCount) putFloat3Checked(bos, writeBuf, normX[i], normY[i], normZ[i])
+                for (i in 0 until clusterCount) putFloat2Checked(bos, writeBuf, sumU[i], sumV[i])
+                if (hasColors && sr != null && sg != null && sb != null && sa != null) {
+                    for (i in 0 until clusterCount) {
+                        if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
+                        writeBuf.put(linearToUByte(sr[i]))
+                        writeBuf.put(linearToUByte(sg[i]))
+                        writeBuf.put(linearToUByte(sb[i]))
+                        writeBuf.put(linearToUByte(sa[i]))
                     }
                 }
                 flushWriteBuf(bos, writeBuf)
-                if (texBytes != null) {
-                    for (p in 0 until texPrePad) bos.write(0)
-                    bos.write(texBytes)
-                }
-                for (p in 0 until binPadding) bos.write(0)
+
+                writeGroupedIndicesAndTextures(
+                    bos = bos,
+                    writeBuf = writeBuf,
+                    triFile = tFile,
+                    hasMatInTri = hasMultiMaterial,
+                    useIntIndices = useIntIndices,
+                    scratchDir = scratchDir,
+                    plan = plan
+                )
             }
             cleanup()
             return finalBounds
@@ -633,25 +732,30 @@ object StreamingMeshProcessor {
 
     /**
      * Lossless disk-backed stream writer for <= DIRECT_TRIANGLE_LIMIT meshes (< ~1.8M triangles).
-     * Never allocates huge FloatArray/IntArray slabs in Java heap.
+     * Supports optional RGBA8 vertex colors (COLOR_0) and multi-material/multi-texture primitives.
      */
     private class DirectStreamingGlbWriter(
-        private val scratchDir: File
+        private val scratchDir: File,
+        private val hasColors: Boolean = false,
+        private val hasMultiMaterial: Boolean = false
     ) : AutoCloseable {
         private val id = System.nanoTime()
         private val posFile = File(scratchDir, "dpos_$id.bin")
         private val normFile = File(scratchDir, "dnorm_$id.bin")
         private val uvFile = File(scratchDir, "duv_$id.bin")
+        private val colFile = if (hasColors) File(scratchDir, "dcol_$id.bin") else null
         private val idxFile = File(scratchDir, "didx_$id.bin")
 
         private val posOut = BufferedOutputStream(FileOutputStream(posFile), IO_BUFFER_BYTES)
         private val normOut = BufferedOutputStream(FileOutputStream(normFile), IO_BUFFER_BYTES)
         private val uvOut = BufferedOutputStream(FileOutputStream(uvFile), IO_BUFFER_BYTES)
+        private val colOut = colFile?.let { BufferedOutputStream(FileOutputStream(it), IO_BUFFER_BYTES) }
         private val idxOut = BufferedOutputStream(FileOutputStream(idxFile), IO_BUFFER_BYTES)
 
         private val posBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         private val normBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         private val uvBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        private val colBuf = if (hasColors) ByteBuffer.allocate(GLB_CHUNK_BYTES) else null
         private val idxBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
 
         var vertexCount = 0
@@ -663,23 +767,35 @@ object StreamingMeshProcessor {
         fun emitVertex(
             px: Float, py: Float, pz: Float,
             nx: Float, ny: Float, nz: Float,
-            u: Float, v: Float
+            u: Float, v: Float,
+            r: Float = 1f, g: Float = 1f, b: Float = 1f, a: Float = 1f
         ): Int {
             val vIdx = vertexCount++
             bounds.expand(px, py, pz)
             putFloat3Checked(posOut, posBuf, px, py, pz)
             putFloat3Checked(normOut, normBuf, nx, ny, nz)
             putFloat2Checked(uvOut, uvBuf, u, v)
+            val co = colOut
+            val cb = colBuf
+            if (hasColors && co != null && cb != null) {
+                if (cb.remaining() < 4) flushWriteBuf(co, cb)
+                cb.put(linearToUByte(r))
+                cb.put(linearToUByte(g))
+                cb.put(linearToUByte(b))
+                cb.put(linearToUByte(a))
+            }
             return vIdx
         }
 
-        fun emitTriangle(i0: Int, i1: Int, i2: Int) {
-            if (idxBuf.remaining() < 12) {
+        fun emitTriangle(i0: Int, i1: Int, i2: Int, matId: Int = 0) {
+            val recBytes = if (hasMultiMaterial) 16 else 12
+            if (idxBuf.remaining() < recBytes) {
                 flushWriteBuf(idxOut, idxBuf)
             }
             idxBuf.putInt(i0)
             idxBuf.putInt(i1)
             idxBuf.putInt(i2)
+            if (hasMultiMaterial) idxBuf.putInt(matId)
             indexCount += 3
         }
 
@@ -690,84 +806,74 @@ object StreamingMeshProcessor {
             metallicFactor: Float = 0.1f,
             roughnessFactor: Float = 0.7f,
             textureFile: File? = null,
-            textureMime: String? = null
+            textureMime: String? = null,
+            materials: List<GlbMaterialSpec>? = null
         ) {
             flushWriteBuf(posOut, posBuf); posOut.close()
             flushWriteBuf(normOut, normBuf); normOut.close()
             flushWriteBuf(uvOut, uvBuf); uvOut.close()
+            if (colOut != null && colBuf != null) {
+                flushWriteBuf(colOut, colBuf); colOut.close()
+            }
             flushWriteBuf(idxOut, idxBuf); idxOut.close()
             bounds.normalizeIfEmpty()
 
-            val texBytes = if (textureFile != null && textureFile.exists() && textureFile.length() in 1L..24_000_000L) {
-                runCatching { textureFile.readBytes() }.getOrNull()
-            } else null
-
+            val resolvedMats = resolveMaterialList(materials, baseColorFactor, metallicFactor, roughnessFactor, textureFile, textureMime, hasColors)
             val useIntIndices = vertexCount > 65535 || indexCount > 65535
             val posBytes = vertexCount.toLong() * 3L * 4L
             val normBytes = vertexCount.toLong() * 3L * 4L
             val uvBytes = vertexCount.toLong() * 2L * 4L
-            val idxBytes = if (useIntIndices) indexCount.toLong() * 4L else indexCount.toLong() * 2L
-            val rawGeoBytes = posBytes + normBytes + uvBytes + idxBytes
-            val texPrePad = if (texBytes != null) ((4L - (rawGeoBytes % 4L)) % 4L).toInt() else 0
-            val totalBinBytes = rawGeoBytes + texPrePad + (texBytes?.size?.toLong() ?: 0L)
-            val binPadding = ((4L - (totalBinBytes % 4L)) % 4L).toInt()
-            val paddedBinBytes = totalBinBytes + binPadding
+            val colorBytes = if (hasColors) vertexCount.toLong() * 4L else 0L
+            val vertDataBytes = posBytes + normBytes + uvBytes + colorBytes
 
-            val jsonBytes = buildStandardGlbJson(
+            val plan = planGroupedGlbLayout(
                 vertCount = vertexCount,
-                indexCount = indexCount,
+                vertDataBytes = vertDataBytes,
+                hasColors = hasColors,
                 useIntIndices = useIntIndices,
+                triFile = idxFile,
+                hasMatInTri = hasMultiMaterial,
+                totalTriangles = indexCount / 3,
+                materials = resolvedMats
+            )
+
+            val jsonBytes = buildMultiMaterialGlbJson(
+                vertCount = vertexCount,
                 posByteLength = posBytes,
                 normByteLength = normBytes,
                 uvByteLength = uvBytes,
-                indexByteLength = idxBytes,
-                totalBinaryLength = totalBinBytes,
+                colorByteLength = colorBytes,
+                useIntIndices = useIntIndices,
                 bounds = bounds,
                 generator = generator,
-                baseColorFactor = baseColorFactor,
-                metallicFactor = metallicFactor,
-                roughnessFactor = roughnessFactor,
-                textureOffset = rawGeoBytes + texPrePad,
-                textureByteLength = texBytes?.size ?: 0,
-                textureMimeType = textureMime
+                plan = plan
             )
             val jsonPadding = (4 - (jsonBytes.size % 4)) % 4
             val paddedJsonLen = jsonBytes.size + jsonPadding
-            val totalGlbLen = (12L + 8L + paddedJsonLen + 8L + paddedBinBytes).toInt()
+            val totalGlbLen = (12L + 8L + paddedJsonLen + 8L + plan.paddedBinBytes).toInt()
 
             outGlb.parentFile?.mkdirs()
             val writeBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
             val copyChunk = ByteArray(IO_BUFFER_BYTES)
 
             BufferedOutputStream(FileOutputStream(outGlb), IO_BUFFER_BYTES).use { bos ->
-                writeGlbHeaders(bos, writeBuf, totalGlbLen, jsonBytes, paddedJsonLen, jsonPadding, paddedBinBytes.toInt())
+                writeGlbHeaders(bos, writeBuf, totalGlbLen, jsonBytes, paddedJsonLen, jsonPadding, plan.paddedBinBytes.toInt())
                 appendFileRaw(posFile, bos, copyChunk)
                 appendFileRaw(normFile, bos, copyChunk)
                 appendFileRaw(uvFile, bos, copyChunk)
+                if (hasColors && colFile != null && colFile.exists()) {
+                    appendFileRaw(colFile, bos, copyChunk)
+                }
 
-                if (useIntIndices) {
-                    appendFileRaw(idxFile, bos, copyChunk)
-                } else {
-                    val readBB = ByteBuffer.wrap(copyChunk).order(ByteOrder.LITTLE_ENDIAN)
-                    BufferedInputStream(FileInputStream(idxFile), IO_BUFFER_BYTES).use { bis ->
-                        while (true) {
-                            val read = bis.read(copyChunk)
-                            if (read <= 0) break
-                            var off = 0
-                            while (off + 4 <= read) {
-                                if (writeBuf.remaining() < 2) flushWriteBuf(bos, writeBuf)
-                                writeBuf.putShort(readBB.getInt(off).toShort())
-                                off += 4
-                            }
-                        }
-                    }
-                    flushWriteBuf(bos, writeBuf)
-                }
-                if (texBytes != null) {
-                    for (p in 0 until texPrePad) bos.write(0)
-                    bos.write(texBytes)
-                }
-                for (p in 0 until binPadding) bos.write(0)
+                writeGroupedIndicesAndTextures(
+                    bos = bos,
+                    writeBuf = writeBuf,
+                    triFile = idxFile,
+                    hasMatInTri = hasMultiMaterial,
+                    useIntIndices = useIntIndices,
+                    scratchDir = scratchDir,
+                    plan = plan
+                )
             }
         }
 
@@ -785,10 +891,12 @@ object StreamingMeshProcessor {
             runCatching { posOut.close() }
             runCatching { normOut.close() }
             runCatching { uvOut.close() }
+            runCatching { colOut?.close() }
             runCatching { idxOut.close() }
             runCatching { posFile.delete() }
             runCatching { normFile.delete() }
             runCatching { uvFile.delete() }
+            runCatching { colFile?.delete() }
             runCatching { idxFile.delete() }
         }
     }
@@ -1060,6 +1168,7 @@ object StreamingMeshProcessor {
             val positions = MappedFloatTupleStore(3, scratchDir, "ply_pos")
             val normals = if (headerInfo.hasNormals) MappedFloatTupleStore(3, scratchDir, "ply_nrm") else null
             val uvs = if (headerInfo.hasUvs) MappedFloatTupleStore(2, scratchDir, "ply_uv") else null
+            val colors = if (headerInfo.hasColors) MappedFloatTupleStore(4, scratchDir, "ply_col") else null
 
             try {
                 val bounds = MeshBounds()
@@ -1069,10 +1178,25 @@ object StreamingMeshProcessor {
                     positions = positions,
                     normals = normals,
                     uvs = uvs,
+                    colors = colors,
                     bounds = bounds,
                     scratchDir = scratchDir
                 )
                 bounds.normalizeIfEmpty()
+
+                var texFile: File? = null
+                var texMime: String? = null
+                for (texName in headerInfo.textureFiles) {
+                    val found = findCompanionAssetFile(plyFile.parentFile, texName)
+                    if (found != null) {
+                        val prepared = prepareMobileTextureFile(scratchDir, found, maxEdge = 1536)
+                        if (prepared != null) {
+                            texFile = prepared.first
+                            texMime = prepared.second
+                            break
+                        }
+                    }
+                }
 
                 val totalVerts = positions.count
                 val totalTris = rawTris.count
@@ -1082,6 +1206,7 @@ object StreamingMeshProcessor {
                     positions = positions,
                     normals = normals,
                     uvs = uvs,
+                    colors = colors,
                     triIndexFile = rawTris.file,
                     totalVerts = totalVerts,
                     totalTris = totalTris,
@@ -1089,7 +1214,9 @@ object StreamingMeshProcessor {
                     scratchDir = scratchDir,
                     outGlb = outGlb,
                     generator = "MixedReality Streaming PLY Engine",
-                    indexIsLong = rawTris.indexIsLong
+                    indexIsLong = rawTris.indexIsLong,
+                    textureFile = texFile,
+                    textureMime = texMime
                 )
                 rawTris.close()
 
@@ -1112,6 +1239,7 @@ object StreamingMeshProcessor {
                 positions.close()
                 normals?.close()
                 uvs?.close()
+                colors?.close()
             }
         } catch (t: Throwable) {
             Log.e(TAG, "PLY conversion failed: ${t.message}", t)
@@ -1137,11 +1265,14 @@ object StreamingMeshProcessor {
         val positions = MappedFloatTupleStore(3, scratchDir, "obj_pos")
         val normals = MappedFloatTupleStore(3, scratchDir, "obj_nrm")
         val uvs = MappedFloatTupleStore(2, scratchDir, "obj_uv")
+        var vertexColors: MappedFloatTupleStore? = null
         val triIndexFile = File(scratchDir, "obj_tris.bin")
 
         val bounds = MeshBounds()
         var triCount = 0L
         var parsedMtlNote: String? = null
+        val mtlLib = ObjMtlLibrary()
+        var currentMatId = -1
         var faceV = LongArray(16)
         var faceT = LongArray(16)
         var faceN = LongArray(16)
@@ -1172,8 +1303,45 @@ object StreamingMeshProcessor {
                             val zEnd = findWhitespace(line, cursor, len)
                             val z = if (zEnd > cursor) parseFastFloat(line, cursor, zEnd) else 0f
                             if (zEnd > cursor) {
+                                val prevVertCount = positions.count
                                 positions.add3(x, y, z)
                                 bounds.expand(x, y, z)
+
+                                // Check optional per-vertex RGB[A] colors: v x y z r g b [a]
+                                cursor = skipWhitespace(line, zEnd, len)
+                                if (cursor < len) {
+                                    val rEnd = findWhitespace(line, cursor, len)
+                                    val c1 = skipWhitespace(line, rEnd, len)
+                                    val gEnd = if (c1 < len) findWhitespace(line, c1, len) else c1
+                                    val c2 = skipWhitespace(line, gEnd, len)
+                                    val bEnd = if (c2 < len) findWhitespace(line, c2, len) else c2
+                                    if (rEnd > cursor && gEnd > c1 && bEnd > c2) {
+                                        var r = parseFastFloat(line, cursor, rEnd, -1f)
+                                        var g = parseFastFloat(line, c1, gEnd, -1f)
+                                        var b = parseFastFloat(line, c2, bEnd, -1f)
+                                        if (r >= 0f && g >= 0f && b >= 0f) {
+                                            val c3 = skipWhitespace(line, bEnd, len)
+                                            val aEnd = if (c3 < len) findWhitespace(line, c3, len) else c3
+                                            var a = if (aEnd > c3) parseFastFloat(line, c3, aEnd, 1f) else 1f
+                                            if (r > 1.01f || g > 1.01f || b > 1.01f || a > 1.01f) {
+                                                r /= 255f; g /= 255f; b /= 255f
+                                                if (a > 1.01f) a /= 255f
+                                            }
+                                            if (vertexColors == null) {
+                                                val store = MappedFloatTupleStore(4, scratchDir, "obj_col")
+                                                var pad = 0L
+                                                while (pad < prevVertCount) {
+                                                    store.add4(1f, 1f, 1f, 1f)
+                                                    pad++
+                                                }
+                                                vertexColors = store
+                                            }
+                                            vertexColors!!.add4(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b), a.coerceIn(0f, 1f))
+                                            continue
+                                        }
+                                    }
+                                }
+                                vertexColors?.add4(1f, 1f, 1f, 1f)
                             }
                         }
                         cmdLen == 2 && c0 == 'v' && line[cursor + 1] == 'n' -> {
@@ -1195,7 +1363,8 @@ object StreamingMeshProcessor {
                             cursor = skipWhitespace(line, uEnd, len)
                             val vEnd = findWhitespace(line, cursor, len)
                             val v = if (vEnd > cursor) parseFastFloat(line, cursor, vEnd) else 0f
-                            if (vEnd > cursor) uvs.add2(u, v)
+                            // Wavefront OBJ V=0 is bottom-left; glTF TEXCOORD_0 V=0 is top-left
+                            if (vEnd > cursor) uvs.add2(u, 1f - v)
                         }
                         cmdLen == 1 && c0 == 'f' -> {
                             val totalV = positions.count
@@ -1218,6 +1387,9 @@ object StreamingMeshProcessor {
                                 cursor = skipWhitespace(line, tokEnd, len)
                             }
                             if (faceCount >= 3) {
+                                val faceMatId = if (currentMatId >= 0) currentMatId else {
+                                    mtlLib.getOrReserveId("__default__").also { currentMatId = it }
+                                }
                                 val v0 = faceV[0] - 1L
                                 if (v0 !in 0L until totalV) continue
                                 val t0 = faceT[0] - 1L
@@ -1226,23 +1398,33 @@ object StreamingMeshProcessor {
                                     val v1 = faceV[i] - 1L
                                     val v2 = faceV[i + 1] - 1L
                                     if (v1 !in 0L until totalV || v2 !in 0L until totalV) continue
-                                    if (triBuf.remaining() < 72) flushWriteBuf(triOut, triBuf)
+                                    if (triBuf.remaining() < 76) flushWriteBuf(triOut, triBuf)
                                     triBuf.putLong(v0); triBuf.putLong(t0); triBuf.putLong(n0)
                                     triBuf.putLong(v1); triBuf.putLong(faceT[i] - 1L); triBuf.putLong(faceN[i] - 1L)
                                     triBuf.putLong(v2); triBuf.putLong(faceT[i + 1] - 1L); triBuf.putLong(faceN[i + 1] - 1L)
+                                    triBuf.putInt(faceMatId)
                                     triCount++
+                                }
+                            }
+                        }
+                        cmdLen == 6 && line.startsWith("usemtl", cursor) -> {
+                            cursor = skipWhitespace(line, cmdEnd, len)
+                            if (cursor < len) {
+                                val matName = line.substring(cursor, len).trim()
+                                if (matName.isNotEmpty()) {
+                                    currentMatId = mtlLib.getOrReserveId(matName)
                                 }
                             }
                         }
                         cmdLen == 6 && line.startsWith("mtllib", cursor) -> {
                             cursor = skipWhitespace(line, cmdEnd, len)
                             if (cursor < len) {
-                                val mtlName = line.substring(cursor, len).trim()
-                                val mtlFile = File(objFile.parentFile, mtlName)
-                                parsedMtlNote = if (mtlFile.exists()) {
-                                    "Material $mtlName"
+                                val mtlRaw = line.substring(cursor, len).trim()
+                                val loaded = parseMtlReferencesIntoLibrary(mtlRaw, objFile.parentFile, scratchDir, mtlLib)
+                                parsedMtlNote = if (loaded > 0) {
+                                    "Material $mtlRaw"
                                 } else {
-                                    "Missing MTL $mtlName"
+                                    "Missing MTL $mtlRaw"
                                 }
                             }
                         }
@@ -1251,6 +1433,17 @@ object StreamingMeshProcessor {
             }
             flushWriteBuf(triOut, triBuf)
             triOut.close()
+
+            // Fallback check for same-named sibling .mtl if no mtllib loaded materials
+            if (mtlLib.parsedCount == 0 && objFile.parentFile != null) {
+                val siblingMtl = findCompanionAssetFile(objFile.parentFile, "${objFile.nameWithoutExtension}.mtl")
+                if (siblingMtl != null) {
+                    parseMtlFileIntoLibrary(siblingMtl, objFile.parentFile, scratchDir, mtlLib)
+                    if (mtlLib.parsedCount > 0 && parsedMtlNote == null) {
+                        parsedMtlNote = "Material ${siblingMtl.name}"
+                    }
+                }
+            }
 
             bounds.normalizeIfEmpty()
             val outGlb = File(cacheDir, "${objFile.nameWithoutExtension}_converted.glb")
@@ -1266,16 +1459,19 @@ object StreamingMeshProcessor {
                 )
             }
 
+            val resolvedMats = if (mtlLib.parsedCount > 0 || mtlLib.specs.size > 1) mtlLib.specs.toList() else null
             val stats = emitObjDiskTrianglesToGlb(
                 positions = positions,
                 normals = normals,
                 uvs = uvs,
+                colors = vertexColors,
                 triRecordFile = triIndexFile,
                 totalVerts = positions.count,
                 totalTris = triCount,
                 bounds = bounds,
                 scratchDir = scratchDir,
-                outGlb = outGlb
+                outGlb = outGlb,
+                materials = resolvedMats
             )
 
             val baseMsg = if (stats.wasSimplified) {
@@ -1309,6 +1505,7 @@ object StreamingMeshProcessor {
             positions.close()
             normals.close()
             uvs.close()
+            vertexColors?.close()
             runCatching { triIndexFile.delete() }
             runCatching { scratchDir.deleteRecursively() }
         }
@@ -1316,54 +1513,124 @@ object StreamingMeshProcessor {
 
     /**
      * Streaming 3MF converter parsing XML directly inside ZipInputStream without whole-file ByteArray loads.
+     * Preserves `<basematerials>` and `<m:colorgroup>` per-object and per-triangle colors.
      */
     fun convertThreeMfToGlb(cacheDir: File, threeMfFile: File): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "3mf_scratch_${System.nanoTime()}").apply { mkdirs() }
         val positions = MappedFloatTupleStore(3, scratchDir, "3mf_pos")
         val triIndexFile = File(scratchDir, "3mf_tris.bin")
+        val triColorFile = File(scratchDir, "3mf_tcols.bin")
         val bounds = MeshBounds()
         var triCount = 0L
+        var anyTriangleColor = false
 
         try {
             val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUFFER_BYTES)
             val triBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+            val colOut = BufferedOutputStream(FileOutputStream(triColorFile), IO_BUFFER_BYTES)
+            val colBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
 
-            val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = false }
+            val colorResources = HashMap<String, MutableList<Int>>() // resourceId -> list of packed linear RGBA8 Ints
+            var activeResourceList: MutableList<Int>? = null
+            var defaultObjectPid: String? = null
+            var defaultObjectPindex = -1
+
+            val saxFactory = SAXParserFactory.newInstance().apply {
+                isNamespaceAware = false
+                runCatching { setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
+                runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
+                runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
+            }
+            val saxParser = saxFactory.newSAXParser()
             ZipInputStream(BufferedInputStream(FileInputStream(threeMfFile), IO_BUFFER_BYTES)).use { zis ->
                 var entry = zis.nextEntry
                 while (entry != null) {
                     if (!entry.isDirectory && entry.name.endsWith(".model", ignoreCase = true)) {
-                        val parser = factory.newPullParser()
-                        parser.setInput(zis, "UTF-8")
                         var objectVertexOffset = positions.count
-                        var event = parser.eventType
-                        while (event != XmlPullParser.END_DOCUMENT) {
-                            if (event == XmlPullParser.START_TAG) {
-                                when (parser.name.lowercase(Locale.US)) {
+                        val nonClosingStream = object : FilterInputStream(zis) {
+                            override fun close() {
+                                // Leave ZipInputStream open across .model entries
+                            }
+                        }
+                        val handler = object : DefaultHandler() {
+                            override fun startElement(uri: String?, localName: String?, qName: String?, attrs: Attributes) {
+                                val rawName = if (!qName.isNullOrEmpty()) qName else (localName ?: "")
+                                val localTag = rawName.substringAfter(':').lowercase(Locale.US)
+                                when (localTag) {
+                                    "basematerials", "colorgroup" -> {
+                                        val resId = attrs.getValue("id")
+                                        activeResourceList = if (!resId.isNullOrEmpty()) {
+                                            colorResources.getOrPut(resId) { mutableListOf() }
+                                        } else null
+                                    }
+                                    "base" -> {
+                                        val list = activeResourceList
+                                        if (list != null) {
+                                            val hex = attrs.getValue("displaycolor")
+                                            list.add(parseHexSrgbToPackedLinearRgba(hex))
+                                        }
+                                    }
+                                    "color" -> {
+                                        val list = activeResourceList
+                                        if (list != null) {
+                                            val hex = attrs.getValue("color")
+                                            list.add(parseHexSrgbToPackedLinearRgba(hex))
+                                        }
+                                    }
+                                    "object" -> {
+                                        defaultObjectPid = attrs.getValue("pid")
+                                        defaultObjectPindex = attrs.getValue("pindex")?.toIntOrNull() ?: -1
+                                    }
                                     "mesh" -> objectVertexOffset = positions.count
                                     "vertex" -> {
-                                        val x = parser.getAttributeValue(null, "x")?.toFloatOrNull() ?: 0f
-                                        val y = parser.getAttributeValue(null, "y")?.toFloatOrNull() ?: 0f
-                                        val z = parser.getAttributeValue(null, "z")?.toFloatOrNull() ?: 0f
+                                        val x = attrs.getValue("x")?.toFloatOrNull() ?: 0f
+                                        val y = attrs.getValue("y")?.toFloatOrNull() ?: 0f
+                                        val z = attrs.getValue("z")?.toFloatOrNull() ?: 0f
                                         positions.add3(x, y, z)
                                         bounds.expand(x, y, z)
                                     }
                                     "triangle" -> {
-                                        val v1 = (parser.getAttributeValue(null, "v1")?.toLongOrNull() ?: -1L) + objectVertexOffset
-                                        val v2 = (parser.getAttributeValue(null, "v2")?.toLongOrNull() ?: -1L) + objectVertexOffset
-                                        val v3 = (parser.getAttributeValue(null, "v3")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        val v1 = (attrs.getValue("v1")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        val v2 = (attrs.getValue("v2")?.toLongOrNull() ?: -1L) + objectVertexOffset
+                                        val v3 = (attrs.getValue("v3")?.toLongOrNull() ?: -1L) + objectVertexOffset
                                         if (v1 in 0L until positions.count && v2 in 0L until positions.count && v3 in 0L until positions.count) {
                                             if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
                                             triBuf.putLong(v1)
                                             triBuf.putLong(v2)
                                             triBuf.putLong(v3)
+
+                                            val pid = attrs.getValue("pid") ?: defaultObjectPid
+                                            val p1 = attrs.getValue("p1")?.toIntOrNull() ?: defaultObjectPindex
+                                            val p2 = attrs.getValue("p2")?.toIntOrNull() ?: p1
+                                            val p3 = attrs.getValue("p3")?.toIntOrNull() ?: p1
+                                            val resList = if (pid != null) colorResources[pid] else null
+                                            val rgba1 = if (resList != null && p1 in resList.indices) { anyTriangleColor = true; resList[p1] } else -1
+                                            val rgba2 = if (resList != null && p2 in resList.indices) { anyTriangleColor = true; resList[p2] } else rgba1
+                                            val rgba3 = if (resList != null && p3 in resList.indices) { anyTriangleColor = true; resList[p3] } else rgba1
+
+                                            if (colBuf.remaining() < 12) flushWriteBuf(colOut, colBuf)
+                                            colBuf.putInt(rgba1)
+                                            colBuf.putInt(rgba2)
+                                            colBuf.putInt(rgba3)
                                             triCount++
                                         }
                                     }
                                 }
                             }
-                            event = parser.next()
+
+                            override fun endElement(uri: String?, localName: String?, qName: String?) {
+                                val rawName = if (!qName.isNullOrEmpty()) qName else (localName ?: "")
+                                val localTag = rawName.substringAfter(':').lowercase(Locale.US)
+                                when (localTag) {
+                                    "basematerials", "colorgroup" -> activeResourceList = null
+                                    "object" -> {
+                                        defaultObjectPid = null
+                                        defaultObjectPindex = -1
+                                    }
+                                }
+                            }
                         }
+                        saxParser.parse(nonClosingStream, handler)
                     }
                     zis.closeEntry()
                     entry = zis.nextEntry
@@ -1371,6 +1638,8 @@ object StreamingMeshProcessor {
             }
             flushWriteBuf(triOut, triBuf)
             triOut.close()
+            flushWriteBuf(colOut, colBuf)
+            colOut.close()
             bounds.normalizeIfEmpty()
 
             if (triCount <= 0L || positions.count <= 0L) {
@@ -1389,6 +1658,7 @@ object StreamingMeshProcessor {
                 positions = positions,
                 normals = null,
                 uvs = null,
+                cornerColorFile = if (anyTriangleColor) triColorFile else null,
                 triIndexFile = triIndexFile,
                 totalVerts = positions.count,
                 totalTris = triCount,
@@ -1422,6 +1692,7 @@ object StreamingMeshProcessor {
         } finally {
             positions.close()
             runCatching { triIndexFile.delete() }
+            runCatching { triColorFile.delete() }
             runCatching { scratchDir.deleteRecursively() }
         }
     }
@@ -1544,6 +1815,7 @@ object StreamingMeshProcessor {
                 if (images.length() == 0) return@runCatching null
 
                 val rewrittenBv = HashMap<Int, Pair<ByteArray, String>>()
+                val convertedImgIndices = HashSet<Int>()
                 for (i in 0 until images.length()) {
                     val img = images.getJSONObject(i)
                     val bvIdx = img.optInt("bufferView", -1)
@@ -1557,10 +1829,17 @@ object StreamingMeshProcessor {
                     raf.seek(binFileOffset + off)
                     raf.readFully(imgBytes)
 
+                    val isWebpMagic = imgBytes.size >= 12 &&
+                        imgBytes[0] == 'R'.code.toByte() && imgBytes[1] == 'I'.code.toByte() &&
+                        imgBytes[2] == 'F'.code.toByte() && imgBytes[3] == 'F'.code.toByte() &&
+                        imgBytes[8] == 'W'.code.toByte() && imgBytes[9] == 'E'.code.toByte() &&
+                        imgBytes[10] == 'B'.code.toByte() && imgBytes[11] == 'P'.code.toByte()
+                    val isWebp = isWebpMagic || img.optString("mimeType").contains("webp", true)
+
                     val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size, boundsOpts)
                     val maxDim = max(boundsOpts.outWidth, boundsOpts.outHeight)
-                    if (maxDim <= maxEdge && !img.optString("mimeType").contains("webp", true)) continue
+                    if (maxDim <= maxEdge && !isWebp) continue
 
                     var sample = 1
                     while (maxDim / sample > maxEdge * 2) sample *= 2
@@ -1569,13 +1848,39 @@ object StreamingMeshProcessor {
                     val outStream = java.io.ByteArrayOutputStream()
                     val format = if (bmp.hasAlpha()) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
                     val mime = if (bmp.hasAlpha()) "image/png" else "image/jpeg"
-                    bmp.compress(format, 85, outStream)
+                    bmp.compress(format, 88, outStream)
                     bmp.recycle()
                     rewrittenBv[bvIdx] = outStream.toByteArray() to mime
                     img.put("mimeType", mime)
+                    convertedImgIndices.add(i)
                 }
 
                 if (rewrittenBv.isEmpty()) return@runCatching null
+
+                // Normalize any EXT_texture_webp texture nodes whose source was converted to PNG/JPEG
+                val textures = root.optJSONArray("textures")
+                if (textures != null) {
+                    for (t in 0 until textures.length()) {
+                        val tex = textures.optJSONObject(t) ?: continue
+                        val exts = tex.optJSONObject("extensions") ?: continue
+                        val webpExt = exts.optJSONObject("EXT_texture_webp") ?: continue
+                        val srcIdx = webpExt.optInt("source", -1)
+                        if (srcIdx in convertedImgIndices) {
+                            if (!tex.has("source")) tex.put("source", srcIdx)
+                            exts.remove("EXT_texture_webp")
+                            if (exts.length() == 0) tex.remove("extensions")
+                        }
+                    }
+                }
+                for (extKey in listOf("extensionsUsed", "extensionsRequired")) {
+                    val arr = root.optJSONArray(extKey) ?: continue
+                    val filtered = JSONArray()
+                    for (k in 0 until arr.length()) {
+                        val v = arr.optString(k)
+                        if (!v.equals("EXT_texture_webp", ignoreCase = true)) filtered.put(v)
+                    }
+                    if (filtered.length() == 0) root.remove(extKey) else root.put(extKey, filtered)
+                }
 
                 // Append resized images cleanly at the end of BIN chunk and point their bufferViews there
                 var newBinEnd = binLen.toLong()
@@ -1637,7 +1942,8 @@ object StreamingMeshProcessor {
     /**
      * Decimates an UNCOMPRESSED oversized `.glb` (when raw vertices/triangles exceed GPU VRAM bounds)
      * directly on disk into a mobile-safe GLB using bulk channel reads, full node world transforms,
-     * and quantized/float accessor support + triangle strip/fan conversion.
+     * quantized/float accessor support + triangle strip/fan conversion, AND full preservation of
+     * COLOR_0 vertex colors, multi-materials, PBR factors, and embedded/external textures.
      */
     fun simplifyUncompressedGlb(cacheDir: File, srcGlb: File, force: Boolean = false): File? {
         val info = inspectGlbMetadata(srcGlb)
@@ -1658,12 +1964,24 @@ object StreamingMeshProcessor {
                 val bufferViews = root.optArr("bufferViews") ?: return@use null
                 val meshes = root.optArr("meshes") ?: return@use null
 
+                // Extract all materials & embedded/referenced textures cleanly before streaming geometry
+                val (materialsList, matTexCoordIndices) = extractGlbMaterialsAndTextures(
+                    root = root,
+                    raf = raf,
+                    binOffset = binOffset,
+                    bufferViews = bufferViews,
+                    srcDir = srcGlb.parentFile,
+                    scratchDir = scratchDir
+                )
+                val multiMat = materialsList.size > 1
+
                 // Build mesh -> world matrices list via scene/nodes hierarchy
                 val meshTransforms = collectGlbMeshWorldMatrices(root, meshes.length())
 
                 val positions = MappedFloatTupleStore(3, scratchDir, "glb_pos")
                 val normals = MappedFloatTupleStore(3, scratchDir, "glb_nrm")
                 val uvs = MappedFloatTupleStore(2, scratchDir, "glb_uv")
+                var colors: MappedFloatTupleStore? = null
                 val triIndexFile = File(scratchDir, "glb_tris.bin")
                 val triOut = BufferedOutputStream(FileOutputStream(triIndexFile), IO_BUFFER_BYTES)
                 val triBuf = ByteBuffer.allocate(GLB_CHUNK_BYTES).order(ByteOrder.LITTLE_ENDIAN)
@@ -1702,9 +2020,14 @@ object StreamingMeshProcessor {
                                 val posBaseOffset = binOffset + posBv.optLong("byteOffset", 0L) + posAcc.optLong("byteOffset", 0L)
                                 val posNormalized = posAcc.optBoolean("normalized", false)
 
-                                // Optional NORMAL & TEXCOORD_0 streams read sequentially if present
+                                val matId = if (materialsList.isNotEmpty()) {
+                                    prim.optInt("material", 0).coerceIn(0, materialsList.lastIndex)
+                                } else 0
+                                val desiredTexCoord = matTexCoordIndices.getOrElse(matId) { 0 }
+
                                 val nrmAccIdx = attrs.optInt("NORMAL", -1)
-                                val uvAccIdx = attrs.optInt("TEXCOORD_0", -1)
+                                val uvAccIdx = attrs.optInt("TEXCOORD_$desiredTexCoord", attrs.optInt("TEXCOORD_0", -1))
+                                val colAccIdx = attrs.optInt("COLOR_0", -1)
 
                                 val vertStartIdx = positions.count
                                 streamGlbVec3AccessorBulk(
@@ -1722,7 +2045,7 @@ object StreamingMeshProcessor {
                                     bounds = bounds
                                 )
 
-                                // Keep normals/uvs aligned to positions.count
+                                // Keep normals, uvs, and colors aligned to positions.count
                                 val nrmWritten = if (nrmAccIdx in 0 until accessors.length()) {
                                     val nAcc = accessors.optObj(nrmAccIdx)
                                     val nBvIdx = nAcc?.optInt("bufferView", -1) ?: -1
@@ -1784,6 +2107,44 @@ object StreamingMeshProcessor {
                                     for (k in 0L until posCount) uvs.add2(0f, 0f)
                                 }
 
+                                val colAcc = if (colAccIdx in 0 until accessors.length()) accessors.optObj(colAccIdx) else null
+                                val colType = colAcc?.optString("type") ?: ""
+                                val colDims = when (colType) { "VEC3" -> 3; "VEC4" -> 4; else -> 0 }
+                                val colComp = colAcc?.optInt("componentType") ?: 0
+                                val colCompSz = gltfCompByteSize(colComp)
+                                val colBvIdx = colAcc?.optInt("bufferView", -1) ?: -1
+                                val canReadColor = colAcc != null && colDims > 0 && colCompSz > 0 &&
+                                    colAcc.optLong("count", 0L) == posCount && colBvIdx in 0 until bufferViews.length()
+                                if (canReadColor && colors == null) {
+                                    val store = MappedFloatTupleStore(4, scratchDir, "glb_col")
+                                    var pad = 0L
+                                    while (pad < vertStartIdx) {
+                                        store.add4(1f, 1f, 1f, 1f)
+                                        pad++
+                                    }
+                                    colors = store
+                                }
+                                if (canReadColor && colors != null) {
+                                    val cBv = bufferViews.optObj(colBvIdx)!!
+                                    val minCBytes = colCompSz * colDims
+                                    val cStride = cBv.optInt("byteStride", minCBytes).coerceAtLeast(minCBytes)
+                                    val cOff = binOffset + cBv.optLong("byteOffset", 0L) + colAcc!!.optLong("byteOffset", 0L)
+                                    streamGlbColorAccessorBulk(
+                                        raf = raf,
+                                        baseOffset = cOff,
+                                        count = posCount,
+                                        dims = colDims,
+                                        stride = cStride,
+                                        compType = colComp,
+                                        normalized = colAcc.optBoolean("normalized", colComp != 5126),
+                                        bulkBuf = bulkBuf,
+                                        bulkBB = bulkBB,
+                                        dst = colors!!
+                                    )
+                                } else if (colors != null) {
+                                    for (k in 0L until posCount) colors!!.add4(1f, 1f, 1f, 1f)
+                                }
+
                                 // Stream indices in bulk and triangulate TRIANGLES / STRIP / FAN
                                 val idxAccIdx = prim.optInt("indices", -1)
                                 totalTris += streamGlbPrimitiveIndicesBulk(
@@ -1795,6 +2156,8 @@ object StreamingMeshProcessor {
                                     mode = mode,
                                     vertStartIdx = vertStartIdx,
                                     posCount = posCount,
+                                    matId = matId,
+                                    writeMatId = multiMat,
                                     bulkBuf = bulkBuf,
                                     bulkBB = bulkBB,
                                     triOut = triOut,
@@ -1809,13 +2172,12 @@ object StreamingMeshProcessor {
                     bounds.normalizeIfEmpty()
                     if (totalTris <= 0L) return@use null
 
-                    // Preserve first material's baseColorFactor if no external texture dependencies exist
-                    val baseColor = extractPrimaryMaterialBaseColor(root)
                     val outGlb = File(cacheDir, "${srcGlb.nameWithoutExtension}_optimized.glb")
                     emitIndexedDiskTrianglesToGlb(
                         positions = positions,
                         normals = normals,
                         uvs = uvs,
+                        colors = colors,
                         triIndexFile = triIndexFile,
                         totalVerts = positions.count,
                         totalTris = totalTris,
@@ -1824,13 +2186,15 @@ object StreamingMeshProcessor {
                         outGlb = outGlb,
                         generator = "MixedReality GLB Optimizer",
                         indexIsLong = true,
-                        baseColorFactor = baseColor
+                        triHasMat = multiMat,
+                        materials = materialsList.ifEmpty { null }
                     )
                     outGlb
                 } finally {
                     positions.close()
                     normals.close()
                     uvs.close()
+                    colors?.close()
                     runCatching { triOut.close() }
                 }
             }
@@ -1961,6 +2325,42 @@ object StreamingMeshProcessor {
         }
     }
 
+    private fun streamGlbColorAccessorBulk(
+        raf: RandomAccessFile,
+        baseOffset: Long,
+        count: Long,
+        dims: Int,
+        stride: Int,
+        compType: Int,
+        normalized: Boolean,
+        bulkBuf: ByteArray,
+        bulkBB: ByteBuffer,
+        dst: MappedFloatTupleStore
+    ) {
+        val cSz = gltfCompByteSize(compType)
+        val elemBytes = cSz * dims
+        val elemsPerChunk = (bulkBuf.size / stride).coerceAtLeast(1)
+        raf.seek(baseOffset)
+        var remaining = count
+        while (remaining > 0L) {
+            val batch = minOf(remaining, elemsPerChunk.toLong()).toInt()
+            val bytesNeeded = if (batch == 1) elemBytes else (batch - 1) * stride + elemBytes
+            raf.readFully(bulkBuf, 0, bytesNeeded)
+            for (i in 0 until batch) {
+                val o = i * stride
+                val r = decodeGlbScalar(bulkBB, bulkBuf, o, compType, normalized).coerceIn(0f, 1f)
+                val g = decodeGlbScalar(bulkBB, bulkBuf, o + cSz, compType, normalized).coerceIn(0f, 1f)
+                val b = decodeGlbScalar(bulkBB, bulkBuf, o + cSz * 2, compType, normalized).coerceIn(0f, 1f)
+                val a = if (dims >= 4) decodeGlbScalar(bulkBB, bulkBuf, o + cSz * 3, compType, normalized).coerceIn(0f, 1f) else 1f
+                dst.add4(r, g, b, a)
+            }
+            if (stride > elemBytes && remaining > batch) {
+                raf.skipBytes(stride - elemBytes)
+            }
+            remaining -= batch.toLong()
+        }
+    }
+
     private fun streamGlbPrimitiveIndicesBulk(
         raf: RandomAccessFile,
         binOffset: Long,
@@ -1970,18 +2370,22 @@ object StreamingMeshProcessor {
         mode: Int,
         vertStartIdx: Long,
         posCount: Long,
+        matId: Int,
+        writeMatId: Boolean,
         bulkBuf: ByteArray,
         bulkBB: ByteBuffer,
         triOut: BufferedOutputStream,
         triBuf: ByteBuffer
     ): Long {
         var tris = 0L
+        val recNeed = if (writeMatId) 28 else 24
         fun emitTri(a: Long, b: Long, c: Long) {
             if (a == b || b == c || a == c) return
-            if (triBuf.remaining() < 24) flushWriteBuf(triOut, triBuf)
+            if (triBuf.remaining() < recNeed) flushWriteBuf(triOut, triBuf)
             triBuf.putLong(vertStartIdx + a)
             triBuf.putLong(vertStartIdx + b)
             triBuf.putLong(vertStartIdx + c)
+            if (writeMatId) triBuf.putInt(matId)
             tris++
         }
 
@@ -2063,6 +2467,149 @@ object StreamingMeshProcessor {
             remaining -= batch.toLong()
         }
         return tris
+    }
+
+    private fun extractGlbMaterialsAndTextures(
+        root: MiniJson.Obj,
+        raf: RandomAccessFile,
+        binOffset: Long,
+        bufferViews: MiniJson.Arr,
+        srcDir: File?,
+        scratchDir: File
+    ): Pair<List<GlbMaterialSpec>, IntArray> {
+        val mats = root.optArr("materials") ?: return emptyList<GlbMaterialSpec>() to IntArray(0)
+        if (mats.length() == 0) return emptyList<GlbMaterialSpec>() to IntArray(0)
+        val textures = root.optArr("textures")
+        val images = root.optArr("images")
+        val extractedImgCache = HashMap<Int, Pair<File, String>?>()
+
+        fun resolveImage(imgIdx: Int): Pair<File, String>? {
+            if (imgIdx < 0 || images == null || imgIdx >= images.length()) return null
+            if (extractedImgCache.containsKey(imgIdx)) return extractedImgCache[imgIdx]
+            val img = images.optObj(imgIdx)
+            var result: Pair<File, String>? = null
+            if (img != null) {
+                val mime = img.optString("mimeType").lowercase(Locale.US)
+                val bvIdx = img.optInt("bufferView", -1)
+                if (bvIdx in 0 until bufferViews.length()) {
+                    val bv = bufferViews.optObj(bvIdx)
+                    val off = bv?.optLong("byteOffset", 0L) ?: 0L
+                    val bLen = bv?.optInt("byteLength", 0) ?: 0
+                    if (bLen in 1..(48 * 1024 * 1024)) {
+                        val rawBytes = ByteArray(bLen)
+                        raf.seek(binOffset + off)
+                        raf.readFully(rawBytes)
+                        val ext = guessImageExtFromMimeOrBytes(mime, rawBytes)
+                        val rawOut = File(scratchDir, "glb_img_${imgIdx}.${ext}")
+                        rawOut.writeBytes(rawBytes)
+                        result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = 1536)
+                    }
+                } else {
+                    val uri = img.optString("uri")
+                    if (uri.startsWith("data:", ignoreCase = true)) {
+                        val comma = uri.indexOf(',')
+                        if (comma > 0) {
+                            val header = uri.substring(5, comma).lowercase(Locale.US)
+                            val b64 = uri.substring(comma + 1)
+                            val rawBytes = runCatching { java.util.Base64.getDecoder().decode(b64) }.getOrNull()
+                            if (rawBytes != null && rawBytes.isNotEmpty()) {
+                                val ext = guessImageExtFromMimeOrBytes(header, rawBytes)
+                                val rawOut = File(scratchDir, "glb_img_${imgIdx}.${ext}")
+                                rawOut.writeBytes(rawBytes)
+                                result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = 1536)
+                            }
+                        }
+                    } else if (uri.isNotBlank() && srcDir != null) {
+                        val found = findCompanionAssetFile(srcDir, uri)
+                        if (found != null) {
+                            result = prepareMobileTextureFile(scratchDir, found, maxEdge = 1536)
+                        }
+                    }
+                }
+            }
+            extractedImgCache[imgIdx] = result
+            return result
+        }
+
+        val outMats = ArrayList<GlbMaterialSpec>(mats.length())
+        val texCoords = IntArray(mats.length())
+
+        for (i in 0 until mats.length()) {
+            val m = mats.optObj(i)
+            val pbr = m?.optObj("pbrMetallicRoughness")
+            val exts = m?.optObj("extensions")
+            val specGloss = exts?.optObj("KHR_materials_pbrSpecularGlossiness")
+            val isUnlit = exts?.has("KHR_materials_unlit") == true
+
+            val factorArr = pbr?.optArr("baseColorFactor") ?: specGloss?.optArr("diffuseFactor")
+            val baseColor = if (factorArr != null && factorArr.length() >= 3) {
+                floatArrayOf(
+                    factorArr.optDouble(0, 1.0).toFloat(),
+                    factorArr.optDouble(1, 1.0).toFloat(),
+                    factorArr.optDouble(2, 1.0).toFloat(),
+                    if (factorArr.length() >= 4) factorArr.optDouble(3, 1.0).toFloat() else 1f
+                )
+            } else {
+                floatArrayOf(1f, 1f, 1f, 1f)
+            }
+
+            val metallic = if (pbr != null) {
+                pbr.optDouble("metallicFactor", 1.0).toFloat().coerceIn(0f, 1f)
+            } else if (specGloss != null) {
+                0.05f
+            } else 0.1f
+
+            val roughness = if (pbr != null) {
+                pbr.optDouble("roughnessFactor", 1.0).toFloat().coerceIn(0.05f, 1f)
+            } else if (specGloss != null) {
+                (1.0 - specGloss.optDouble("glossinessFactor", 0.5)).toFloat().coerceIn(0.05f, 1f)
+            } else 0.7f
+
+            val emArr = m?.optArr("emissiveFactor")
+            val emissive = if (emArr != null && emArr.length() >= 3) {
+                floatArrayOf(
+                    emArr.optDouble(0, 0.0).toFloat(),
+                    emArr.optDouble(1, 0.0).toFloat(),
+                    emArr.optDouble(2, 0.0).toFloat()
+                )
+            } else null
+
+            val alphaMode = m?.optString("alphaMode", "OPAQUE")?.ifBlank { "OPAQUE" } ?: "OPAQUE"
+            val doubleSided = m?.optBoolean("doubleSided", true) ?: true
+
+            val baseTexObj = pbr?.optObj("baseColorTexture") ?: specGloss?.optObj("diffuseTexture")
+            val texIdx = baseTexObj?.optInt("index", -1) ?: -1
+            texCoords[i] = baseTexObj?.optInt("texCoord", 0) ?: 0
+            val texObj = if (textures != null && texIdx in 0 until textures.length()) textures.optObj(texIdx) else null
+            val imgIdx = texObj?.optInt("source", -1)?.takeIf { it >= 0 }
+                ?: texObj?.optObj("extensions")?.optObj("EXT_texture_webp")?.optInt("source", -1)
+                ?: -1
+            val resolvedTex = resolveImage(imgIdx)
+
+            outMats.add(
+                GlbMaterialSpec(
+                    baseColorFactor = baseColor,
+                    metallicFactor = metallic,
+                    roughnessFactor = roughness,
+                    emissiveFactor = emissive,
+                    doubleSided = doubleSided,
+                    alphaMode = alphaMode,
+                    unlit = isUnlit,
+                    textureFile = resolvedTex?.first,
+                    textureMime = resolvedTex?.second
+                )
+            )
+        }
+        return outMats to texCoords
+    }
+
+    private fun guessImageExtFromMimeOrBytes(mime: String, bytes: ByteArray): String {
+        if (mime.contains("png")) return "png"
+        if (mime.contains("webp")) return "webp"
+        if (mime.contains("jpeg") || mime.contains("jpg")) return "jpg"
+        if (bytes.size >= 4 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()) return "png"
+        if (bytes.size >= 12 && bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte() && bytes[8] == 'W'.code.toByte() && bytes[9] == 'E'.code.toByte()) return "webp"
+        return "jpg"
     }
 
     private fun extractPrimaryMaterialBaseColor(root: MiniJson.Obj): FloatArray? {
@@ -2151,11 +2698,13 @@ object StreamingMeshProcessor {
     /** Fast, zero-dependency pure-Kotlin JSON reader for GLB/glTF headers across Android & JVM tests. */
     private object MiniJson {
         class Obj(private val map: Map<String, Any?>) {
+            fun has(k: String): Boolean = map.containsKey(k)
             fun optObj(k: String): Obj? = map[k] as? Obj
             fun optArr(k: String): Arr? = map[k] as? Arr
             fun optString(k: String, def: String = ""): String = map[k] as? String ?: def
             fun optInt(k: String, def: Int = 0): Int = (map[k] as? Number)?.toInt() ?: def
             fun optLong(k: String, def: Long = 0L): Long = (map[k] as? Number)?.toLong() ?: def
+            fun optDouble(k: String, def: Double = 0.0): Double = (map[k] as? Number)?.toDouble() ?: def
             fun optBoolean(k: String, def: Boolean = false): Boolean = map[k] as? Boolean ?: def
         }
         class Arr(private val list: List<Any?>) {
@@ -2318,82 +2867,203 @@ object StreamingMeshProcessor {
         metallicFactor: Float = 0.1f,
         roughnessFactor: Float = 0.7f,
         textureFile: File? = null,
-        textureMime: String? = null
+        textureMime: String? = null,
+        colors: MappedFloatTupleStore? = null,
+        cornerColorFile: File? = null,
+        triHasMat: Boolean = false,
+        materials: List<GlbMaterialSpec>? = null
     ): MeshStats {
         positions.sealForRead()
         normals?.sealForRead()
         uvs?.sealForRead()
+        colors?.sealForRead()
 
+        val hasCornerColors = cornerColorFile != null && cornerColorFile.exists()
+        val hasVertColors = hasCornerColors || (colors != null && colors.count == positions.count)
+        val hasMultiMat = triHasMat && (materials?.size ?: 0) > 1
         val needsCluster = totalVerts > DIRECT_TRIANGLE_LIMIT.toLong() || totalTris > DIRECT_TRIANGLE_LIMIT.toLong()
-        val triBytes = if (indexIsLong) 24 else 12
-        val readBuf = ByteArray(triBytes * 4096)
+        val triBytes = (if (indexIsLong) 24 else 12) + (if (triHasMat) 4 else 0)
+        val batchRecords = 4096
+        val readBuf = ByteArray(triBytes * batchRecords)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
+        val cColBuf = if (hasCornerColors) ByteArray(12 * batchRecords) else ByteArray(0)
+        val cColBB = ByteBuffer.wrap(cColBuf).order(ByteOrder.LITTLE_ENDIAN)
+
+        fun unpackLinearRgbaComp(packed: Int, shift: Int): Float = ((packed ushr shift) and 0xFF) / 255f
 
         if (!needsCluster) {
-            DirectStreamingGlbWriter(scratchDir).use { writer ->
-                if (normals != null && normals.count == positions.count) {
+            DirectStreamingGlbWriter(scratchDir, hasColors = hasVertColors, hasMultiMaterial = hasMultiMat).use { writer ->
+                if (!hasCornerColors && normals != null && normals.count == positions.count) {
                     var v = 0L
                     while (v < positions.count) {
                         val u = if (uvs != null && v < uvs.count) uvs.getU(v) else 0f
                         val tv = if (uvs != null && v < uvs.count) uvs.getV(v) else 0f
-                        writer.emitVertex(
-                            positions.getX(v), positions.getY(v), positions.getZ(v),
-                            normals.getX(v), normals.getY(v), normals.getZ(v),
-                            u, tv
-                        )
+                        if (hasVertColors && colors != null) {
+                            writer.emitVertex(
+                                positions.getX(v), positions.getY(v), positions.getZ(v),
+                                normals.getX(v), normals.getY(v), normals.getZ(v),
+                                u, tv,
+                                colors.getR(v), colors.getG(v), colors.getB(v), colors.getA(v)
+                            )
+                        } else {
+                            writer.emitVertex(
+                                positions.getX(v), positions.getY(v), positions.getZ(v),
+                                normals.getX(v), normals.getY(v), normals.getZ(v),
+                                u, tv
+                            )
+                        }
                         v++
                     }
                     BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
                         while (true) {
-                            val n = bis.read(readBuf)
+                            val n = readUpToAligned(bis, readBuf, triBytes)
                             if (n <= 0) break
                             var off = 0
                             while (off + triBytes <= n) {
-                                val i0: Long; val i1: Long; val i2: Long
+                                val i0: Long; val i1: Long; val i2: Long; val mId: Int
                                 if (indexIsLong) {
                                     i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                                    mId = if (triHasMat) readBB.getInt(off + 24) else 0
                                 } else {
                                     i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                                    mId = if (triHasMat) readBB.getInt(off + 12) else 0
                                 }
                                 if (i0 in 0L until totalVerts && i1 in 0L until totalVerts && i2 in 0L until totalVerts) {
-                                    writer.emitTriangle(i0.toInt(), i1.toInt(), i2.toInt())
+                                    writer.emitTriangle(i0.toInt(), i1.toInt(), i2.toInt(), mId)
                                 }
                                 off += triBytes
                             }
                         }
                     }
                 } else {
-                    BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
-                        while (true) {
-                            val n = bis.read(readBuf)
-                            if (n <= 0) break
-                            var off = 0
-                            while (off + triBytes <= n) {
-                                val i0: Long; val i1: Long; val i2: Long
-                                if (indexIsLong) {
-                                    i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
-                                } else {
-                                    i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                    val colBis = if (hasCornerColors) BufferedInputStream(FileInputStream(cornerColorFile!!), IO_BUFFER_BYTES) else null
+                    try {
+                        BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
+                            while (true) {
+                                val n = readUpToAligned(bis, readBuf, triBytes)
+                                if (n <= 0) break
+                                val recs = n / triBytes
+                                val cRead = if (colBis != null) readExactOrLess(colBis, cColBuf, recs * 12) else 0
+                                var off = 0
+                                var cOff = 0
+                                while (off + triBytes <= n) {
+                                    val i0: Long; val i1: Long; val i2: Long; val mId: Int
+                                    if (indexIsLong) {
+                                        i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                                        mId = if (triHasMat) readBB.getInt(off + 24) else 0
+                                    } else {
+                                        i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                                        mId = if (triHasMat) readBB.getInt(off + 12) else 0
+                                    }
+                                    val c0 = if (cOff + 12 <= cRead) cColBB.getInt(cOff) else -1
+                                    val c1 = if (cOff + 12 <= cRead) cColBB.getInt(cOff + 4) else -1
+                                    val c2 = if (cOff + 12 <= cRead) cColBB.getInt(cOff + 8) else -1
+                                    off += triBytes
+                                    cOff += 12
+                                    if (i0 in 0L until totalVerts && i1 in 0L until totalVerts && i2 in 0L until totalVerts) {
+                                        val x0 = positions.getX(i0); val y0 = positions.getY(i0); val z0 = positions.getZ(i0)
+                                        val x1 = positions.getX(i1); val y1 = positions.getY(i1); val z1 = positions.getZ(i1)
+                                        val x2 = positions.getX(i2); val y2 = positions.getY(i2); val z2 = positions.getZ(i2)
+                                        val hasN = normals != null && normals.count == positions.count
+                                        val (fnx, fny, fnz) = if (hasN) Triple(0f, 1f, 0f) else computeFaceNormal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
+                                        val u0 = if (uvs != null && i0 < uvs.count) uvs.getU(i0) else 0f
+                                        val v0 = if (uvs != null && i0 < uvs.count) uvs.getV(i0) else 0f
+                                        val u1 = if (uvs != null && i1 < uvs.count) uvs.getU(i1) else 0f
+                                        val v1 = if (uvs != null && i1 < uvs.count) uvs.getV(i1) else 0f
+                                        val u2 = if (uvs != null && i2 < uvs.count) uvs.getU(i2) else 0f
+                                        val v2 = if (uvs != null && i2 < uvs.count) uvs.getV(i2) else 0f
+
+                                        val r0 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c0, 0)
+                                            colors != null -> colors.getR(i0)
+                                            else -> 1f
+                                        }
+                                        val g0 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c0, 8)
+                                            colors != null -> colors.getG(i0)
+                                            else -> 1f
+                                        }
+                                        val b0 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c0, 16)
+                                            colors != null -> colors.getB(i0)
+                                            else -> 1f
+                                        }
+                                        val a0 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c0, 24)
+                                            colors != null -> colors.getA(i0)
+                                            else -> 1f
+                                        }
+
+                                        val r1 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c1, 0)
+                                            colors != null -> colors.getR(i1)
+                                            else -> 1f
+                                        }
+                                        val g1 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c1, 8)
+                                            colors != null -> colors.getG(i1)
+                                            else -> 1f
+                                        }
+                                        val b1 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c1, 16)
+                                            colors != null -> colors.getB(i1)
+                                            else -> 1f
+                                        }
+                                        val a1 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c1, 24)
+                                            colors != null -> colors.getA(i1)
+                                            else -> 1f
+                                        }
+
+                                        val r2 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c2, 0)
+                                            colors != null -> colors.getR(i2)
+                                            else -> 1f
+                                        }
+                                        val g2 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c2, 8)
+                                            colors != null -> colors.getG(i2)
+                                            else -> 1f
+                                        }
+                                        val b2 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c2, 16)
+                                            colors != null -> colors.getB(i2)
+                                            else -> 1f
+                                        }
+                                        val a2 = when {
+                                            hasCornerColors -> unpackLinearRgbaComp(c2, 24)
+                                            colors != null -> colors.getA(i2)
+                                            else -> 1f
+                                        }
+
+                                        val o0 = writer.emitVertex(
+                                            x0, y0, z0,
+                                            if (hasN) normals!!.getX(i0) else fnx,
+                                            if (hasN) normals!!.getY(i0) else fny,
+                                            if (hasN) normals!!.getZ(i0) else fnz,
+                                            u0, v0, r0, g0, b0, a0
+                                        )
+                                        val o1 = writer.emitVertex(
+                                            x1, y1, z1,
+                                            if (hasN) normals!!.getX(i1) else fnx,
+                                            if (hasN) normals!!.getY(i1) else fny,
+                                            if (hasN) normals!!.getZ(i1) else fnz,
+                                            u1, v1, r1, g1, b1, a1
+                                        )
+                                        val o2 = writer.emitVertex(
+                                            x2, y2, z2,
+                                            if (hasN) normals!!.getX(i2) else fnx,
+                                            if (hasN) normals!!.getY(i2) else fny,
+                                            if (hasN) normals!!.getZ(i2) else fnz,
+                                            u2, v2, r2, g2, b2, a2
+                                        )
+                                        writer.emitTriangle(o0, o1, o2, mId)
+                                    }
                                 }
-                                if (i0 in 0L until totalVerts && i1 in 0L until totalVerts && i2 in 0L until totalVerts) {
-                                    val x0 = positions.getX(i0); val y0 = positions.getY(i0); val z0 = positions.getZ(i0)
-                                    val x1 = positions.getX(i1); val y1 = positions.getY(i1); val z1 = positions.getZ(i1)
-                                    val x2 = positions.getX(i2); val y2 = positions.getY(i2); val z2 = positions.getZ(i2)
-                                    val (nx, ny, nz) = computeFaceNormal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
-                                    val u0 = if (uvs != null && i0 < uvs.count) uvs.getU(i0) else 0f
-                                    val v0 = if (uvs != null && i0 < uvs.count) uvs.getV(i0) else 0f
-                                    val u1 = if (uvs != null && i1 < uvs.count) uvs.getU(i1) else 0f
-                                    val v1 = if (uvs != null && i1 < uvs.count) uvs.getV(i1) else 0f
-                                    val u2 = if (uvs != null && i2 < uvs.count) uvs.getU(i2) else 0f
-                                    val v2 = if (uvs != null && i2 < uvs.count) uvs.getV(i2) else 0f
-                                    val o0 = writer.emitVertex(x0, y0, z0, nx, ny, nz, u0, v0)
-                                    val o1 = writer.emitVertex(x1, y1, z1, nx, ny, nz, u1, v1)
-                                    val o2 = writer.emitVertex(x2, y2, z2, nx, ny, nz, u2, v2)
-                                    writer.emitTriangle(o0, o1, o2)
-                                }
-                                off += triBytes
                             }
                         }
+                    } finally {
+                        runCatching { colBis?.close() }
                     }
                 }
                 writer.finalizeToGlb(
@@ -2403,7 +3073,8 @@ object StreamingMeshProcessor {
                     metallicFactor = metallicFactor,
                     roughnessFactor = roughnessFactor,
                     textureFile = textureFile,
-                    textureMime = textureMime
+                    textureMime = textureMime,
+                    materials = materials
                 )
                 return MeshStats(
                     originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
@@ -2422,52 +3093,84 @@ object StreamingMeshProcessor {
         val hasPerVertNorm = normals != null && normals.count == positions.count
         while (true) {
             val isFloor = gridRes <= 64
-            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
+            val acc = SpatialClusterAccumulator(
+                bounds = bounds,
+                gridResolution = gridRes,
+                forceNoOverflowFallback = isFloor,
+                hasColors = hasVertColors,
+                hasMultiMaterial = hasMultiMat
+            )
             acc.startTriangleStream(scratchDir)
+            val colBis = if (hasCornerColors) BufferedInputStream(FileInputStream(cornerColorFile!!), IO_BUFFER_BYTES) else null
             try {
                 BufferedInputStream(FileInputStream(triIndexFile), IO_BUFFER_BYTES).use { bis ->
                     while (!acc.overflowed) {
-                        val n = bis.read(readBuf)
+                        val n = readUpToAligned(bis, readBuf, triBytes)
                         if (n <= 0) break
+                        val recs = n / triBytes
+                        val cRead = if (colBis != null) readExactOrLess(colBis, cColBuf, recs * 12) else 0
                         var off = 0
+                        var cOff = 0
                         while (off + triBytes <= n && !acc.overflowed) {
-                            val i0: Long; val i1: Long; val i2: Long
+                            val i0: Long; val i1: Long; val i2: Long; val mId: Int
                             if (indexIsLong) {
                                 i0 = readBB.getLong(off); i1 = readBB.getLong(off + 8); i2 = readBB.getLong(off + 16)
+                                mId = if (triHasMat) readBB.getInt(off + 24) else 0
                             } else {
                                 i0 = readBB.getInt(off).toLong(); i1 = readBB.getInt(off + 4).toLong(); i2 = readBB.getInt(off + 8).toLong()
+                                mId = if (triHasMat) readBB.getInt(off + 12) else 0
                             }
+                            val cc0 = if (cOff + 12 <= cRead) cColBB.getInt(cOff) else -1
+                            val cc1 = if (cOff + 12 <= cRead) cColBB.getInt(cOff + 4) else -1
+                            val cc2 = if (cOff + 12 <= cRead) cColBB.getInt(cOff + 8) else -1
                             off += triBytes
+                            cOff += 12
                             if (i0 !in 0L until totalVerts || i1 !in 0L until totalVerts || i2 !in 0L until totalVerts) continue
                             val x0 = positions.getX(i0); val y0 = positions.getY(i0); val z0 = positions.getZ(i0)
                             val x1 = positions.getX(i1); val y1 = positions.getY(i1); val z1 = positions.getZ(i1)
                             val x2 = positions.getX(i2); val y2 = positions.getY(i2); val z2 = positions.getZ(i2)
                             val (fnx, fny, fnz) = if (hasPerVertNorm) Triple(0f, 1f, 0f) else computeFaceNormal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
+
                             val c0 = acc.getOrAssignCluster(
                                 x0, y0, z0,
-                                if (hasPerVertNorm) normals.getX(i0) else fnx,
-                                if (hasPerVertNorm) normals.getY(i0) else fny,
-                                if (hasPerVertNorm) normals.getZ(i0) else fnz,
+                                if (hasPerVertNorm) normals!!.getX(i0) else fnx,
+                                if (hasPerVertNorm) normals!!.getY(i0) else fny,
+                                if (hasPerVertNorm) normals!!.getZ(i0) else fnz,
                                 if (uvs != null && i0 < uvs.count) uvs.getU(i0) else 0f,
-                                if (uvs != null && i0 < uvs.count) uvs.getV(i0) else 0f
+                                if (uvs != null && i0 < uvs.count) uvs.getV(i0) else 0f,
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc0, 0); colors != null -> colors.getR(i0); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc0, 8); colors != null -> colors.getG(i0); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc0, 16); colors != null -> colors.getB(i0); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc0, 24); colors != null -> colors.getA(i0); else -> 1f },
+                                mId
                             )
                             val c1 = acc.getOrAssignCluster(
                                 x1, y1, z1,
-                                if (hasPerVertNorm) normals.getX(i1) else fnx,
-                                if (hasPerVertNorm) normals.getY(i1) else fny,
-                                if (hasPerVertNorm) normals.getZ(i1) else fnz,
+                                if (hasPerVertNorm) normals!!.getX(i1) else fnx,
+                                if (hasPerVertNorm) normals!!.getY(i1) else fny,
+                                if (hasPerVertNorm) normals!!.getZ(i1) else fnz,
                                 if (uvs != null && i1 < uvs.count) uvs.getU(i1) else 0f,
-                                if (uvs != null && i1 < uvs.count) uvs.getV(i1) else 0f
+                                if (uvs != null && i1 < uvs.count) uvs.getV(i1) else 0f,
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc1, 0); colors != null -> colors.getR(i1); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc1, 8); colors != null -> colors.getG(i1); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc1, 16); colors != null -> colors.getB(i1); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc1, 24); colors != null -> colors.getA(i1); else -> 1f },
+                                mId
                             )
                             val c2 = acc.getOrAssignCluster(
                                 x2, y2, z2,
-                                if (hasPerVertNorm) normals.getX(i2) else fnx,
-                                if (hasPerVertNorm) normals.getY(i2) else fny,
-                                if (hasPerVertNorm) normals.getZ(i2) else fnz,
+                                if (hasPerVertNorm) normals!!.getX(i2) else fnx,
+                                if (hasPerVertNorm) normals!!.getY(i2) else fny,
+                                if (hasPerVertNorm) normals!!.getZ(i2) else fnz,
                                 if (uvs != null && i2 < uvs.count) uvs.getU(i2) else 0f,
-                                if (uvs != null && i2 < uvs.count) uvs.getV(i2) else 0f
+                                if (uvs != null && i2 < uvs.count) uvs.getV(i2) else 0f,
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc2, 0); colors != null -> colors.getR(i2); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc2, 8); colors != null -> colors.getG(i2); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc2, 16); colors != null -> colors.getB(i2); else -> 1f },
+                                when { hasCornerColors -> unpackLinearRgbaComp(cc2, 24); colors != null -> colors.getA(i2); else -> 1f },
+                                mId
                             )
-                            acc.addTriangle(c0, c1, c2)
+                            acc.addTriangle(c0, c1, c2, mId)
                         }
                     }
                 }
@@ -2484,7 +3187,8 @@ object StreamingMeshProcessor {
                     metallicFactor = metallicFactor,
                     roughnessFactor = roughnessFactor,
                     textureFile = textureFile,
-                    textureMime = textureMime
+                    textureMime = textureMime,
+                    materials = materials
                 )
                 return MeshStats(
                     originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
@@ -2496,6 +3200,7 @@ object StreamingMeshProcessor {
                     rawOriginalTriangles = totalTris
                 )
             } finally {
+                runCatching { colBis?.close() }
                 acc.cleanup()
             }
         }
@@ -2505,34 +3210,40 @@ object StreamingMeshProcessor {
         positions: MappedFloatTupleStore,
         normals: MappedFloatTupleStore,
         uvs: MappedFloatTupleStore,
+        colors: MappedFloatTupleStore?,
         triRecordFile: File,
         totalVerts: Long,
         totalTris: Long,
         bounds: MeshBounds,
         scratchDir: File,
-        outGlb: File
+        outGlb: File,
+        materials: List<GlbMaterialSpec>? = null
     ): MeshStats {
         positions.sealForRead()
         normals.sealForRead()
         uvs.sealForRead()
+        colors?.sealForRead()
 
+        val hasColors = colors != null && colors.count == positions.count
+        val hasMultiMat = (materials?.size ?: 0) > 1
         val totalN = normals.count
         val totalT = uvs.count
-        val recBytes = 72 // 9 Longs per triangle (v0,t0,n0, v1,t1,n1, v2,t2,n2)
+        val recBytes = 76 // 9 Longs (v0,t0,n0, v1,t1,n1, v2,t2,n2) + Int matId
         val readBuf = ByteArray(recBytes * 2048)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
 
         if (totalVerts <= DIRECT_TRIANGLE_LIMIT.toLong() && totalTris <= DIRECT_TRIANGLE_LIMIT.toLong()) {
-            DirectStreamingGlbWriter(scratchDir).use { writer ->
+            DirectStreamingGlbWriter(scratchDir, hasColors = hasColors, hasMultiMaterial = hasMultiMat).use { writer ->
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
                     while (true) {
-                        val n = bis.read(readBuf)
+                        val n = readUpToAligned(bis, readBuf, recBytes)
                         if (n <= 0) break
                         var off = 0
                         while (off + recBytes <= n) {
                             val v0 = readBB.getLong(off); val t0 = readBB.getLong(off + 8); val n0 = readBB.getLong(off + 16)
                             val v1 = readBB.getLong(off + 24); val t1 = readBB.getLong(off + 32); val n1 = readBB.getLong(off + 40)
                             val v2 = readBB.getLong(off + 48); val t2 = readBB.getLong(off + 56); val n2 = readBB.getLong(off + 64)
+                            val mId = readBB.getInt(off + 72)
                             off += recBytes
                             if (v0 !in 0L until totalVerts || v1 !in 0L until totalVerts || v2 !in 0L until totalVerts) continue
 
@@ -2547,7 +3258,11 @@ object StreamingMeshProcessor {
                                 if (n0 in 0L until totalN) normals.getY(n0) else fny,
                                 if (n0 in 0L until totalN) normals.getZ(n0) else fnz,
                                 if (t0 in 0L until totalT) uvs.getU(t0) else 0f,
-                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f
+                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f,
+                                if (hasColors) colors!!.getR(v0) else 1f,
+                                if (hasColors) colors!!.getG(v0) else 1f,
+                                if (hasColors) colors!!.getB(v0) else 1f,
+                                if (hasColors) colors!!.getA(v0) else 1f
                             )
                             val o1 = writer.emitVertex(
                                 x1, y1, z1,
@@ -2555,7 +3270,11 @@ object StreamingMeshProcessor {
                                 if (n1 in 0L until totalN) normals.getY(n1) else fny,
                                 if (n1 in 0L until totalN) normals.getZ(n1) else fnz,
                                 if (t1 in 0L until totalT) uvs.getU(t1) else 0f,
-                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f
+                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f,
+                                if (hasColors) colors!!.getR(v1) else 1f,
+                                if (hasColors) colors!!.getG(v1) else 1f,
+                                if (hasColors) colors!!.getB(v1) else 1f,
+                                if (hasColors) colors!!.getA(v1) else 1f
                             )
                             val o2 = writer.emitVertex(
                                 x2, y2, z2,
@@ -2563,13 +3282,17 @@ object StreamingMeshProcessor {
                                 if (n2 in 0L until totalN) normals.getY(n2) else fny,
                                 if (n2 in 0L until totalN) normals.getZ(n2) else fnz,
                                 if (t2 in 0L until totalT) uvs.getU(t2) else 0f,
-                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f
+                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f,
+                                if (hasColors) colors!!.getR(v2) else 1f,
+                                if (hasColors) colors!!.getG(v2) else 1f,
+                                if (hasColors) colors!!.getB(v2) else 1f,
+                                if (hasColors) colors!!.getA(v2) else 1f
                             )
-                            writer.emitTriangle(o0, o1, o2)
+                            writer.emitTriangle(o0, o1, o2, mId)
                         }
                     }
                 }
-                writer.finalizeToGlb(outGlb, "MixedReality Streaming OBJ Engine")
+                writer.finalizeToGlb(outGlb, "MixedReality Streaming OBJ Engine", materials = materials)
                 return MeshStats(
                     originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
@@ -2586,18 +3309,25 @@ object StreamingMeshProcessor {
         var gridRes = estimateInitialGridResolution(totalTris)
         while (true) {
             val isFloor = gridRes <= 64
-            val acc = SpatialClusterAccumulator(bounds, gridRes, forceNoOverflowFallback = isFloor)
+            val acc = SpatialClusterAccumulator(
+                bounds = bounds,
+                gridResolution = gridRes,
+                forceNoOverflowFallback = isFloor,
+                hasColors = hasColors,
+                hasMultiMaterial = hasMultiMat
+            )
             acc.startTriangleStream(scratchDir)
             try {
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
                     while (!acc.overflowed) {
-                        val n = bis.read(readBuf)
+                        val n = readUpToAligned(bis, readBuf, recBytes)
                         if (n <= 0) break
                         var off = 0
                         while (off + recBytes <= n && !acc.overflowed) {
                             val v0 = readBB.getLong(off); val t0 = readBB.getLong(off + 8); val n0 = readBB.getLong(off + 16)
                             val v1 = readBB.getLong(off + 24); val t1 = readBB.getLong(off + 32); val n1 = readBB.getLong(off + 40)
                             val v2 = readBB.getLong(off + 48); val t2 = readBB.getLong(off + 56); val n2 = readBB.getLong(off + 64)
+                            val mId = readBB.getInt(off + 72)
                             off += recBytes
                             if (v0 !in 0L until totalVerts || v1 !in 0L until totalVerts || v2 !in 0L until totalVerts) continue
 
@@ -2612,7 +3342,12 @@ object StreamingMeshProcessor {
                                 if (n0 in 0L until totalN) normals.getY(n0) else fny,
                                 if (n0 in 0L until totalN) normals.getZ(n0) else fnz,
                                 if (t0 in 0L until totalT) uvs.getU(t0) else 0f,
-                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f
+                                if (t0 in 0L until totalT) uvs.getV(t0) else 0f,
+                                if (hasColors) colors!!.getR(v0) else 1f,
+                                if (hasColors) colors!!.getG(v0) else 1f,
+                                if (hasColors) colors!!.getB(v0) else 1f,
+                                if (hasColors) colors!!.getA(v0) else 1f,
+                                mId
                             )
                             val c1 = acc.getOrAssignCluster(
                                 x1, y1, z1,
@@ -2620,7 +3355,12 @@ object StreamingMeshProcessor {
                                 if (n1 in 0L until totalN) normals.getY(n1) else fny,
                                 if (n1 in 0L until totalN) normals.getZ(n1) else fnz,
                                 if (t1 in 0L until totalT) uvs.getU(t1) else 0f,
-                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f
+                                if (t1 in 0L until totalT) uvs.getV(t1) else 0f,
+                                if (hasColors) colors!!.getR(v1) else 1f,
+                                if (hasColors) colors!!.getG(v1) else 1f,
+                                if (hasColors) colors!!.getB(v1) else 1f,
+                                if (hasColors) colors!!.getA(v1) else 1f,
+                                mId
                             )
                             val c2 = acc.getOrAssignCluster(
                                 x2, y2, z2,
@@ -2628,9 +3368,14 @@ object StreamingMeshProcessor {
                                 if (n2 in 0L until totalN) normals.getY(n2) else fny,
                                 if (n2 in 0L until totalN) normals.getZ(n2) else fnz,
                                 if (t2 in 0L until totalT) uvs.getU(t2) else 0f,
-                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f
+                                if (t2 in 0L until totalT) uvs.getV(t2) else 0f,
+                                if (hasColors) colors!!.getR(v2) else 1f,
+                                if (hasColors) colors!!.getG(v2) else 1f,
+                                if (hasColors) colors!!.getB(v2) else 1f,
+                                if (hasColors) colors!!.getA(v2) else 1f,
+                                mId
                             )
-                            acc.addTriangle(c0, c1, c2)
+                            acc.addTriangle(c0, c1, c2, mId)
                         }
                     }
                 }
@@ -2641,7 +3386,7 @@ object StreamingMeshProcessor {
                 }
                 val outVerts = acc.clusterCount
                 val outTris = acc.emittedTriangles
-                acc.writeToGlb(outGlb)
+                acc.writeToGlb(outGlb, materials = materials)
                 return MeshStats(
                     originalVertices = totalVerts.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                     originalTriangles = totalTris.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
@@ -2655,6 +3400,248 @@ object StreamingMeshProcessor {
                 acc.cleanup()
             }
         }
+    }
+
+    // =========================================================================
+    // OBJ + MTL, 3MF & Companion Texture Parsing Helpers
+    // =========================================================================
+
+    internal class ObjMtlLibrary {
+        val matIndexByName = LinkedHashMap<String, Int>()
+        val specs = mutableListOf<GlbMaterialSpec>()
+        var parsedCount = 0
+
+        fun getOrReserveId(name: String): Int {
+            val clean = name.trim()
+            return matIndexByName.getOrPut(clean) {
+                val id = specs.size
+                specs.add(GlbMaterialSpec())
+                id
+            }
+        }
+    }
+
+    internal fun parseMtlReferencesIntoLibrary(
+        mtlListRaw: String,
+        objDir: File?,
+        scratchDir: File,
+        lib: ObjMtlLibrary
+    ): Int {
+        if (objDir == null) return 0
+        var loaded = 0
+        val clean = mtlListRaw.trim()
+        val direct = findCompanionAssetFile(objDir, clean)
+        if (direct != null) {
+            parseMtlFileIntoLibrary(direct, objDir, scratchDir, lib)
+            loaded++
+        } else {
+            for (tok in clean.split(Regex("\\s+"))) {
+                val cand = findCompanionAssetFile(objDir, tok)
+                if (cand != null) {
+                    parseMtlFileIntoLibrary(cand, objDir, scratchDir, lib)
+                    loaded++
+                }
+            }
+        }
+        return loaded
+    }
+
+    internal fun parseMtlFileIntoLibrary(
+        mtlFile: File,
+        objDir: File?,
+        scratchDir: File,
+        lib: ObjMtlLibrary
+    ) {
+        if (!mtlFile.exists() || !mtlFile.isFile) return
+        val texCache = HashMap<String, Pair<File, String>?>()
+
+        var curIdx = -1
+        var kd = floatArrayOf(1f, 1f, 1f, 1f)
+        var hasKd = false
+        var ke: FloatArray? = null
+        var metallic = 0.1f
+        var roughness = 0.7f
+        var alpha = 1f
+        var texFile: File? = null
+        var texMime: String? = null
+
+        fun commitCurrent() {
+            if (curIdx < 0) return
+            val hasTex = texFile != null && !texMime.isNullOrBlank()
+            val finalBase = if (hasTex && (!hasKd || (kd[0] < 0.005f && kd[1] < 0.005f && kd[2] < 0.005f))) {
+                floatArrayOf(1f, 1f, 1f, alpha)
+            } else {
+                floatArrayOf(kd[0], kd[1], kd[2], alpha)
+            }
+            lib.specs[curIdx] = GlbMaterialSpec(
+                baseColorFactor = finalBase,
+                metallicFactor = metallic,
+                roughnessFactor = roughness,
+                emissiveFactor = ke,
+                doubleSided = true,
+                alphaMode = if (alpha < 0.99f) "BLEND" else "OPAQUE",
+                unlit = false,
+                textureFile = texFile,
+                textureMime = texMime
+            )
+            lib.parsedCount++
+        }
+
+        fun stripMtlTexOptions(rawArg: String): String {
+            val toks = rawArg.trim().split(Regex("\\s+"))
+            var i = 0
+            while (i < toks.size) {
+                val t = toks[i]
+                when (t.lowercase(Locale.US)) {
+                    "-o", "-s", "-t" -> i += 4
+                    "-mm" -> i += 3
+                    "-bm", "-imfchan", "-clamp", "-blendu", "-blendv", "-texres", "-type", "-boost" -> i += 2
+                    else -> {
+                        if (t.startsWith("-")) i++ else break
+                    }
+                }
+            }
+            return if (i < toks.size) toks.subList(i, toks.size).joinToString(" ").trim('"', '\'') else rawArg.trim('"', '\'')
+        }
+
+        runCatching {
+            mtlFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                for (raw in lines) {
+                    val line = raw.trim()
+                    if (line.isEmpty() || line.startsWith("#")) continue
+                    val sp = line.indexOfFirst { it <= ' ' }
+                    val key = (if (sp < 0) line else line.substring(0, sp)).lowercase(Locale.US)
+                    val arg = if (sp < 0) "" else line.substring(sp + 1).trim()
+                    when (key) {
+                        "newmtl" -> {
+                            commitCurrent()
+                            curIdx = lib.getOrReserveId(arg.ifBlank { "default" })
+                            kd = floatArrayOf(1f, 1f, 1f, 1f)
+                            hasKd = false
+                            ke = null
+                            metallic = 0.1f
+                            roughness = 0.7f
+                            alpha = 1f
+                            texFile = null
+                            texMime = null
+                        }
+                        "kd" -> if (curIdx >= 0) {
+                            val parts = arg.split(Regex("\\s+"))
+                            if (parts.size >= 3) {
+                                val r = parts[0].toFloatOrNull() ?: 1f
+                                val g = parts[1].toFloatOrNull() ?: 1f
+                                val b = parts[2].toFloatOrNull() ?: 1f
+                                kd = floatArrayOf(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b), alpha)
+                                hasKd = true
+                            }
+                        }
+                        "ke" -> if (curIdx >= 0) {
+                            val parts = arg.split(Regex("\\s+"))
+                            if (parts.size >= 3) {
+                                val r = parts[0].toFloatOrNull() ?: 0f
+                                val g = parts[1].toFloatOrNull() ?: 0f
+                                val b = parts[2].toFloatOrNull() ?: 0f
+                                ke = floatArrayOf(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b))
+                            }
+                        }
+                        "d" -> if (curIdx >= 0) {
+                            alpha = (arg.toFloatOrNull() ?: 1f).coerceIn(0f, 1f)
+                        }
+                        "tr" -> if (curIdx >= 0) {
+                            alpha = (1f - (arg.toFloatOrNull() ?: 0f)).coerceIn(0f, 1f)
+                        }
+                        "ns" -> if (curIdx >= 0) {
+                            val ns = (arg.toFloatOrNull() ?: 25f).coerceAtLeast(0f)
+                            roughness = sqrt(2f / (ns + 2f)).coerceIn(0.08f, 1f)
+                        }
+                        "pr" -> if (curIdx >= 0) {
+                            roughness = (arg.toFloatOrNull() ?: 0.7f).coerceIn(0.05f, 1f)
+                        }
+                        "pm" -> if (curIdx >= 0) {
+                            metallic = (arg.toFloatOrNull() ?: 0.1f).coerceIn(0f, 1f)
+                        }
+                        "map_kd" -> if (curIdx >= 0 && texFile == null) {
+                            val texRel = stripMtlTexOptions(arg)
+                            val resolved = texCache.getOrPut(texRel) {
+                                val found = findCompanionAssetFile(mtlFile.parentFile, texRel)
+                                    ?: findCompanionAssetFile(objDir, texRel)
+                                found?.let { prepareMobileTextureFile(scratchDir, it, maxEdge = 1536) }
+                            }
+                            if (resolved != null) {
+                                texFile = resolved.first
+                                texMime = resolved.second
+                            }
+                        }
+                    }
+                }
+                commitCurrent()
+            }
+        }
+    }
+
+    internal fun findCompanionAssetFile(baseDir: File?, relOrName: String): File? {
+        if (baseDir == null || !baseDir.exists()) return null
+        val clean = relOrName.trim().trim('"', '\'').replace('\\', '/')
+        if (clean.isEmpty()) return null
+        val direct = File(baseDir, clean)
+        if (direct.exists() && direct.isFile) return direct
+        val baseName = clean.substringAfterLast('/')
+        val sibling = File(baseDir, baseName)
+        if (sibling.exists() && sibling.isFile) return sibling
+
+        // Case-insensitive search up to depth 2 (common for textures/ folders or Windows-authored exports)
+        fun walk(dir: File, depth: Int): File? {
+            val children = dir.listFiles() ?: return null
+            for (c in children) {
+                if (c.isFile && c.name.equals(baseName, ignoreCase = true)) return c
+            }
+            if (depth < 2) {
+                for (c in children) {
+                    if (c.isDirectory) {
+                        val hit = walk(c, depth + 1)
+                        if (hit != null) return hit
+                    }
+                }
+            }
+            return null
+        }
+        return walk(baseDir, 0)
+    }
+
+    private fun parseHexSrgbToPackedLinearRgba(hexRaw: String?): Int {
+        val hex = hexRaw?.trim()?.removePrefix("#") ?: return -1
+        if (hex.length != 6 && hex.length != 8) return -1
+        val r = hex.substring(0, 2).toIntOrNull(16)?.div(255f) ?: 1f
+        val g = hex.substring(2, 4).toIntOrNull(16)?.div(255f) ?: 1f
+        val b = hex.substring(4, 6).toIntOrNull(16)?.div(255f) ?: 1f
+        val a = if (hex.length == 8) (hex.substring(6, 8).toIntOrNull(16)?.div(255f) ?: 1f) else 1f
+        val rb = (srgbToLinear(r) * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val gb = (srgbToLinear(g) * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val bb = (srgbToLinear(b) * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val ab = (a.coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255)
+        return rb or (gb shl 8) or (bb shl 16) or (ab shl 24)
+    }
+
+    private fun readUpToAligned(bis: InputStream, buf: ByteArray, recBytes: Int): Int {
+        val maxBytes = (buf.size / recBytes) * recBytes
+        var total = 0
+        while (total < maxBytes) {
+            val n = bis.read(buf, total, maxBytes - total)
+            if (n < 0) break
+            total += n
+        }
+        return (total / recBytes) * recBytes
+    }
+
+    private fun readExactOrLess(bis: InputStream, buf: ByteArray, targetBytes: Int): Int {
+        var total = 0
+        val cap = minOf(targetBytes, buf.size)
+        while (total < cap) {
+            val n = bis.read(buf, total, cap - total)
+            if (n < 0) break
+            total += n
+        }
+        return total
     }
 
     // =========================================================================
@@ -2676,12 +3663,15 @@ object StreamingMeshProcessor {
         val xIdx: Int, val yIdx: Int, val zIdx: Int,
         val nxIdx: Int, val nyIdx: Int, val nzIdx: Int,
         val uIdx: Int, val vIdx: Int,
+        val rIdx: Int, val gIdx: Int, val bIdx: Int, val aIdx: Int,
         val props: List<PlyVertexProp>,
         val faceListCountType: PlyPropType,
-        val faceListIndexType: PlyPropType
+        val faceListIndexType: PlyPropType,
+        val textureFiles: List<String>
     ) {
         val hasNormals: Boolean get() = nxIdx >= 0 && nyIdx >= 0 && nzIdx >= 0
         val hasUvs: Boolean get() = uIdx >= 0 && vIdx >= 0
+        val hasColors: Boolean get() = rIdx >= 0 && gIdx >= 0 && bIdx >= 0
     }
 
     private data class DiskTriStream(val file: File, val count: Long, val indexIsLong: Boolean) {
@@ -2713,9 +3703,18 @@ object StreamingMeshProcessor {
             var stride = 0
             var faceCountType = PlyPropType.UCHAR
             var faceIdxType = PlyPropType.INT
+            var hasFaceIndexList = false
+            val texFiles = mutableListOf<String>()
 
             for (line in lines) {
-                if (line.isEmpty() || line.startsWith("comment") || line.startsWith("obj_info")) continue
+                if (line.isEmpty() || line.startsWith("obj_info")) continue
+                if (line.startsWith("comment")) {
+                    val parts = line.split(Regex("\\s+"), limit = 3)
+                    if (parts.size >= 3 && parts[1].equals("TextureFile", ignoreCase = true)) {
+                        texFiles.add(parts[2].trim())
+                    }
+                    continue
+                }
                 val parts = line.split(Regex("\\s+"))
                 when (parts[0]) {
                     "format" -> {
@@ -2743,9 +3742,13 @@ object StreamingMeshProcessor {
                             val t = parsePlyType(parts[1]) ?: return null
                             props.add(PlyVertexProp(parts.last().lowercase(Locale.US), t, stride))
                             stride += t.byteSize
-                        } else if (currentElement == "face" && parts.size >= 5 && parts[1] == "list") {
-                            faceCountType = parsePlyType(parts[2]) ?: PlyPropType.UCHAR
-                            faceIdxType = parsePlyType(parts[3]) ?: PlyPropType.INT
+                        } else if (currentElement == "face" && parts.size >= 5 && parts[1] == "list" && !hasFaceIndexList) {
+                            val pName = parts.last().lowercase(Locale.US)
+                            if (pName.contains("vertex") || pName == "indices") {
+                                faceCountType = parsePlyType(parts[2]) ?: PlyPropType.UCHAR
+                                faceIdxType = parsePlyType(parts[3]) ?: PlyPropType.INT
+                                hasFaceIndexList = true
+                            }
                         }
                     }
                     "end_header" -> break
@@ -2759,6 +3762,10 @@ object StreamingMeshProcessor {
             if (xIdx < 0 || yIdx < 0 || zIdx < 0) return null
             val nxIdx = findProp("nx"); val nyIdx = findProp("ny"); val nzIdx = findProp("nz")
             val uIdx = findProp("s", "u", "texture_u"); val vIdx = findProp("t", "v", "texture_v")
+            val rIdx = findProp("red", "r", "diffuse_red", "ambient_red")
+            val gIdx = findProp("green", "g", "diffuse_green", "ambient_green")
+            val bIdx = findProp("blue", "b", "diffuse_blue", "ambient_blue")
+            val aIdx = findProp("alpha", "a", "diffuse_alpha", "opacity")
 
             return PlyHeader(
                 format = format,
@@ -2769,9 +3776,11 @@ object StreamingMeshProcessor {
                 xIdx = xIdx, yIdx = yIdx, zIdx = zIdx,
                 nxIdx = nxIdx, nyIdx = nyIdx, nzIdx = nzIdx,
                 uIdx = uIdx, vIdx = vIdx,
+                rIdx = rIdx, gIdx = gIdx, bIdx = bIdx, aIdx = aIdx,
                 props = props,
                 faceListCountType = faceCountType,
-                faceListIndexType = faceIdxType
+                faceListIndexType = faceIdxType,
+                textureFiles = texFiles
             )
         }
     }
@@ -2788,12 +3797,20 @@ object StreamingMeshProcessor {
         else -> null
     }
 
+    private fun normalizePlyColorComp(raw: Float, type: PlyPropType): Float = when (type) {
+        PlyPropType.UCHAR, PlyPropType.CHAR -> (raw / 255f).coerceIn(0f, 1f)
+        PlyPropType.USHORT, PlyPropType.SHORT -> (raw / 65535f).coerceIn(0f, 1f)
+        PlyPropType.INT, PlyPropType.UINT -> (raw / 255f).coerceIn(0f, 1f)
+        PlyPropType.FLOAT, PlyPropType.DOUBLE -> (if (raw > 1.01f) raw / 255f else raw).coerceIn(0f, 1f)
+    }
+
     private fun streamPlyGeometryAndFaces(
         plyFile: File,
         header: PlyHeader,
         positions: MappedFloatTupleStore,
         normals: MappedFloatTupleStore?,
         uvs: MappedFloatTupleStore?,
+        colors: MappedFloatTupleStore?,
         bounds: MeshBounds,
         scratchDir: File
     ): DiskTriStream {
@@ -2810,6 +3827,10 @@ object StreamingMeshProcessor {
                 var tokEnds = IntArray(64)
                 var vi = 0L
                 val maxNeededCoordIdx = max(header.xIdx, max(header.yIdx, header.zIdx))
+                val rType = if (header.hasColors) header.props[header.rIdx].type else PlyPropType.UCHAR
+                val gType = if (header.hasColors) header.props[header.gIdx].type else PlyPropType.UCHAR
+                val bType = if (header.hasColors) header.props[header.bIdx].type else PlyPropType.UCHAR
+                val aType = if (header.aIdx >= 0) header.props[header.aIdx].type else PlyPropType.UCHAR
 
                 while (vi < header.vertexCount) {
                     val line = reader.readLine() ?: break
@@ -2845,7 +3866,14 @@ object StreamingMeshProcessor {
                     if (uvs != null) {
                         val u = if (header.uIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.uIdx], tokEnds[header.uIdx]) else 0f
                         val v = if (header.vIdx in 0 until tCount) parseFastFloat(line, tokStarts[header.vIdx], tokEnds[header.vIdx]) else 0f
-                        uvs.add2(u, v)
+                        uvs.add2(u, 1f - v)
+                    }
+                    if (colors != null) {
+                        val rr = if (header.rIdx in 0 until tCount) normalizePlyColorComp(parseFastFloat(line, tokStarts[header.rIdx], tokEnds[header.rIdx]), rType) else 1f
+                        val gg = if (header.gIdx in 0 until tCount) normalizePlyColorComp(parseFastFloat(line, tokStarts[header.gIdx], tokEnds[header.gIdx]), gType) else 1f
+                        val bb = if (header.bIdx in 0 until tCount) normalizePlyColorComp(parseFastFloat(line, tokStarts[header.bIdx], tokEnds[header.bIdx]), bType) else 1f
+                        val aa = if (header.aIdx in 0 until tCount) normalizePlyColorComp(parseFastFloat(line, tokStarts[header.aIdx], tokEnds[header.aIdx]), aType) else 1f
+                        colors.add4(srgbToLinear(rr), srgbToLinear(gg), srgbToLinear(bb), aa)
                     }
                 }
 
@@ -2887,6 +3915,10 @@ object StreamingMeshProcessor {
                 val nzP = if (header.hasNormals) header.props[header.nzIdx] else null
                 val uP = if (header.hasUvs) header.props[header.uIdx] else null
                 val vP = if (header.hasUvs) header.props[header.vIdx] else null
+                val rP = if (header.hasColors) header.props[header.rIdx] else null
+                val gP = if (header.hasColors) header.props[header.gIdx] else null
+                val bP = if (header.hasColors) header.props[header.bIdx] else null
+                val aP = if (header.aIdx >= 0) header.props[header.aIdx] else null
 
                 var vi = 0L
                 while (vi < header.vertexCount) {
@@ -2900,7 +3932,14 @@ object StreamingMeshProcessor {
                         normals.add3(readPlyFloat(vBB, nxP), readPlyFloat(vBB, nyP), readPlyFloat(vBB, nzP))
                     }
                     if (uvs != null && uP != null && vP != null) {
-                        uvs.add2(readPlyFloat(vBB, uP), readPlyFloat(vBB, vP))
+                        uvs.add2(readPlyFloat(vBB, uP), 1f - readPlyFloat(vBB, vP))
+                    }
+                    if (colors != null && rP != null && gP != null && bP != null) {
+                        val rr = normalizePlyColorComp(readPlyFloat(vBB, rP), rP.type)
+                        val gg = normalizePlyColorComp(readPlyFloat(vBB, gP), gP.type)
+                        val bb = normalizePlyColorComp(readPlyFloat(vBB, bP), bP.type)
+                        val aa = if (aP != null) normalizePlyColorComp(readPlyFloat(vBB, aP), aP.type) else 1f
+                        colors.add4(srgbToLinear(rr), srgbToLinear(gg), srgbToLinear(bb), aa)
                     }
                     vi++
                 }
@@ -2974,67 +4013,412 @@ object StreamingMeshProcessor {
         else -> n.toString()
     }
 
-    private fun buildStandardGlbJson(
+    private data class EmbeddedTextureLayout(
+        val file: File,
+        val mime: String,
+        val bytes: ByteArray,
+        val byteOffset: Long,
+        val prePad: Int
+    )
+
+    private data class IndexGroupLayout(
+        val matId: Int,
+        val outMatIndex: Int,
+        val triCount: Int,
+        val byteOffset: Long,
+        val byteLength: Long,
+        val prePad: Int
+    )
+
+    private data class GroupedGlbLayoutPlan(
+        val materials: List<GlbMaterialSpec>,
+        val hasMaterials: Boolean,
+        val hasColors: Boolean,
+        val indexGroups: List<IndexGroupLayout>,
+        val textures: List<EmbeddedTextureLayout>,
+        val matToTexIndex: IntArray,
+        val totalBinBytes: Long,
+        val binPadding: Int,
+        val paddedBinBytes: Long
+    )
+
+    private fun resolveMaterialList(
+        materials: List<GlbMaterialSpec>?,
+        baseColorFactor: FloatArray?,
+        metallicFactor: Float,
+        roughnessFactor: Float,
+        textureFile: File?,
+        textureMime: String?,
+        hasColors: Boolean
+    ): List<GlbMaterialSpec> {
+        if (!materials.isNullOrEmpty()) return materials
+        if (baseColorFactor != null || (textureFile != null && !textureMime.isNullOrBlank())) {
+            return listOf(
+                GlbMaterialSpec(
+                    baseColorFactor = baseColorFactor ?: floatArrayOf(1f, 1f, 1f, 1f),
+                    metallicFactor = metallicFactor,
+                    roughnessFactor = roughnessFactor,
+                    textureFile = textureFile,
+                    textureMime = textureMime
+                )
+            )
+        }
+        if (hasColors) {
+            return listOf(
+                GlbMaterialSpec(
+                    baseColorFactor = floatArrayOf(1f, 1f, 1f, 1f),
+                    metallicFactor = metallicFactor,
+                    roughnessFactor = roughnessFactor
+                )
+            )
+        }
+        return emptyList()
+    }
+
+    private fun planGroupedGlbLayout(
         vertCount: Int,
-        indexCount: Int,
+        vertDataBytes: Long,
+        hasColors: Boolean,
         useIntIndices: Boolean,
+        triFile: File?,
+        hasMatInTri: Boolean,
+        totalTriangles: Int,
+        materials: List<GlbMaterialSpec>
+    ): GroupedGlbLayoutPlan {
+        val matCount = materials.size.coerceAtLeast(1)
+        val counts = IntArray(matCount)
+        if (!hasMatInTri || matCount <= 1 || triFile == null || !triFile.exists()) {
+            counts[0] = totalTriangles
+        } else {
+            val buf = ByteArray(16 * 4096)
+            val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+            BufferedInputStream(FileInputStream(triFile), IO_BUFFER_BYTES).use { bis ->
+                while (true) {
+                    val n = readUpToAligned(bis, buf, 16)
+                    if (n <= 0) break
+                    var off = 0
+                    while (off + 16 <= n) {
+                        val m = bb.getInt(off + 12).let { if (it in 0 until matCount) it else 0 }
+                        counts[m]++
+                        off += 16
+                    }
+                }
+            }
+        }
+
+        val activeMatIds = ArrayList<Int>(matCount)
+        for (i in 0 until matCount) {
+            if (counts[i] > 0) activeMatIds.add(i)
+        }
+        if (activeMatIds.isEmpty() && totalTriangles > 0) {
+            activeMatIds.add(0)
+            counts[0] = totalTriangles
+        }
+
+        var cursor = vertDataBytes
+        val idxElemBytes = if (useIntIndices) 4L else 2L
+        val groups = ArrayList<IndexGroupLayout>(activeMatIds.size)
+        for ((outIdx, mId) in activeMatIds.withIndex()) {
+            val prePad = ((4L - (cursor % 4L)) % 4L).toInt()
+            cursor += prePad
+            val bLen = counts[mId].toLong() * 3L * idxElemBytes
+            groups.add(
+                IndexGroupLayout(
+                    matId = mId,
+                    outMatIndex = if (materials.isEmpty()) -1 else mId,
+                    triCount = counts[mId],
+                    byteOffset = cursor,
+                    byteLength = bLen,
+                    prePad = prePad
+                )
+            )
+            cursor += bLen
+        }
+
+        val texList = ArrayList<EmbeddedTextureLayout>()
+        val texIdxByPath = HashMap<String, Int>()
+        val matToTex = IntArray(materials.size) { -1 }
+        var totalTexBytes = 0L
+        val maxTotalTexBytes = 56L * 1024L * 1024L
+
+        for ((mIdx, mat) in materials.withIndex()) {
+            val tf = mat.textureFile
+            val mime = mat.textureMime
+            if (tf != null && !mime.isNullOrBlank() && tf.exists() && tf.length() in 1L..24_000_000L) {
+                val key = runCatching { tf.canonicalPath }.getOrElse { tf.absolutePath }
+                val existing = texIdxByPath[key]
+                if (existing != null) {
+                    matToTex[mIdx] = existing
+                } else if (totalTexBytes + tf.length() <= maxTotalTexBytes) {
+                    val raw = runCatching { tf.readBytes() }.getOrNull()
+                    if (raw != null && raw.isNotEmpty()) {
+                        val prePad = ((4L - (cursor % 4L)) % 4L).toInt()
+                        cursor += prePad
+                        val tIdx = texList.size
+                        texList.add(EmbeddedTextureLayout(tf, mime, raw, cursor, prePad))
+                        texIdxByPath[key] = tIdx
+                        matToTex[mIdx] = tIdx
+                        cursor += raw.size.toLong()
+                        totalTexBytes += raw.size.toLong()
+                    }
+                }
+            }
+        }
+
+        val totalBin = cursor
+        val binPadding = ((4L - (totalBin % 4L)) % 4L).toInt()
+        return GroupedGlbLayoutPlan(
+            materials = materials,
+            hasMaterials = materials.isNotEmpty(),
+            hasColors = hasColors,
+            indexGroups = groups,
+            textures = texList,
+            matToTexIndex = matToTex,
+            totalBinBytes = totalBin,
+            binPadding = binPadding,
+            paddedBinBytes = totalBin + binPadding
+        )
+    }
+
+    private fun buildMultiMaterialGlbJson(
+        vertCount: Int,
         posByteLength: Long,
         normByteLength: Long,
         uvByteLength: Long,
-        indexByteLength: Long,
-        totalBinaryLength: Long,
+        colorByteLength: Long,
+        useIntIndices: Boolean,
         bounds: MeshBounds,
         generator: String,
-        baseColorFactor: FloatArray? = null,
-        metallicFactor: Float = 0.1f,
-        roughnessFactor: Float = 0.7f,
-        textureOffset: Long = 0L,
-        textureByteLength: Int = 0,
-        textureMimeType: String? = null
+        plan: GroupedGlbLayoutPlan
     ): ByteArray {
-        val hasMat = baseColorFactor != null || textureByteLength > 0
-        val hasTex = textureByteLength > 0 && !textureMimeType.isNullOrBlank()
-        val sb = StringBuilder(1024)
+        val sb = StringBuilder(2048)
         sb.append('{')
         sb.append("\"asset\":{\"version\":\"2.0\",\"generator\":\"").append(generator).append("\"},")
+        if (plan.materials.any { it.unlit }) {
+            sb.append("\"extensionsUsed\":[\"KHR_materials_unlit\"],")
+        }
         sb.append("\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],")
-        sb.append("\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"mode\":4")
-        if (hasMat) sb.append(",\"material\":0")
-        sb.append("}]}],")
-        if (hasMat) {
-            val c = baseColorFactor ?: floatArrayOf(1f, 1f, 1f, 1f)
-            sb.append("\"materials\":[{\"pbrMetallicRoughness\":{")
-            sb.append("\"baseColorFactor\":[")
-                .append(c[0]).append(',').append(c[1]).append(',').append(c[2]).append(',').append(if (c.size > 3) c[3] else 1f)
-                .append("],")
-            if (hasTex) sb.append("\"baseColorTexture\":{\"index\":0},")
-            sb.append("\"metallicFactor\":").append(metallicFactor)
-            sb.append(",\"roughnessFactor\":").append(roughnessFactor)
-            sb.append("},\"doubleSided\":true}],")
+
+        val colorAttrIdx = if (plan.hasColors) 3 else -1
+        val firstIndexAccessorIdx = if (plan.hasColors) 4 else 3
+        val idxCompType = if (useIntIndices) 5125 else 5123
+
+        sb.append("\"meshes\":[{\"primitives\":[")
+        for ((gIdx, grp) in plan.indexGroups.withIndex()) {
+            if (gIdx > 0) sb.append(',')
+            sb.append("{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2")
+            if (colorAttrIdx >= 0) sb.append(",\"COLOR_0\":").append(colorAttrIdx)
+            sb.append("},\"indices\":").append(firstIndexAccessorIdx + gIdx).append(",\"mode\":4")
+            if (plan.hasMaterials && grp.outMatIndex >= 0) {
+                sb.append(",\"material\":").append(grp.outMatIndex)
+            }
+            sb.append('}')
         }
-        if (hasTex) {
-            sb.append("\"textures\":[{\"sampler\":0,\"source\":0}],")
-            sb.append("\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}],")
-            sb.append("\"images\":[{\"bufferView\":4,\"mimeType\":\"").append(textureMimeType).append("\"}],")
+        sb.append("]}],")
+
+        if (plan.hasMaterials) {
+            sb.append("\"materials\":[")
+            for ((mIdx, mat) in plan.materials.withIndex()) {
+                if (mIdx > 0) sb.append(',')
+                val c = mat.baseColorFactor
+                val texIdx = plan.matToTexIndex.getOrElse(mIdx) { -1 }
+                sb.append("{\"pbrMetallicRoughness\":{")
+                sb.append("\"baseColorFactor\":[")
+                    .append(c.getOrElse(0) { 1f }).append(',')
+                    .append(c.getOrElse(1) { 1f }).append(',')
+                    .append(c.getOrElse(2) { 1f }).append(',')
+                    .append(c.getOrElse(3) { 1f }).append("],")
+                if (texIdx >= 0) sb.append("\"baseColorTexture\":{\"index\":").append(texIdx).append("},")
+                sb.append("\"metallicFactor\":").append(mat.metallicFactor.coerceIn(0f, 1f))
+                sb.append(",\"roughnessFactor\":").append(mat.roughnessFactor.coerceIn(0.05f, 1f))
+                sb.append('}')
+                val em = mat.emissiveFactor
+                if (em != null && em.size >= 3 && (em[0] > 0.001f || em[1] > 0.001f || em[2] > 0.001f)) {
+                    sb.append(",\"emissiveFactor\":[").append(em[0]).append(',').append(em[1]).append(',').append(em[2]).append(']')
+                }
+                if (mat.alphaMode != "OPAQUE") {
+                    sb.append(",\"alphaMode\":\"").append(mat.alphaMode).append('"')
+                }
+                if (mat.doubleSided) sb.append(",\"doubleSided\":true")
+                if (mat.unlit) sb.append(",\"extensions\":{\"KHR_materials_unlit\":{}}")
+                sb.append('}')
+            }
+            sb.append("],")
         }
+
+        val firstTexBvIdx = firstIndexAccessorIdx + plan.indexGroups.size
+        if (plan.textures.isNotEmpty()) {
+            sb.append("\"textures\":[")
+            for (t in plan.textures.indices) {
+                if (t > 0) sb.append(',')
+                sb.append("{\"sampler\":0,\"source\":").append(t).append('}')
+            }
+            sb.append("],\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}],")
+            sb.append("\"images\":[")
+            for ((t, tex) in plan.textures.withIndex()) {
+                if (t > 0) sb.append(',')
+                sb.append("{\"bufferView\":").append(firstTexBvIdx + t).append(",\"mimeType\":\"").append(tex.mime).append("\"}")
+            }
+            sb.append("],")
+        }
+
+        // Accessors: POSITION, NORMAL, TEXCOORD_0, [COLOR_0], indices[0..G-1]
         sb.append("\"accessors\":[")
         sb.append("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount)
             .append(",\"type\":\"VEC3\",\"max\":[").append(bounds.maxX).append(',').append(bounds.maxY).append(',').append(bounds.maxZ)
             .append("],\"min\":[").append(bounds.minX).append(',').append(bounds.minY).append(',').append(bounds.minZ).append("]},")
         sb.append("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount).append(",\"type\":\"VEC3\"},")
-        sb.append("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount).append(",\"type\":\"VEC2\"},")
-        sb.append("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":").append(if (useIntIndices) 5125 else 5123)
-            .append(",\"count\":").append(indexCount).append(",\"type\":\"SCALAR\"}],")
-        sb.append("\"bufferViews\":[")
+        sb.append("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":").append(vertCount).append(",\"type\":\"VEC2\"}")
+        if (plan.hasColors) {
+            sb.append(",{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5121,\"normalized\":true,\"count\":").append(vertCount).append(",\"type\":\"VEC4\"}")
+        }
+        for ((gIdx, grp) in plan.indexGroups.withIndex()) {
+            val bvIdx = firstIndexAccessorIdx + gIdx
+            sb.append(",{\"bufferView\":").append(bvIdx)
+                .append(",\"byteOffset\":0,\"componentType\":").append(idxCompType)
+                .append(",\"count\":").append(grp.triCount * 3)
+                .append(",\"type\":\"SCALAR\"}")
+        }
+        sb.append("],\"bufferViews\":[")
         sb.append("{\"buffer\":0,\"byteOffset\":0,\"byteLength\":").append(posByteLength).append(",\"target\":34962},")
         sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength).append(",\"byteLength\":").append(normByteLength).append(",\"target\":34962},")
-        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength).append(",\"byteLength\":").append(uvByteLength).append(",\"target\":34962},")
-        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength + uvByteLength).append(",\"byteLength\":").append(indexByteLength).append(",\"target\":34963}")
-        if (hasTex) {
-            sb.append(",{\"buffer\":0,\"byteOffset\":").append(textureOffset).append(",\"byteLength\":").append(textureByteLength).append('}')
+        sb.append("{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength).append(",\"byteLength\":").append(uvByteLength).append(",\"target\":34962}")
+        if (plan.hasColors) {
+            sb.append(",{\"buffer\":0,\"byteOffset\":").append(posByteLength + normByteLength + uvByteLength)
+                .append(",\"byteLength\":").append(colorByteLength).append(",\"target\":34962}")
         }
-        sb.append("],\"buffers\":[{\"byteLength\":").append(totalBinaryLength).append("}]}")
+        for (grp in plan.indexGroups) {
+            sb.append(",{\"buffer\":0,\"byteOffset\":").append(grp.byteOffset)
+                .append(",\"byteLength\":").append(grp.byteLength).append(",\"target\":34963}")
+        }
+        for (tex in plan.textures) {
+            sb.append(",{\"buffer\":0,\"byteOffset\":").append(tex.byteOffset)
+                .append(",\"byteLength\":").append(tex.bytes.size).append('}')
+        }
+        sb.append("],\"buffers\":[{\"byteLength\":").append(plan.totalBinBytes).append("}]}")
         return sb.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    private fun writeGroupedIndicesAndTextures(
+        bos: BufferedOutputStream,
+        writeBuf: ByteBuffer,
+        triFile: File?,
+        hasMatInTri: Boolean,
+        useIntIndices: Boolean,
+        scratchDir: File,
+        plan: GroupedGlbLayoutPlan
+    ) {
+        if (triFile != null && triFile.exists() && plan.indexGroups.isNotEmpty()) {
+            val recBytes = if (hasMatInTri) 16 else 12
+            val readChunk = ByteArray(recBytes * 4096)
+            val readBB = ByteBuffer.wrap(readChunk).order(ByteOrder.LITTLE_ENDIAN)
+
+            if (!hasMatInTri || plan.indexGroups.size <= 1) {
+                val grp = plan.indexGroups[0]
+                for (p in 0 until grp.prePad) {
+                    if (writeBuf.remaining() < 1) flushWriteBuf(bos, writeBuf)
+                    writeBuf.put(0.toByte())
+                }
+                BufferedInputStream(FileInputStream(triFile), IO_BUFFER_BYTES).use { bis ->
+                    while (true) {
+                        val read = readUpToAligned(bis, readChunk, recBytes)
+                        if (read <= 0) break
+                        var off = 0
+                        while (off + recBytes <= read) {
+                            for (k in 0 until 3) {
+                                val idx = readBB.getInt(off + k * 4)
+                                if (useIntIndices) {
+                                    if (writeBuf.remaining() < 4) flushWriteBuf(bos, writeBuf)
+                                    writeBuf.putInt(idx)
+                                } else {
+                                    if (writeBuf.remaining() < 2) flushWriteBuf(bos, writeBuf)
+                                    writeBuf.putShort(idx.toShort())
+                                }
+                            }
+                            off += recBytes
+                        }
+                    }
+                }
+                flushWriteBuf(bos, writeBuf)
+            } else {
+                // Bucket indices into temporary files in chunks of 24 materials (1 sequential pass per 24 materials)
+                val maxMatId = (plan.materials.size - 1).coerceAtLeast(0)
+                var batchStart = 0
+                val bucketFiles = HashMap<Int, File>(24)
+                val bucketOuts = HashMap<Int, BufferedOutputStream>(24)
+                val bucketBufs = HashMap<Int, ByteBuffer>(24)
+                val copyChunk = ByteArray(IO_BUFFER_BYTES)
+
+                while (batchStart < plan.indexGroups.size) {
+                    val batchEnd = minOf(batchStart + 24, plan.indexGroups.size)
+                    val activeBatchIds = HashSet<Int>(24)
+                    for (gi in batchStart until batchEnd) {
+                        val mId = plan.indexGroups[gi].matId
+                        activeBatchIds.add(mId)
+                        val bf = File(scratchDir, "mb_${mId}_${System.nanoTime()}.bin")
+                        bucketFiles[mId] = bf
+                        bucketOuts[mId] = BufferedOutputStream(FileOutputStream(bf), 32_768)
+                        bucketBufs[mId] = ByteBuffer.allocate(16_384).order(ByteOrder.LITTLE_ENDIAN)
+                    }
+                    try {
+                        BufferedInputStream(FileInputStream(triFile), IO_BUFFER_BYTES).use { bis ->
+                            while (true) {
+                                val read = readUpToAligned(bis, readChunk, 16)
+                                if (read <= 0) break
+                                var off = 0
+                                while (off + 16 <= read) {
+                                    val mId = readBB.getInt(off + 12).let { if (it in 0..maxMatId) it else 0 }
+                                    if (mId in activeBatchIds) {
+                                        val bOut = bucketOuts[mId]!!
+                                        val bBuf = bucketBufs[mId]!!
+                                        val needed = if (useIntIndices) 12 else 6
+                                        if (bBuf.remaining() < needed) flushWriteBuf(bOut, bBuf)
+                                        for (k in 0 until 3) {
+                                            val idx = readBB.getInt(off + k * 4)
+                                            if (useIntIndices) bBuf.putInt(idx) else bBuf.putShort(idx.toShort())
+                                        }
+                                    }
+                                    off += 16
+                                }
+                            }
+                        }
+                        for (gi in batchStart until batchEnd) {
+                            val grp = plan.indexGroups[gi]
+                            val mId = grp.matId
+                            bucketOuts[mId]?.let { bOut ->
+                                bucketBufs[mId]?.let { bBuf -> flushWriteBuf(bOut, bBuf) }
+                                bOut.close()
+                            }
+                            for (p in 0 until grp.prePad) bos.write(0)
+                            val bf = bucketFiles[mId]
+                            if (bf != null && bf.exists()) {
+                                BufferedInputStream(FileInputStream(bf), IO_BUFFER_BYTES).use { bis ->
+                                    while (true) {
+                                        val n = bis.read(copyChunk)
+                                        if (n <= 0) break
+                                        bos.write(copyChunk, 0, n)
+                                    }
+                                }
+                                bf.delete()
+                            }
+                        }
+                    } finally {
+                        bucketOuts.values.forEach { runCatching { it.close() } }
+                        bucketFiles.values.forEach { runCatching { it.delete() } }
+                        bucketOuts.clear()
+                        bucketBufs.clear()
+                        bucketFiles.clear()
+                    }
+                    batchStart = batchEnd
+                }
+            }
+        }
+        flushWriteBuf(bos, writeBuf)
+        for (tex in plan.textures) {
+            for (p in 0 until tex.prePad) bos.write(0)
+            bos.write(tex.bytes)
+        }
+        for (p in 0 until plan.binPadding) bos.write(0)
     }
 
     private fun writeGlbHeaders(

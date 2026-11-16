@@ -441,4 +441,474 @@ class UsdAndInfinityScaleTest {
         ByteBuffer.wrap(finalBytes).order(ByteOrder.LITTLE_ENDIAN).putLong(tocOffsetPos, tocPos)
         return finalBytes
     }
+
+    private fun extractGlbJson(glb: File): String {
+        val bytes = glb.readBytes()
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0x46546C67, bb.int)
+        assertEquals(2, bb.int)
+        bb.int
+        val jsonLen = bb.int
+        assertEquals(0x4E4F534A, bb.int)
+        return String(bytes, 20, jsonLen, Charsets.UTF_8).trimEnd()
+    }
+
+    private fun minimal1x1PngBytes(): ByteArray = byteArrayOf(
+        0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90.toByte(), 0x77, 0x53,
+        0xDE.toByte(), 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+        0x54, 0x08, 0xD7.toByte(), 0x63, 0xF8.toByte(), 0xCF.toByte(), 0xC0.toByte(), 0x00,
+        0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD.toByte(), 0x8D.toByte(),
+        0xB0.toByte(), 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+        0x44, 0xAE.toByte(), 0x42, 0x60, 0x82.toByte()
+    )
+
+    @Test
+    fun simplifyUncompressedGlbPreservesVertexColorsMultiMaterialsAndEmbeddedTexture() {
+        val cacheDir = tempFolder.newFolder("simplify_colors_tex")
+        val srcGlb = File(cacheDir, "colored_textured.glb")
+        val png = minimal1x1PngBytes()
+
+        val posBytes = 4 * 3 * 4 // 4 verts VEC3 float = 48 bytes
+        val colBytes = 4 * 4     // 4 verts COLOR_0 VEC4 ubyte = 16 bytes
+        val idxBytes = 6 * 2     // 2 tris = 6 u16 = 12 bytes
+        val pngOffset = posBytes + colBytes + idxBytes // 76 bytes (4-byte aligned)
+        val rawBinLen = pngOffset + png.size
+        val binPad = (4 - (rawBinLen % 4)) % 4
+        val paddedBinLen = rawBinLen + binPad
+
+        val json = """
+        {
+          "asset": {"version": "2.0"},
+          "scene": 0,
+          "scenes": [{"nodes": [0]}],
+          "nodes": [{"mesh": 0}],
+          "meshes": [{
+            "primitives": [
+              {"attributes": {"POSITION": 0, "COLOR_0": 1}, "indices": 2, "material": 0},
+              {"attributes": {"POSITION": 0, "COLOR_0": 1}, "indices": 3, "material": 1}
+            ]
+          }],
+          "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [1.0, 0.25, 0.1, 1.0], "baseColorTexture": {"index": 0}}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.1, 0.8, 0.9, 1.0], "metallicFactor": 0.6, "roughnessFactor": 0.25}}
+          ],
+          "textures": [{"source": 0}],
+          "images": [{"bufferView": 4, "mimeType": "image/png"}],
+          "accessors": [
+            {"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [0,0,0], "max": [1,1,0]},
+            {"bufferView": 1, "byteOffset": 0, "componentType": 5121, "normalized": true, "count": 4, "type": "VEC4"},
+            {"bufferView": 2, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"},
+            {"bufferView": 3, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}
+          ],
+          "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 48, "target": 34962},
+            {"buffer": 0, "byteOffset": 48, "byteLength": 16, "target": 34962},
+            {"buffer": 0, "byteOffset": 64, "byteLength": 6, "target": 34963},
+            {"buffer": 0, "byteOffset": 70, "byteLength": 6, "target": 34963},
+            {"buffer": 0, "byteOffset": $pngOffset, "byteLength": ${png.size}}
+          ],
+          "buffers": [{"byteLength": $rawBinLen}]
+        }
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+
+        val jsonPad = (4 - (json.size % 4)) % 4
+        val paddedJsonLen = json.size + jsonPad
+        val totalLen = 12 + 8 + paddedJsonLen + 8 + paddedBinLen
+
+        val out = ByteBuffer.allocate(totalLen).order(ByteOrder.LITTLE_ENDIAN)
+        out.putInt(0x46546C67); out.putInt(2); out.putInt(totalLen)
+        out.putInt(paddedJsonLen); out.putInt(0x4E4F534A)
+        out.put(json); repeat(jsonPad) { out.put(0x20.toByte()) }
+        out.putInt(paddedBinLen); out.putInt(0x004E4942)
+        // Positions
+        out.putFloat(0f); out.putFloat(0f); out.putFloat(0f)
+        out.putFloat(1f); out.putFloat(0f); out.putFloat(0f)
+        out.putFloat(1f); out.putFloat(1f); out.putFloat(0f)
+        out.putFloat(0f); out.putFloat(1f); out.putFloat(0f)
+        // Colors (red, green, blue, yellow)
+        out.put(255.toByte()); out.put(0); out.put(0); out.put(255.toByte())
+        out.put(0); out.put(255.toByte()); out.put(0); out.put(255.toByte())
+        out.put(0); out.put(0); out.put(255.toByte()); out.put(255.toByte())
+        out.put(255.toByte()); out.put(255.toByte()); out.put(0); out.put(255.toByte())
+        // Indices: tri 0 -> mat 0; tri 1 -> mat 1
+        out.putShort(0); out.putShort(1); out.putShort(2)
+        out.putShort(0); out.putShort(2); out.putShort(3)
+        out.put(png)
+        repeat(binPad) { out.put(0) }
+        srcGlb.writeBytes(out.array())
+
+        val simplified = StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, srcGlb, force = true)
+        assertNotNull(simplified)
+        val outJson = extractGlbJson(simplified!!)
+        assertTrue("COLOR_0 attribute must be preserved", outJson.contains("\"COLOR_0\""))
+        assertTrue("baseColorTexture must be preserved", outJson.contains("\"baseColorTexture\""))
+        assertTrue("Embedded PNG image must be preserved", outJson.contains("image/png"))
+        assertTrue("Second material color [0.1,0.8,0.9,1.0] must be preserved", outJson.contains("0.8"))
+    }
+
+    @Test
+    fun objWithMtlTexturesMultiMaterialAndVertexColorsPreservesAllColors() {
+        val workDir = tempFolder.newFolder("obj_mtl_color")
+        val outDir = File(workDir, "cache")
+        File(workDir, "diffuse_tex.png").writeBytes(minimal1x1PngBytes())
+        File(workDir, "palette.mtl").writeText(
+            """
+            newmtl RedMat
+            Kd 0.9 0.1 0.1
+            map_Kd diffuse_tex.png
+
+            newmtl BlueMat
+            Kd 0.1 0.2 0.95
+            """.trimIndent()
+        )
+        val objFile = File(workDir, "colored.obj")
+        objFile.writeText(
+            """
+            mtllib palette.mtl
+            v 0 0 0 255 0 0
+            v 1 0 0 0 255 0
+            v 1 1 0 0 0 255
+            v 0 1 0 255 255 0
+            vt 0.0 0.25
+            vt 1.0 0.25
+            vt 1.0 0.75
+            vt 0.0 0.75
+            usemtl RedMat
+            f 1/1 2/2 3/3
+            usemtl BlueMat
+            f 1/1 3/3 4/4
+            """.trimIndent()
+        )
+
+        val res = ModelFormatConverter.convertObjToGlb(outDir, objFile)
+        assertTrue(res.isSuccess)
+        assertEquals(2, res.triangleCount)
+        val json = extractGlbJson(res.glbFile)
+        assertTrue("OBJ vertex colors must emit COLOR_0", json.contains("\"COLOR_0\""))
+        assertTrue("MTL map_Kd PNG texture must be embedded", json.contains("\"baseColorTexture\""))
+        assertTrue("Embedded PNG image must exist", json.contains("image/png"))
+        assertTrue("Multiple materials must emit >=2 primitives", json.contains("\"material\":1"))
+    }
+
+    @Test
+    fun plyAndThreeMfPreserveVertexAndTriangleColors() {
+        val outDir = tempFolder.newFolder("ply_3mf_color")
+
+        // PLY with uchar RGB vertex colors
+        val plyFile = File(outDir, "colored.ply")
+        plyFile.writeText(
+            """
+            ply
+            format ascii 1.0
+            element vertex 3
+            property float x
+            property float y
+            property float z
+            property uchar red
+            property uchar green
+            property uchar blue
+            element face 1
+            property list uchar int vertex_indices
+            end_header
+            0 0 0 255 0 0
+            1 0 0 0 255 0
+            0 1 0 0 0 255
+            3 0 1 2
+            """.trimIndent()
+        )
+        val plyRes = StreamingMeshProcessor.convertPlyToGlb(outDir, plyFile)
+        assertTrue(plyRes.isSuccess)
+        assertTrue("PLY vertex colors must emit COLOR_0", extractGlbJson(plyRes.glbFile).contains("\"COLOR_0\""))
+
+        // 3MF with basematerials & colored triangle
+        val mfFile = File(outDir, "colored.3mf")
+        val modelXml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+              <resources>
+                <basematerials id="1">
+                  <base name="Crimson" displaycolor="#FF2244" />
+                </basematerials>
+                <object id="2" type="model" pid="1" pindex="0">
+                  <mesh>
+                    <vertices>
+                      <vertex x="0" y="0" z="0" />
+                      <vertex x="10" y="0" z="0" />
+                      <vertex x="0" y="10" z="0" />
+                    </vertices>
+                    <triangles>
+                      <triangle v1="0" v2="1" v3="2" pid="1" p1="0" />
+                    </triangles>
+                  </mesh>
+                </object>
+              </resources>
+              <build><item objectid="2" /></build>
+            </model>
+        """.trimIndent()
+        ZipOutputStream(mfFile.outputStream()).use { zos ->
+            zos.putNextEntry(ZipEntry("3D/3dmodel.model"))
+            zos.write(modelXml.toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
+        val mfRes = StreamingMeshProcessor.convertThreeMfToGlb(outDir, mfFile)
+        assertTrue(mfRes.isSuccess)
+        assertEquals(1, mfRes.triangleCount)
+        assertTrue("3MF colored triangle must emit COLOR_0", extractGlbJson(mfRes.glbFile).contains("\"COLOR_0\""))
+    }
+
+    @Test
+    fun usdzWithGeomSubsetMultiMaterialAndVertexDisplayColorPreservesCorrectColors() {
+        val outDir = tempFolder.newFolder("usdz_multicolor")
+        val usdz = tempFolder.newFile("multicolor.usdz")
+        val png = minimal1x1PngBytes()
+
+        // Ensure sibling NormalTex shader does NOT overwrite DiffTex, AND GeomSubset switches material per face,
+        // AND second mesh with primvars:displayColor exports COLOR_0
+        val usda = """
+            #usda 1.0
+            def Xform "Root"
+            {
+                def Material "TexturedMat"
+                {
+                    token outputs:surface.connect = </Root/TexturedMat/PBR.outputs:surface>
+                    def Shader "PBR"
+                    {
+                        uniform token info:id = "UsdPreviewSurface"
+                        color3f inputs:diffuseColor = (0.18, 0.18, 0.18)
+                        color3f inputs:diffuseColor.connect = </Root/TexturedMat/DiffTex.outputs:rgb>
+                        normal3f inputs:normal.connect = </Root/TexturedMat/NormalTex.outputs:rgb>
+                    }
+                    def Shader "DiffTex"
+                    {
+                        uniform token info:id = "UsdUVTexture"
+                        asset inputs:file = @albedo_color.png@
+                    }
+                    def Shader "NormalTex"
+                    {
+                        uniform token info:id = "UsdUVTexture"
+                        asset inputs:file = @surface_normal.jpg@
+                    }
+                }
+                def Material "SolidBlueMat"
+                {
+                    token outputs:surface.connect = </Root/SolidBlueMat/PBR.outputs:surface>
+                    def Shader "PBR"
+                    {
+                        uniform token info:id = "UsdPreviewSurface"
+                        color3f inputs:diffuseColor = (0.05, 0.3, 0.95)
+                    }
+                }
+                def Mesh "MultiMatBox"
+                {
+                    int[] faceVertexCounts = [3, 3]
+                    int[] faceVertexIndices = [0, 1, 2, 0, 2, 3]
+                    point3f[] points = [(0,0,0), (1,0,0), (1,1,0), (0,1,0)]
+                    texCoord2f[] primvars:st = [(0,0), (1,0), (1,1), (0,1)] (interpolation = "vertex")
+                    def GeomSubset "Sub0"
+                    {
+                        uniform token elementType = "face"
+                        int[] indices = [0]
+                        rel material:binding = </Root/TexturedMat>
+                    }
+                    def GeomSubset "Sub1"
+                    {
+                        uniform token elementType = "face"
+                        int[] indices = [1]
+                        rel material:binding = </Root/SolidBlueMat>
+                    }
+                }
+                def Mesh "VertColorTri"
+                {
+                    int[] faceVertexCounts = [3]
+                    int[] faceVertexIndices = [0, 1, 2]
+                    point3f[] points = [(2,0,0), (3,0,0), (2,1,0)]
+                    color3f[] primvars:displayColor = [(1, 0, 0), (0, 1, 0), (0, 0, 1)] (interpolation = "vertex")
+                }
+            }
+        """.trimIndent()
+
+        ZipOutputStream(usdz.outputStream()).use { zos ->
+            zos.putNextEntry(ZipEntry("scene.usda"))
+            zos.write(usda.toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            zos.putNextEntry(ZipEntry("albedo_color.png"))
+            zos.write(png)
+            zos.closeEntry()
+            zos.putNextEntry(ZipEntry("surface_normal.jpg"))
+            zos.write(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+            zos.closeEntry()
+        }
+
+        val res = ModelFormatConverter.convertUsdzToGlb(outDir, usdz)
+        assertTrue(res.isSuccess)
+        assertEquals(3, res.triangleCount)
+        val json = extractGlbJson(res.glbFile)
+        assertTrue("USDZ vertex displayColor must emit COLOR_0", json.contains("\"COLOR_0\""))
+        assertTrue("Connected diffuse PNG (not normal JPG) must be chosen", json.contains("image/png"))
+        assertFalse("Normal map JPG must not overwrite connected diffuse PNG", json.contains("image/jpeg"))
+        assertTrue("GeomSubset must emit second material slot", json.contains("\"material\":1"))
+        assertTrue("SolidBlueMat color (0.95) must be preserved", json.contains("0.95"))
+    }
+
+    @Test
+    fun usdcCrateInlineVec3DiffuseColorDecodesSignedBytesAccurately() {
+        val outDir = tempFolder.newFolder("usdc_inline_color")
+        val usdcBytes = buildSyntheticColoredCrateUsdc()
+        val usdcFile = tempFolder.newFile("green_pyr.usdc").apply { writeBytes(usdcBytes) }
+
+        val res = ModelFormatConverter.processIncomingModel(outDir, usdcFile)
+        assertTrue("Colored USDC Crate must convert cleanly", res.isSuccess)
+        val json = extractGlbJson(res.glbFile)
+        // Expected baseColorFactor is [0.0, 1.0, 0.0, 1.0] (previously bugged to [256.0, 0.0, 0.0, 1.0])
+        assertTrue("Inline Crate Vec3f (0,1,0) must unpack to [0.0,1.0,0.0,1.0], got: $json", json.contains("[0.0,1.0,0.0,1.0]"))
+    }
+
+    private fun buildSyntheticColoredCrateUsdc(): ByteArray {
+        val out = ByteArrayOutputStream()
+        fun writeU32(v: Int) {
+            out.write(v and 0xFF); out.write((v ushr 8) and 0xFF)
+            out.write((v ushr 16) and 0xFF); out.write((v ushr 24) and 0xFF)
+        }
+        fun writeU64(v: Long) {
+            for (b in 0..7) out.write(((v ushr (b * 8)) and 0xFFL).toInt())
+        }
+        fun writeFloat(v: Float) = writeU32(java.lang.Float.floatToRawIntBits(v))
+
+        out.write("PXR-USDC".toByteArray(Charsets.US_ASCII))
+        out.write(byteArrayOf(0, 8, 0, 0, 0, 0, 0, 0))
+        val tocOffsetPos = out.size()
+        writeU64(0L)
+        out.write(ByteArray(88 - out.size()))
+
+        // Tokens:
+        // 0="", 1="upAxis", 2="Y", 3="Pyr", 4="typeName", 5="Mesh",
+        // 6="points", 7="default", 8="faceVertexCounts", 9="faceVertexIndices",
+        // 10="material:binding", 11="targetPaths", 12="Mat", 13="Material",
+        // 14="PBR", 15="Shader", 16="inputs:diffuseColor"
+        val tokens = listOf(
+            "", "upAxis", "Y", "Pyr", "typeName", "Mesh",
+            "points", "default", "faceVertexCounts", "faceVertexIndices",
+            "material:binding", "targetPaths", "Mat", "Material",
+            "PBR", "Shader", "inputs:diffuseColor"
+        )
+
+        val ptsOffset = out.size().toLong()
+        writeU64(3L)
+        for (f in floatArrayOf(0f, 1f, 0f, -1f, 0f, 0f, 1f, 0f, 0f)) writeFloat(f)
+
+        val countsOffset = out.size().toLong()
+        writeU64(1L); writeU32(3)
+
+        val idxOffset = out.size().toLong()
+        writeU64(3L); writeU32(0); writeU32(1); writeU32(2)
+
+        // PathListOp payload for material:binding targetPaths -> path index 6 ("/Mat")
+        // Bit 1 (Explicit list): header = 0x02, count(int64) = 1, pathIdx(int32) = 6
+        val bindTargetOffset = out.size().toLong()
+        out.write(0x02)
+        writeU64(1L)
+        writeU32(6)
+
+        // TOKENS
+        val tokStart = out.size().toLong()
+        val rawTok = tokens.joinToString("\u0000", postfix = "\u0000").toByteArray(Charsets.UTF_8)
+        val compTok = tfCompressSingleBlock(rawTok)
+        writeU64(tokens.size.toLong()); writeU64(rawTok.size.toLong()); writeU64(compTok.size.toLong()); out.write(compTok)
+        val tokSize = out.size().toLong() - tokStart
+
+        // STRINGS
+        val strStart = out.size().toLong(); writeU64(0L); val strSize = out.size().toLong() - strStart
+
+        // FIELDS
+        // 0: upAxis="Y"
+        // 1: typeName="Mesh"
+        // 2: default=points
+        // 3: default=counts
+        // 4: default=indices
+        // 5: targetPaths=[/Mat]
+        // 6: typeName="Material"
+        // 7: typeName="Shader"
+        // 8: default=inline Vec3f (0, 1, 0) -> bytes: [0, 1, 0] -> payload = 0x000100L!
+        val fldStart = out.size().toLong()
+        val fTokIdx = intArrayOf(1, 4, 7, 7, 7, 11, 4, 4, 7)
+        val fReps = longArrayOf(
+            valueRep(11, 2L, isInlined = true),
+            valueRep(11, 5L, isInlined = true),
+            valueRep(21, ptsOffset, isArray = true),
+            valueRep(3, countsOffset, isArray = true),
+            valueRep(3, idxOffset, isArray = true),
+            valueRep(34, bindTargetOffset),
+            valueRep(11, 13L, isInlined = true),
+            valueRep(11, 15L, isInlined = true),
+            valueRep(21, 0x000100L, isInlined = true)
+        )
+        val compFTok = compressUsdInts32(fTokIdx)
+        val rawFRep = ByteBuffer.allocate(fReps.size * 8).order(ByteOrder.LITTLE_ENDIAN)
+        fReps.forEach { rawFRep.putLong(it) }
+        val compFRep = tfCompressSingleBlock(rawFRep.array())
+        writeU64(fTokIdx.size.toLong())
+        writeU64(compFTok.size.toLong()); out.write(compFTok)
+        writeU64(compFRep.size.toLong()); out.write(compFRep)
+        val fldSize = out.size().toLong() - fldStart
+
+        // FIELDSETS: fsIdx = 0, 2, 4, 6, 8, 10, 12, 14, 16
+        val fsStart = out.size().toLong()
+        val fsArr = intArrayOf(0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1)
+        val compFs = compressUsdInts32(fsArr)
+        writeU64(fsArr.size.toLong()); writeU64(compFs.size.toLong()); out.write(compFs)
+        val fsSize = out.size().toLong() - fsStart
+
+        // PATHS (9 nodes):
+        // 0="/", 1="/Pyr", 2="/Pyr.points", 3="/Pyr.faceVertexCounts", 4="/Pyr.faceVertexIndices", 5="/Pyr.material:binding",
+        // 6="/Mat", 7="/Mat/PBR", 8="/Mat/PBR.inputs:diffuseColor"
+        // jumps:
+        // node 0: child only (-1)
+        // node 1: child(1->2) AND sibling(1->6: jump = 5)
+        // node 2: sibling only (0), node 3: sibling only (0), node 4: sibling only (0), node 5: leaf (-2)
+        // node 6: child only (-1), node 7: child only (-1), node 8: leaf (-2)
+        val pStart = out.size().toLong()
+        val pIdxs = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8)
+        val eToks = intArrayOf(0, 3, -6, -8, -9, -10, 12, 14, -16)
+        val jumps = intArrayOf(-1, 5, 0, 0, 0, -2, -1, -1, -2)
+        val cP = compressUsdInts32(pIdxs); val cE = compressUsdInts32(eToks); val cJ = compressUsdInts32(jumps)
+        writeU64(9L)
+        writeU64(cP.size.toLong()); out.write(cP)
+        writeU64(cE.size.toLong()); out.write(cE)
+        writeU64(cJ.size.toLong()); out.write(cJ)
+        val pSize = out.size().toLong() - pStart
+
+        // SPECS
+        val sStart = out.size().toLong()
+        val spPath = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8)
+        val spFs = intArrayOf(0, 2, 4, 6, 8, 10, 12, 14, 16)
+        val spType = intArrayOf(1, 2, 3, 3, 3, 4, 2, 2, 3)
+        val cSpP = compressUsdInts32(spPath); val cSpF = compressUsdInts32(spFs); val cSpT = compressUsdInts32(spType)
+        writeU64(9L)
+        writeU64(cSpP.size.toLong()); out.write(cSpP)
+        writeU64(cSpF.size.toLong()); out.write(cSpF)
+        writeU64(cSpT.size.toLong()); out.write(cSpT)
+        val sSize = out.size().toLong() - sStart
+
+        val tocPos = out.size().toLong()
+        val secs = listOf(
+            Triple("TOKENS", tokStart, tokSize),
+            Triple("STRINGS", strStart, strSize),
+            Triple("FIELDS", fldStart, fldSize),
+            Triple("FIELDSETS", fsStart, fsSize),
+            Triple("PATHS", pStart, pSize),
+            Triple("SPECS", sStart, sSize)
+        )
+        writeU64(secs.size.toLong())
+        for ((name, st, sz) in secs) {
+            out.write(name.toByteArray(Charsets.US_ASCII).copyOf(16))
+            writeU64(st); writeU64(sz)
+        }
+
+        val finalBytes = out.toByteArray()
+        ByteBuffer.wrap(finalBytes).order(ByteOrder.LITTLE_ENDIAN).putLong(tocOffsetPos, tocPos)
+        return finalBytes
+    }
 }
