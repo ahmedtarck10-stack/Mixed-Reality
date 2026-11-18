@@ -32,7 +32,12 @@ object UsdMeshConverter {
      * Preserves `"USDZ"` as `originalFormat` when geometry is extracted (or `"USDZ (Apple)"` fallback
      * only if no valid USD mesh exists or the archive is corrupt).
      */
-    fun convertUsdToGlb(cacheDir: File, usdFile: File, isZippedUsdz: Boolean): ModelFormatConverter.ConversionResult {
+    fun convertUsdToGlb(
+        cacheDir: File,
+        usdFile: File,
+        isZippedUsdz: Boolean,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
+    ): ModelFormatConverter.ConversionResult {
         val workDir = File(cacheDir, "usd_work_${System.nanoTime()}").apply { mkdirs() }
         try {
             if (isZippedUsdz) {
@@ -71,8 +76,8 @@ object UsdMeshConverter {
                     val dstGlb = File(cacheDir, embeddedGlb.name)
                     embeddedGlb.copyTo(dstGlb, overwrite = true)
                     val info = StreamingMeshProcessor.inspectGlbMetadata(dstGlb)
-                    val finalGlb = if (info.triangleCount > StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT) {
-                        StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, dstGlb) ?: dstGlb
+                    val finalGlb = if (info.triangleCount > budget.directTriangleLimit.toLong()) {
+                        StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, dstGlb, budget = budget) ?: dstGlb
                     } else dstGlb
                     val finalInfo = StreamingMeshProcessor.inspectGlbMetadata(finalGlb)
                     return ModelFormatConverter.ConversionResult(
@@ -87,7 +92,7 @@ object UsdMeshConverter {
                     )
                 }
 
-                return convertExtractedUsd(cacheDir, usdFile, extractDir, rootFiles)
+                return convertExtractedUsd(cacheDir, usdFile, extractDir, rootFiles, budget)
             } else {
                 val baseDir = usdFile.parentFile ?: workDir
                 return convertUsdCore(
@@ -95,7 +100,8 @@ object UsdMeshConverter {
                     usdFile = usdFile,
                     isZippedUsdz = false,
                     extractDir = baseDir,
-                    rootFiles = listOf(usdFile)
+                    rootFiles = listOf(usdFile),
+                    budget = budget
                 )
             }
         } catch (t: Throwable) {
@@ -110,14 +116,16 @@ object UsdMeshConverter {
         cacheDir: File,
         usdFile: File,
         extractDir: File,
-        rootFiles: List<File>
+        rootFiles: List<File>,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
     ): ModelFormatConverter.ConversionResult {
         return convertUsdCore(
             cacheDir = cacheDir,
             usdFile = usdFile,
             isZippedUsdz = true,
             extractDir = extractDir,
-            rootFiles = rootFiles
+            rootFiles = rootFiles,
+            budget = budget
         )
     }
 
@@ -126,7 +134,8 @@ object UsdMeshConverter {
         usdFile: File,
         isZippedUsdz: Boolean,
         extractDir: File,
-        rootFiles: List<File>
+        rootFiles: List<File>,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
     ): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "usd_scratch_${System.nanoTime()}").apply { mkdirs() }
         val positions = StreamingMeshProcessor.MappedFloatTupleStore(3, scratchDir, "usd_pos")
@@ -222,7 +231,8 @@ object UsdMeshConverter {
                 generator = "MixedReality OpenUSD Engine",
                 indexIsLong = true,
                 triHasMat = true,
-                materials = resolvedMats
+                materials = resolvedMats,
+                budget = budget
             )
 
             val note = if (stats.wasSimplified) {

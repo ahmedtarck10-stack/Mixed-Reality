@@ -887,7 +887,8 @@ fun copyUriAndConvertModel(context: Context, uri: Uri): ModelImportOutcome {
             }
         }
 
-        val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile)
+        val deviceBudget = com.aistudio.mixedreality.util.StreamingMeshProcessor.resolveDeviceMeshBudget(context)
+        val conversion = ModelFormatConverter.processIncomingModel(modelFolder, cacheFile, deviceBudget)
         val statsLabel = if (conversion.rawTriangleCount > 0L || conversion.rawVertexCount > 0L) {
             "${formatCompactCount(conversion.rawVertexCount)} verts • ${formatCompactCount(conversion.rawTriangleCount)} tris"
         } else {

@@ -36,9 +36,17 @@ object ModelFormatConverter {
     )
 
     fun processIncomingModel(context: Context, sourceFile: File): ConversionResult =
-        processIncomingModel(context.cacheDir, sourceFile)
+        processIncomingModel(
+            cacheDir = context.cacheDir,
+            sourceFile = sourceFile,
+            budget = StreamingMeshProcessor.resolveDeviceMeshBudget(context)
+        )
 
-    fun processIncomingModel(cacheDir: File, sourceFile: File): ConversionResult {
+    fun processIncomingModel(
+        cacheDir: File,
+        sourceFile: File,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
+    ): ConversionResult {
         val extension = sourceFile.extension.lowercase()
         return when (extension) {
             "glb" -> {
@@ -51,9 +59,9 @@ object ModelFormatConverter {
                 val msg: String
 
                 if (info.isValidGlb && info.hasUncompressedAccessors &&
-                    info.triangleCount > StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT.toLong()
+                    (info.triangleCount > budget.directTriangleLimit.toLong() || sourceFile.length() > budget.maxDirectFileBytes)
                 ) {
-                    val optimized = StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, sourceFile)
+                    val optimized = StreamingMeshProcessor.simplifyUncompressedGlb(cacheDir, sourceFile, budget = budget)
                     if (optimized != null && optimized.exists() && optimized.length() > 0L) {
                         val optInfo = StreamingMeshProcessor.inspectGlbMetadata(optimized)
                         finalFile = optimized
@@ -61,7 +69,7 @@ object ModelFormatConverter {
                         rawTris = info.triangleCount
                         outVerts = optInfo.vertexCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                         outTris = optInfo.triangleCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                        msg = "Dense GLB (${formatModelCount(info.triangleCount)} tris) optimized to ${formatModelCount(optInfo.triangleCount)} tris for GPU"
+                        msg = "Dense GLB (${formatModelCount(info.triangleCount)} tris) optimized to ${formatModelCount(optInfo.triangleCount)} tris for ${budget.tier.name.lowercase()} device"
                     } else {
                         finalFile = sourceFile
                         rawVerts = info.vertexCount
@@ -71,7 +79,7 @@ object ModelFormatConverter {
                         msg = "Native GLB (${formatModelCount(info.triangleCount)} tris)"
                     }
                 } else if (info.isValidGlb && info.hasWebp) {
-                    val webpSafe = StreamingMeshProcessor.downsampleGlbTexturesForMobile(cacheDir, sourceFile, maxEdge = 2048)
+                    val webpSafe = StreamingMeshProcessor.downsampleGlbTexturesForMobile(cacheDir, sourceFile, maxEdge = budget.maxTextureEdge)
                     val chosen = if (webpSafe != null && webpSafe.exists() && webpSafe.length() > 0L) webpSafe else sourceFile
                     finalFile = chosen
                     rawVerts = info.vertexCount
@@ -114,9 +122,9 @@ object ModelFormatConverter {
                     rawVertexCount = rawVerts
                 )
             }
-            "stl" -> StreamingMeshProcessor.convertStlToGlb(cacheDir, sourceFile)
-            "ply" -> StreamingMeshProcessor.convertPlyToGlb(cacheDir, sourceFile)
-            "3mf" -> StreamingMeshProcessor.convertThreeMfToGlb(cacheDir, sourceFile)
+            "stl" -> StreamingMeshProcessor.convertStlToGlb(cacheDir, sourceFile, budget)
+            "ply" -> StreamingMeshProcessor.convertPlyToGlb(cacheDir, sourceFile, budget)
+            "3mf" -> StreamingMeshProcessor.convertThreeMfToGlb(cacheDir, sourceFile, budget)
             "gltf" -> {
                 var binWarning: String? = null
                 var hasMissingBuffer = false
@@ -173,10 +181,10 @@ object ModelFormatConverter {
                     isSuccess = !hasMissingBuffer
                 )
             }
-            "obj" -> convertObjToGlb(cacheDir, sourceFile)
-            "usdz", "zip" -> convertUsdzToGlb(cacheDir, sourceFile)
-            "usda" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false)
-            "usdc", "usd" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false)
+            "obj" -> convertObjToGlb(cacheDir, objFile = sourceFile, budget = budget)
+            "usdz", "zip" -> convertUsdzToGlb(cacheDir, usdzFile = sourceFile, budget = budget)
+            "usda" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false, budget = budget)
+            "usdc", "usd" -> UsdMeshConverter.convertUsdToGlb(cacheDir, sourceFile, isZippedUsdz = false, budget = budget)
             else -> {
                 ConversionResult(
                     glbFile = sourceFile,
@@ -193,15 +201,19 @@ object ModelFormatConverter {
     private fun formatModelCount(n: Long): String = StreamingMeshProcessor.formatCompact(n)
 
     fun convertObjToGlb(context: Context, objFile: File): ConversionResult =
-        convertObjToGlb(context.cacheDir, objFile)
+        convertObjToGlb(context.cacheDir, objFile, StreamingMeshProcessor.resolveDeviceMeshBudget(context))
 
     /**
      * Converts Wavefront .obj files into compliant binary glTF 2.0 (.glb) with full per-vertex RGB[A] colors,
      * `.mtl` PBR material colors & textures, multi-material primitives, and glTF V-flipped UVs.
      */
-    fun convertObjToGlb(cacheDir: File, objFile: File): ConversionResult {
+    fun convertObjToGlb(
+        cacheDir: File,
+        objFile: File,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
+    ): ConversionResult {
         cacheDir.mkdirs()
-        val streamed = StreamingMeshProcessor.convertObjToGlbStreaming(cacheDir, objFile)
+        val streamed = StreamingMeshProcessor.convertObjToGlbStreaming(cacheDir, objFile, budget)
         if (streamed.isSuccess && streamed.triangleCount > 0 && streamed.glbFile.exists() && streamed.glbFile.length() > 0L) {
             return streamed
         }
@@ -231,12 +243,16 @@ object ModelFormatConverter {
     }
 
     fun convertUsdzToGlb(context: Context, usdzFile: File): ConversionResult =
-        convertUsdzToGlb(context.cacheDir, usdzFile)
+        convertUsdzToGlb(context.cacheDir, usdzFile, StreamingMeshProcessor.resolveDeviceMeshBudget(context))
 
     /**
      * Extracts and converts Apple USDZ (.usdz) or Zipped 3D archives (.zip) into a renderable GLB/glTF.
      */
-    fun convertUsdzToGlb(cacheDir: File, usdzFile: File): ConversionResult {
+    fun convertUsdzToGlb(
+        cacheDir: File,
+        usdzFile: File,
+        budget: StreamingMeshProcessor.DeviceMeshBudget = StreamingMeshProcessor.STANDARD_MESH_BUDGET
+    ): ConversionResult {
         var extractedGlb: File? = null
         var extractedGltf: File? = null
         var extractedObj: File? = null
@@ -290,7 +306,7 @@ object ModelFormatConverter {
 
         val glb = extractedGlb
         if (glb != null && glb.exists() && glb.length() > 0) {
-            return processIncomingModel(extractedDir, glb).copy(originalFormat = "USDZ")
+            return processIncomingModel(extractedDir, glb, budget).copy(originalFormat = "USDZ")
         }
 
         if (hasUsdFiles) {
@@ -298,7 +314,8 @@ object ModelFormatConverter {
                 cacheDir = cacheDir,
                 usdFile = usdzFile,
                 extractDir = extractedDir,
-                rootFiles = allExtractedFiles
+                rootFiles = allExtractedFiles,
+                budget = budget
             )
             if (usdResult.isSuccess) {
                 runCatching { extractedDir.deleteRecursively() }
@@ -308,27 +325,27 @@ object ModelFormatConverter {
 
         val gltf = extractedGltf
         if (gltf != null && gltf.exists() && gltf.length() > 0) {
-            return processIncomingModel(extractedDir, gltf).copy(originalFormat = "USDZ")
+            return processIncomingModel(extractedDir, gltf, budget).copy(originalFormat = "USDZ")
         }
 
         val threeMf = extracted3mf
         if (threeMf != null && threeMf.exists() && threeMf.length() > 0) {
-            return processIncomingModel(extractedDir, threeMf).copy(originalFormat = "USDZ")
+            return processIncomingModel(extractedDir, threeMf, budget).copy(originalFormat = "USDZ")
         }
 
         val stl = extractedStl
         if (stl != null && stl.exists() && stl.length() > 0) {
-            return processIncomingModel(extractedDir, stl).copy(originalFormat = "USDZ")
+            return processIncomingModel(extractedDir, stl, budget).copy(originalFormat = "USDZ")
         }
 
         val ply = extractedPly
         if (ply != null && ply.exists() && ply.length() > 0) {
-            return processIncomingModel(extractedDir, ply).copy(originalFormat = "USDZ")
+            return processIncomingModel(extractedDir, ply, budget).copy(originalFormat = "USDZ")
         }
 
         val obj = extractedObj
         if (obj != null && obj.exists() && obj.length() > 0) {
-            val converted = convertObjToGlb(cacheDir, obj)
+            val converted = convertObjToGlb(cacheDir, obj, budget)
             return ConversionResult(
                 glbFile = converted.glbFile,
                 originalFormat = "USDZ",

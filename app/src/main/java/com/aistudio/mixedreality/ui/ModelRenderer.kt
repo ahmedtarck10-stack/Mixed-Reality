@@ -91,6 +91,8 @@ fun rememberOptimizedModelState(
     customModelFile: File?,
     onModelError: ((String) -> Unit)? = null
 ): ModelLoadState {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val deviceBudget = remember(context) { StreamingMeshProcessor.resolveDeviceMeshBudget(context) }
     val filePath = customModelFile?.absolutePath
     var state by remember(modelLoader, filePath) {
         mutableStateOf<ModelLoadState>(
@@ -205,13 +207,15 @@ fun rememberOptimizedModelState(
                 if (allowFallback) {
                     val cacheParent = targetFile.parentFile ?: targetFile.absoluteFile.parentFile
                     val glbInfo = withContext(Dispatchers.IO) { StreamingMeshProcessor.inspectGlbMetadata(targetFile) }
-                    if (cacheParent != null && glbInfo.imageCount > 0) {
+                    if (cacheParent != null && glbInfo.imageCount > 0 &&
+                        (!glbInfo.hasUncompressedAccessors || glbInfo.triangleCount <= deviceBudget.emergencyTargetTriangles)
+                    ) {
                         state = ModelLoadState.Loading(0.1f, "Optimizing textures for mobile RAM...")
                         val downsampled = withContext(Dispatchers.IO) {
                             StreamingMeshProcessor.downsampleGlbTexturesForMobile(
                                 cacheParent,
                                 targetFile,
-                                maxEdge = 1024
+                                maxEdge = minOf(deviceBudget.maxTextureEdge, 1024)
                             )
                         }
                         if (downsampled != null && downsampled.exists()) {
@@ -225,7 +229,8 @@ fun rememberOptimizedModelState(
                                 cacheParent,
                                 targetFile,
                                 force = true,
-                                emergencyFallback = true
+                                emergencyFallback = true,
+                                budget = deviceBudget
                             )
                         }
                         if (simplified != null && simplified.exists()) {
@@ -254,7 +259,8 @@ fun rememberOptimizedModelState(
                                 cacheParent,
                                 targetFile,
                                 force = true,
-                                emergencyFallback = true
+                                emergencyFallback = true,
+                                budget = deviceBudget
                             )
                         }
                         if (simplified != null && simplified.exists()) {

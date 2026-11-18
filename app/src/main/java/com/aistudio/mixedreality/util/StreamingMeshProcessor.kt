@@ -1,7 +1,10 @@
 package com.aistudio.mixedreality.util
 
+import android.app.ActivityManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,8 +33,8 @@ import kotlin.math.sqrt
 
 /**
  * High-capacity streaming 3D geometry processor engineered for mobile RAM/GPU constraints.
- * Supports unlimited ("∞") vertex and polygon counts across OBJ, STL, PLY, 3MF, GLB, and USD
- * using sequential binary streaming, memory-mapped float buffers, and single-pass spatial clustering.
+ * Supports unlimited ("∞") input vertex and polygon counts across OBJ, STL, PLY, 3MF, GLB, and USD
+ * using sequential binary streaming, memory-mapped float buffers, and device-adaptive budgets.
  */
 object StreamingMeshProcessor {
 
@@ -39,23 +42,133 @@ object StreamingMeshProcessor {
     private const val IO_BUFFER_BYTES = 524_288 // 512 KB streaming buffer
     private const val GLB_CHUNK_BYTES = 65_536
 
-    // Lossless direct emission up to 10M triangles; above that, surface-preserving clustering
-    // retains ~9M-10M triangles (e.g. max ~70% reduction on 30M models, instead of 98% loss to 200K-300K)
-    // using zero-heap memory-mapped storage and 16-bit-per-axis spatial hashing.
+    // Baseline safe limit (~2M triangles) tuned for reliable mobile GPU opening;
+    // runtime hardware classification scales limits up on flagship phones and down on weak phones
+    // so models within device capability load losslessly without unnecessary shrinking.
     const val UNLIMITED_CAPACITY = Long.MAX_VALUE
-    const val DIRECT_TRIANGLE_LIMIT = 10_000_000
-    const val CLUSTER_MAX_VERTICES = 5_500_000
-    const val EMERGENCY_CLUSTER_MAX_VERTICES = 2_200_000
+    const val DIRECT_TRIANGLE_LIMIT = 2_000_000
+    const val CLUSTER_MAX_VERTICES = 1_350_000
+    const val EMERGENCY_CLUSTER_MAX_VERTICES = 500_000
     const val CLUSTER_HASH_TABLE_SIZE = 8_388_608 // Power of 2; off-heap sparse mmap table
 
-    internal fun computeTargetClusterBudget(totalTris: Long, emergencyFallback: Boolean = false): Pair<Long, Int> {
-        if (emergencyFallback) {
-            val targetTris = minOf(totalTris, 3_500_000L).coerceAtLeast(100_000L)
-            return targetTris to EMERGENCY_CLUSTER_MAX_VERTICES
+    enum class DevicePerformanceTier {
+        LOW,
+        STANDARD,
+        HIGH,
+        FLAGSHIP
+    }
+
+    data class DeviceMeshBudget(
+        val tier: DevicePerformanceTier,
+        val directTriangleLimit: Int,
+        val simplifiedTargetTriangles: Long,
+        val maxClusterVertices: Int,
+        val emergencyTargetTriangles: Long,
+        val emergencyMaxClusterVertices: Int,
+        val maxTextureEdge: Int,
+        val maxDirectFileBytes: Long
+    )
+
+    val LOW_MESH_BUDGET = DeviceMeshBudget(
+        tier = DevicePerformanceTier.LOW,
+        directTriangleLimit = 900_000,
+        simplifiedTargetTriangles = 850_000L,
+        maxClusterVertices = 550_000,
+        emergencyTargetTriangles = 380_000L,
+        emergencyMaxClusterVertices = 260_000,
+        maxTextureEdge = 1024,
+        maxDirectFileBytes = 128L * 1024L * 1024L
+    )
+
+    val STANDARD_MESH_BUDGET = DeviceMeshBudget(
+        tier = DevicePerformanceTier.STANDARD,
+        directTriangleLimit = DIRECT_TRIANGLE_LIMIT,
+        simplifiedTargetTriangles = 2_000_000L,
+        maxClusterVertices = CLUSTER_MAX_VERTICES,
+        emergencyTargetTriangles = 750_000L,
+        emergencyMaxClusterVertices = EMERGENCY_CLUSTER_MAX_VERTICES,
+        maxTextureEdge = 1536,
+        maxDirectFileBytes = 200L * 1024L * 1024L
+    )
+
+    val HIGH_MESH_BUDGET = DeviceMeshBudget(
+        tier = DevicePerformanceTier.HIGH,
+        directTriangleLimit = 3_000_000,
+        simplifiedTargetTriangles = 2_750_000L,
+        maxClusterVertices = 1_800_000,
+        emergencyTargetTriangles = 1_100_000L,
+        emergencyMaxClusterVertices = 720_000,
+        maxTextureEdge = 2048,
+        maxDirectFileBytes = 256L * 1024L * 1024L
+    )
+
+    val FLAGSHIP_MESH_BUDGET = DeviceMeshBudget(
+        tier = DevicePerformanceTier.FLAGSHIP,
+        directTriangleLimit = 4_000_000,
+        simplifiedTargetTriangles = 3_600_000L,
+        maxClusterVertices = 2_350_000,
+        emergencyTargetTriangles = 1_500_000L,
+        emergencyMaxClusterVertices = 1_000_000,
+        maxTextureEdge = 2048,
+        maxDirectFileBytes = 320L * 1024L * 1024L
+    )
+
+    internal fun classifyDeviceMeshBudget(
+        totalRamMb: Long,
+        availRamMb: Long,
+        isLowRamDevice: Boolean,
+        cpuCores: Int,
+        is64Bit: Boolean
+    ): DeviceMeshBudget {
+        if (totalRamMb <= 0L) return STANDARD_MESH_BUDGET
+        if (isLowRamDevice || !is64Bit || totalRamMb <= 4_200L || (availRamMb in 1L..1_100L) || cpuCores <= 4) {
+            return LOW_MESH_BUDGET
         }
-        val thirtyPercent = (totalTris * 0.30).toLong()
-        val targetTris = maxOf(thirtyPercent, 8_500_000L).coerceAtMost(10_000_000L)
-        return targetTris to CLUSTER_MAX_VERTICES
+        if (totalRamMb >= 11_000L && (availRamMb <= 0L || availRamMb >= 3_800L) && cpuCores >= 8) {
+            return FLAGSHIP_MESH_BUDGET
+        }
+        if (totalRamMb >= 7_800L && (availRamMb <= 0L || availRamMb >= 2_200L) && cpuCores >= 6) {
+            return HIGH_MESH_BUDGET
+        }
+        return STANDARD_MESH_BUDGET
+    }
+
+    fun resolveDeviceMeshBudget(context: Context? = null): DeviceMeshBudget {
+        if (context == null) return STANDARD_MESH_BUDGET
+        return runCatching {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                ?: return@runCatching STANDARD_MESH_BUDGET
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            val totalMb = memInfo.totalMem / (1024L * 1024L)
+            if (totalMb <= 0L) return@runCatching STANDARD_MESH_BUDGET
+            val availMb = memInfo.availMem / (1024L * 1024L)
+            val lowRam = am.isLowRamDevice || memInfo.lowMemory
+            val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+            val is64Bit = Build.SUPPORTED_64_BIT_ABIS.isNotEmpty()
+            classifyDeviceMeshBudget(
+                totalRamMb = totalMb,
+                availRamMb = availMb,
+                isLowRamDevice = lowRam,
+                cpuCores = cores,
+                is64Bit = is64Bit
+            )
+        }.getOrDefault(STANDARD_MESH_BUDGET)
+    }
+
+    internal fun computeTargetClusterBudget(
+        totalTris: Long,
+        emergencyFallback: Boolean = false,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
+    ): Pair<Long, Int> {
+        val safeTotal = totalTris.coerceAtLeast(1L)
+        if (emergencyFallback) {
+            val floor = minOf(safeTotal, 100_000L)
+            val targetTris = minOf(safeTotal, budget.emergencyTargetTriangles).coerceAtLeast(floor)
+            return targetTris to budget.emergencyMaxClusterVertices
+        }
+        val targetTris = minOf(safeTotal, budget.simplifiedTargetTriangles)
+        return targetTris to budget.maxClusterVertices
     }
 
     data class MeshStats(
@@ -1132,7 +1245,11 @@ object StreamingMeshProcessor {
      * Converts Binary or ASCII STL of any triangle count (250K up to 30,000,000+ triangles)
      * without SceneView's 32 MB / 250K hardcoded caps.
      */
-    fun convertStlToGlb(cacheDir: File, stlFile: File): ModelFormatConverter.ConversionResult {
+    fun convertStlToGlb(
+        cacheDir: File,
+        stlFile: File,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
+    ): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "mesh_scratch_${System.nanoTime()}").apply { mkdirs() }
         try {
             val fileLen = stlFile.length()
@@ -1232,7 +1349,8 @@ object StreamingMeshProcessor {
                 estimatedTotalArea = estimatedTotalArea,
                 bounds = bounds,
                 scratchDir = scratchDir,
-                outGlb = outGlb
+                outGlb = outGlb,
+                budget = budget
             )
 
             val note = if (stats.wasSimplified) {
@@ -1272,9 +1390,10 @@ object StreamingMeshProcessor {
         estimatedTotalArea: Double,
         bounds: MeshBounds,
         scratchDir: File,
-        outGlb: File
+        outGlb: File,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
     ): MeshStats {
-        val useCluster = totalTris > DIRECT_TRIANGLE_LIMIT.toLong()
+        val useCluster = totalTris > budget.directTriangleLimit.toLong()
         if (!useCluster) {
             DirectStreamingGlbWriter(scratchDir).use { writer ->
                 forEachStlTriangle(stlFile, isAscii, totalTris) { nx, ny, nz, x0, y0, z0, x1, y1, z1, x2, y2, z2 ->
@@ -1298,7 +1417,7 @@ object StreamingMeshProcessor {
             }
         }
 
-        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris)
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris, emergencyFallback = false, budget = budget)
         var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
         var upwardRetries = 0
         while (true) {
@@ -1417,7 +1536,11 @@ object StreamingMeshProcessor {
      * Streaming PLY converter supporting ASCII, binary_little_endian, and binary_big_endian
      * with arbitrary property layouts and up to 30,000,000 vertices and 30,000,000 polygons.
      */
-    fun convertPlyToGlb(cacheDir: File, plyFile: File): ModelFormatConverter.ConversionResult {
+    fun convertPlyToGlb(
+        cacheDir: File,
+        plyFile: File,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
+    ): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "ply_scratch_${System.nanoTime()}").apply { mkdirs() }
         try {
             val headerInfo = parsePlyHeader(plyFile)
@@ -1466,7 +1589,7 @@ object StreamingMeshProcessor {
                 for (texName in headerInfo.textureFiles) {
                     val found = findCompanionAssetFile(plyFile.parentFile, texName)
                     if (found != null) {
-                        val prepared = prepareMobileTextureFile(scratchDir, found, maxEdge = 1536)
+                        val prepared = prepareMobileTextureFile(scratchDir, found, maxEdge = budget.maxTextureEdge)
                         if (prepared != null) {
                             texFile = prepared.first
                             texMime = prepared.second
@@ -1493,7 +1616,8 @@ object StreamingMeshProcessor {
                     generator = "MixedReality Streaming PLY Engine",
                     indexIsLong = rawTris.indexIsLong,
                     textureFile = texFile,
-                    textureMime = texMime
+                    textureMime = texMime,
+                    budget = budget
                 )
                 rawTris.close()
 
@@ -1537,7 +1661,11 @@ object StreamingMeshProcessor {
      * Streaming Wavefront OBJ converter using zero-heap memory-mapped vertex pools and spatial clustering,
      * supporting unlimited ("∞") vertices & polygons without Int overflow or GC stalls.
      */
-    fun convertObjToGlbStreaming(cacheDir: File, objFile: File): ModelFormatConverter.ConversionResult {
+    fun convertObjToGlbStreaming(
+        cacheDir: File,
+        objFile: File,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
+    ): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "obj_scratch_${System.nanoTime()}").apply { mkdirs() }
         val positions = MappedFloatTupleStore(3, scratchDir, "obj_pos")
         val normals = MappedFloatTupleStore(3, scratchDir, "obj_nrm")
@@ -1748,7 +1876,8 @@ object StreamingMeshProcessor {
                 bounds = bounds,
                 scratchDir = scratchDir,
                 outGlb = outGlb,
-                materials = resolvedMats
+                materials = resolvedMats,
+                budget = budget
             )
 
             val baseMsg = if (stats.wasSimplified) {
@@ -1792,7 +1921,11 @@ object StreamingMeshProcessor {
      * Streaming 3MF converter parsing XML directly inside ZipInputStream without whole-file ByteArray loads.
      * Preserves `<basematerials>` and `<m:colorgroup>` per-object and per-triangle colors.
      */
-    fun convertThreeMfToGlb(cacheDir: File, threeMfFile: File): ModelFormatConverter.ConversionResult {
+    fun convertThreeMfToGlb(
+        cacheDir: File,
+        threeMfFile: File,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
+    ): ModelFormatConverter.ConversionResult {
         val scratchDir = File(cacheDir, "3mf_scratch_${System.nanoTime()}").apply { mkdirs() }
         val positions = MappedFloatTupleStore(3, scratchDir, "3mf_pos")
         val triIndexFile = File(scratchDir, "3mf_tris.bin")
@@ -1943,7 +2076,8 @@ object StreamingMeshProcessor {
                 scratchDir = scratchDir,
                 outGlb = outGlb,
                 generator = "MixedReality Streaming 3MF Engine",
-                indexIsLong = true
+                indexIsLong = true,
+                budget = budget
             )
 
             return ModelFormatConverter.ConversionResult(
@@ -2226,11 +2360,12 @@ object StreamingMeshProcessor {
         cacheDir: File,
         srcGlb: File,
         force: Boolean = false,
-        emergencyFallback: Boolean = false
+        emergencyFallback: Boolean = false,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
     ): File? {
         val info = inspectGlbMetadata(srcGlb)
         if (!info.isValidGlb || !info.hasUncompressedAccessors) return null
-        if (!force && info.triangleCount <= DIRECT_TRIANGLE_LIMIT && srcGlb.length() <= 512L * 1024L * 1024L) {
+        if (!force && info.triangleCount <= budget.directTriangleLimit.toLong() && srcGlb.length() <= budget.maxDirectFileBytes) {
             return null
         }
         val scratchDir = File(cacheDir, "glb_decim_${System.nanoTime()}").apply { mkdirs() }
@@ -2247,13 +2382,15 @@ object StreamingMeshProcessor {
                 val meshes = root.optArr("meshes") ?: return@use null
 
                 // Extract all materials & embedded/referenced textures cleanly before streaming geometry
+                val textureEdge = if (emergencyFallback) minOf(budget.maxTextureEdge, 1024) else budget.maxTextureEdge
                 val (materialsList, matTexCoordIndices) = extractGlbMaterialsAndTextures(
                     root = root,
                     raf = raf,
                     binOffset = binOffset,
                     bufferViews = bufferViews,
                     srcDir = srcGlb.parentFile,
-                    scratchDir = scratchDir
+                    scratchDir = scratchDir,
+                    maxTextureEdge = textureEdge
                 )
                 val multiMat = materialsList.size > 1
 
@@ -2470,7 +2607,8 @@ object StreamingMeshProcessor {
                         indexIsLong = true,
                         triHasMat = multiMat,
                         materials = materialsList.ifEmpty { null },
-                        emergencyFallback = emergencyFallback
+                        emergencyFallback = emergencyFallback,
+                        budget = budget
                     )
                     outGlb
                 } finally {
@@ -2758,7 +2896,8 @@ object StreamingMeshProcessor {
         binOffset: Long,
         bufferViews: MiniJson.Arr,
         srcDir: File?,
-        scratchDir: File
+        scratchDir: File,
+        maxTextureEdge: Int = 1536
     ): Pair<List<GlbMaterialSpec>, IntArray> {
         val mats = root.optArr("materials") ?: return emptyList<GlbMaterialSpec>() to IntArray(0)
         if (mats.length() == 0) return emptyList<GlbMaterialSpec>() to IntArray(0)
@@ -2785,7 +2924,7 @@ object StreamingMeshProcessor {
                         val ext = guessImageExtFromMimeOrBytes(mime, rawBytes)
                         val rawOut = File(scratchDir, "glb_img_${imgIdx}.${ext}")
                         rawOut.writeBytes(rawBytes)
-                        result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = 1536)
+                        result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = maxTextureEdge)
                     }
                 } else {
                     val uri = img.optString("uri")
@@ -2799,13 +2938,13 @@ object StreamingMeshProcessor {
                                 val ext = guessImageExtFromMimeOrBytes(header, rawBytes)
                                 val rawOut = File(scratchDir, "glb_img_${imgIdx}.${ext}")
                                 rawOut.writeBytes(rawBytes)
-                                result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = 1536)
+                                result = prepareMobileTextureFile(scratchDir, rawOut, maxEdge = maxTextureEdge)
                             }
                         }
                     } else if (uri.isNotBlank() && srcDir != null) {
                         val found = findCompanionAssetFile(srcDir, uri)
                         if (found != null) {
-                            result = prepareMobileTextureFile(scratchDir, found, maxEdge = 1536)
+                            result = prepareMobileTextureFile(scratchDir, found, maxEdge = maxTextureEdge)
                         }
                     }
                 }
@@ -3155,7 +3294,8 @@ object StreamingMeshProcessor {
         cornerColorFile: File? = null,
         triHasMat: Boolean = false,
         materials: List<GlbMaterialSpec>? = null,
-        emergencyFallback: Boolean = false
+        emergencyFallback: Boolean = false,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
     ): MeshStats {
         positions.sealForRead()
         normals?.sealForRead()
@@ -3166,9 +3306,9 @@ object StreamingMeshProcessor {
         val hasVertColors = hasCornerColors || (colors != null && colors.count == positions.count)
         val hasMultiMat = triHasMat && (materials?.size ?: 0) > 1
         val needsCluster = if (emergencyFallback) {
-            totalTris > 100_000L || totalVerts > 250_000L
+            totalTris > budget.emergencyTargetTriangles || totalVerts > (budget.emergencyMaxClusterVertices.toLong() * 2L)
         } else {
-            totalTris > DIRECT_TRIANGLE_LIMIT.toLong() || totalVerts > (DIRECT_TRIANGLE_LIMIT.toLong() * 3L)
+            totalTris > budget.directTriangleLimit.toLong() || totalVerts > (budget.directTriangleLimit.toLong() * 3L)
         }
         val triBytes = (if (indexIsLong) 24 else 12) + (if (triHasMat) 4 else 0)
         val batchRecords = 4096
@@ -3376,8 +3516,8 @@ object StreamingMeshProcessor {
             }
         }
 
-        // Surface-preserving spatial clustering for >10M (30M..infinity) meshes
-        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris, emergencyFallback)
+        // Surface-preserving spatial clustering scaled to device capability
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris, emergencyFallback, budget)
         val estimatedTotalArea = estimateTotalAreaFromIndexedFile(positions, triIndexFile, totalTris, triBytes, indexIsLong)
         var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
         val hasPerVertNorm = normals != null && normals.count == positions.count
@@ -3525,7 +3665,8 @@ object StreamingMeshProcessor {
         bounds: MeshBounds,
         scratchDir: File,
         outGlb: File,
-        materials: List<GlbMaterialSpec>? = null
+        materials: List<GlbMaterialSpec>? = null,
+        budget: DeviceMeshBudget = STANDARD_MESH_BUDGET
     ): MeshStats {
         positions.sealForRead()
         normals.sealForRead()
@@ -3540,7 +3681,7 @@ object StreamingMeshProcessor {
         val readBuf = ByteArray(recBytes * 2048)
         val readBB = ByteBuffer.wrap(readBuf).order(ByteOrder.LITTLE_ENDIAN)
 
-        if (totalTris <= DIRECT_TRIANGLE_LIMIT.toLong() && totalVerts <= (DIRECT_TRIANGLE_LIMIT.toLong() * 3L)) {
+        if (totalTris <= budget.directTriangleLimit.toLong() && totalVerts <= (budget.directTriangleLimit.toLong() * 3L)) {
             DirectStreamingGlbWriter(scratchDir, hasColors = hasColors, hasMultiMaterial = hasMultiMat).use { writer ->
                 BufferedInputStream(FileInputStream(triRecordFile), IO_BUFFER_BYTES).use { bis ->
                     while (true) {
@@ -3613,8 +3754,8 @@ object StreamingMeshProcessor {
             }
         }
 
-        // Spatial Clustering Pass for >10M ("∞") OBJ meshes (~9M-10M preserved triangles)
-        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris)
+        // Spatial Clustering Pass scaled to device capability
+        val (targetTris, maxClusters) = computeTargetClusterBudget(totalTris, emergencyFallback = false, budget = budget)
         val estimatedTotalArea = estimateTotalAreaFromObjFile(positions, triRecordFile, totalTris, recBytes)
         var gridRes = estimateSurfaceAwareGridResolution(bounds, estimatedTotalArea, targetTris, totalTris)
         var upwardRetries = 0

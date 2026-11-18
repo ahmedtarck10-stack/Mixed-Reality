@@ -913,27 +913,79 @@ class UsdAndInfinityScaleTest {
     }
 
     @Test
-    fun tenMillionTriangleLimitAndArtifactPreservingBudgetAreEnforced() {
-        assertEquals(10_000_000, StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT)
-        assertEquals(5_500_000, StreamingMeshProcessor.CLUSTER_MAX_VERTICES)
+    fun twoMillionBaselineAndDeviceAdaptiveBudgetsAreEnforced() {
+        assertEquals(2_000_000, StreamingMeshProcessor.DIRECT_TRIANGLE_LIMIT)
+        assertEquals(1_350_000, StreamingMeshProcessor.CLUSTER_MAX_VERTICES)
 
-        // 30M triangle artifact -> max 70% reduction -> keeps 9M triangles (not 200K-300K!)
-        val (target30M, maxClusters30M) = StreamingMeshProcessor.computeTargetClusterBudget(30_000_000L)
-        assertEquals(9_000_000L, target30M)
-        assertEquals(5_500_000, maxClusters30M)
+        // Weak phone (<=4GB RAM or low-ram): protects RAM/GPU at 900K direct / 850K clustered
+        val lowBudget = StreamingMeshProcessor.classifyDeviceMeshBudget(
+            totalRamMb = 3_800L,
+            availRamMb = 1_200L,
+            isLowRamDevice = false,
+            cpuCores = 8,
+            is64Bit = true
+        )
+        assertEquals(StreamingMeshProcessor.DevicePerformanceTier.LOW, lowBudget.tier)
+        assertEquals(900_000, lowBudget.directTriangleLimit)
 
-        // 12M triangle artifact -> keeps >=8.5M triangles (~71% preserved)
-        val (target12M, _) = StreamingMeshProcessor.computeTargetClusterBudget(12_000_000L)
-        assertEquals(8_500_000L, target12M)
+        // Mid-range phone (6-8GB RAM): baseline 2M triangles opens losslessly without downsizing
+        val standardBudget = StreamingMeshProcessor.classifyDeviceMeshBudget(
+            totalRamMb = 6_000L,
+            availRamMb = 2_400L,
+            isLowRamDevice = false,
+            cpuCores = 8,
+            is64Bit = true
+        )
+        assertEquals(StreamingMeshProcessor.DevicePerformanceTier.STANDARD, standardBudget.tier)
+        assertEquals(2_000_000, standardBudget.directTriangleLimit)
+        val (target30MStandard, maxClustersStandard) = StreamingMeshProcessor.computeTargetClusterBudget(
+            30_000_000L,
+            budget = standardBudget
+        )
+        assertEquals(2_000_000L, target30MStandard)
+        assertEquals(1_350_000, maxClustersStandard)
 
-        // 100M triangle model -> capped safely at 10M triangles
-        val (target100M, _) = StreamingMeshProcessor.computeTargetClusterBudget(100_000_000L)
-        assertEquals(10_000_000L, target100M)
+        // Strong phone (8GB+ healthy RAM): opens up to 3M losslessly
+        val highBudget = StreamingMeshProcessor.classifyDeviceMeshBudget(
+            totalRamMb = 8_192L,
+            availRamMb = 3_500L,
+            isLowRamDevice = false,
+            cpuCores = 8,
+            is64Bit = true
+        )
+        assertEquals(StreamingMeshProcessor.DevicePerformanceTier.HIGH, highBudget.tier)
+        assertEquals(3_000_000, highBudget.directTriangleLimit)
 
-        // Emergency OOM fallback still preserves ~3.5M triangles instead of collapsing to 200K
-        val (targetEmergency, emergencyMax) = StreamingMeshProcessor.computeTargetClusterBudget(30_000_000L, emergencyFallback = true)
-        assertEquals(3_500_000L, targetEmergency)
-        assertEquals(2_200_000, emergencyMax)
+        // Flagship phone (12GB+ RAM): opens up to 4M losslessly without unnecessary simplification
+        val flagshipBudget = StreamingMeshProcessor.classifyDeviceMeshBudget(
+            totalRamMb = 12_288L,
+            availRamMb = 5_500L,
+            isLowRamDevice = false,
+            cpuCores = 8,
+            is64Bit = true
+        )
+        assertEquals(StreamingMeshProcessor.DevicePerformanceTier.FLAGSHIP, flagshipBudget.tier)
+        assertEquals(4_000_000, flagshipBudget.directTriangleLimit)
+        val (target30MFlagship, _) = StreamingMeshProcessor.computeTargetClusterBudget(
+            30_000_000L,
+            budget = flagshipBudget
+        )
+        assertEquals(3_600_000L, target30MFlagship)
+
+        // Emergency OOM fallback drops to a reliably loadable triangle count per tier
+        val (targetEmergencyLow, _) = StreamingMeshProcessor.computeTargetClusterBudget(
+            30_000_000L,
+            emergencyFallback = true,
+            budget = lowBudget
+        )
+        val (targetEmergencyStandard, emergencyMaxStandard) = StreamingMeshProcessor.computeTargetClusterBudget(
+            30_000_000L,
+            emergencyFallback = true,
+            budget = standardBudget
+        )
+        assertEquals(380_000L, targetEmergencyLow)
+        assertEquals(750_000L, targetEmergencyStandard)
+        assertEquals(500_000, emergencyMaxStandard)
     }
 
     @Test

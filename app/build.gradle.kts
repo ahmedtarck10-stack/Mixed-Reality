@@ -34,6 +34,7 @@ android {
             signingConfig = signingConfigs.getByName("debugConfig")
         }
         release {
+            isDefault = true
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debugConfig")
         }
@@ -53,7 +54,22 @@ android {
         compose = true
     }
 
+    bundle {
+        abi {
+            enableSplit = true
+        }
+        density {
+            enableSplit = true
+        }
+        language {
+            enableSplit = true
+        }
+    }
+
     packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }

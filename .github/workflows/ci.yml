@@ -64,50 +64,50 @@ jobs:
       - name: Run Unit Tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace
 
-      - name: Run Android Lint
+      - name: Run Release Lint
         continue-on-error: true
-        run: ./gradlew :app:lintDebug --stacktrace
+        run: ./gradlew :app:lintRelease --stacktrace
 
-      - name: Build Debug & Release APKs
-        run: ./gradlew :app:assembleDebug :app:assembleRelease --stacktrace
+      - name: Build Release APK & Google Play Console AAB (Primary)
+        run: ./gradlew :app:assembleRelease :app:bundleRelease --stacktrace
 
-      - name: Collect APK Artifacts
+      - name: Collect Release Artifacts
         run: |
-          mkdir -p build-apks
-          cp app/build/outputs/apk/debug/*.apk build-apks/
-          cp app/build/outputs/apk/release/*.apk build-apks/
-          echo "Built APK files:"
-          ls -lh build-apks/
+          mkdir -p release-artifacts
+          apk=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          aab=$(find app/build/outputs/bundle/release -name "*.aab" | head -n 1)
+          if [ -z "$apk" ] || [ -z "$aab" ]; then
+            echo "::error::Missing Release APK ($apk) or Release AAB ($aab)"
+            exit 1
+          fi
+          cp "$apk" release-artifacts/mixed-reality-release.apk
+          cp "$aab" release-artifacts/mixed-reality-release.aab
+          echo "Built Release Artifacts:"
+          ls -lh release-artifacts/
 
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: mixed-reality-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload Release APK
+      - name: Upload Release APK (Primary)
         uses: actions/upload-artifact@v4
         with:
           name: mixed-reality-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: release-artifacts/mixed-reality-release.apk
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload All APKs
+      - name: Upload Play Console Release AAB
         uses: actions/upload-artifact@v4
         with:
-          name: mixed-reality-all-apks
-          path: build-apks/*.apk
+          name: mixed-reality-play-console-aab
+          path: release-artifacts/mixed-reality-release.aab
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach APKs to GitHub Release
+      - name: Attach Release APK & Play Console AAB to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build-apks/*.apk
+          files: |
+            release-artifacts/mixed-reality-release.apk
+            release-artifacts/mixed-reality-release.aab
           draft: false
           prerelease: false
           generate_release_notes: true
