@@ -47,7 +47,9 @@ object MediaManager {
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
 
         return try {
-            resolver.openOutputStream(uri)?.use { outputStream ->
+            val stream = resolver.openOutputStream(uri)
+                ?: throw IllegalStateException("Unable to open image MediaStore stream")
+            stream.use { outputStream ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
             }
 
@@ -96,6 +98,9 @@ object MediaManager {
                         if (copyResult == PixelCopy.SUCCESS) {
                             onCaptured(bitmap)
                         } else {
+                            if (!bitmap.isRecycled) {
+                                bitmap.recycle()
+                            }
                             // Fallback to Canvas draw
                             val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                             val canvas = Canvas(fallback)
@@ -107,6 +112,9 @@ object MediaManager {
                 )
             } catch (e: Throwable) {
                 Log.w(TAG, "PixelCopy failed, using canvas fallback: ${e.message}")
+                if (!bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
                 val fallback = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(fallback)
                 decorView.draw(canvas)
@@ -117,6 +125,82 @@ object MediaManager {
             val canvas = Canvas(fallback)
             decorView.draw(canvas)
             onCaptured(fallback)
+        }
+    }
+
+    /**
+     * Captures the composited activity window (SurfaceView/ARSceneView/PreviewView/TextureView/UI)
+     * directly into a caller-owned [destBitmap], letting PixelCopy perform hardware scaling on GPU.
+     */
+    fun captureWindowIntoBitmap(
+        activity: Activity,
+        destBitmap: Bitmap,
+        callbackHandler: Handler,
+        onFinished: (Boolean) -> Unit
+    ) {
+        if (activity.isFinishing || activity.isDestroyed || destBitmap.isRecycled) {
+            onFinished(false)
+            return
+        }
+
+        val window = activity.window
+        val decorView = window.decorView
+        val width = decorView.width
+        val height = decorView.height
+        if (width <= 0 || height <= 0) {
+            onFinished(false)
+            return
+        }
+
+        val srcRect = Rect(0, 0, width, height)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                PixelCopy.request(
+                    window,
+                    srcRect,
+                    destBitmap,
+                    { copyResult ->
+                        if (copyResult == PixelCopy.SUCCESS) {
+                            onFinished(true)
+                        } else {
+                            drawScaledDecorViewFallback(decorView, destBitmap, callbackHandler, onFinished)
+                        }
+                    },
+                    callbackHandler
+                )
+                return
+            } catch (e: Throwable) {
+                Log.w(TAG, "Window PixelCopy request failed: ${e.message}")
+            }
+        }
+
+        drawScaledDecorViewFallback(decorView, destBitmap, callbackHandler, onFinished)
+    }
+
+    private fun drawScaledDecorViewFallback(
+        decorView: android.view.View,
+        destBitmap: Bitmap,
+        callbackHandler: Handler,
+        onFinished: (Boolean) -> Unit
+    ) {
+        decorView.post {
+            val drawn = try {
+                if (destBitmap.isRecycled || decorView.width <= 0 || decorView.height <= 0) {
+                    false
+                } else {
+                    val canvas = Canvas(destBitmap)
+                    val sx = destBitmap.width.toFloat() / decorView.width.toFloat()
+                    val sy = destBitmap.height.toFloat() / decorView.height.toFloat()
+                    canvas.scale(sx, sy)
+                    decorView.draw(canvas)
+                    true
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Canvas fallback draw failed: ${e.message}")
+                false
+            }
+            callbackHandler.post { onFinished(drawn) }
         }
     }
 
@@ -145,7 +229,9 @@ object MediaManager {
         val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
 
         return try {
-            resolver.openOutputStream(uri)?.use { outputStream ->
+            val stream = resolver.openOutputStream(uri)
+                ?: throw IllegalStateException("Unable to open video MediaStore stream")
+            stream.use { outputStream ->
                 videoFile.inputStream().use { inputStream ->
                     inputStream.copyTo(outputStream)
                 }

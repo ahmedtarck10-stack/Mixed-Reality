@@ -173,6 +173,12 @@ fun MRMainScreen(
     val fallbackSurfaceMirrorer = rememberSurfaceMirrorer()
     var activeSurfaceMirrorer by remember { mutableStateOf<SurfaceMirrorer?>(null) }
 
+    DisposableEffect(videoRecorder) {
+        onDispose {
+            videoRecorder.cancelAndRelease()
+        }
+    }
+
     // Clear trigger counter for AR anchors
     var clearTrigger by remember { mutableIntStateOf(0) }
 
@@ -574,15 +580,19 @@ fun MRMainScreen(
                     }
                 },
                 onRecClick = {
-                    // Requirement 2: Start / Stop video recording and save to Gallery
+                    // Requirement 2: Start / Stop video recording across Object, AR, and MR modes
                     if (!isRecording) {
-                        isRecording = true
-                        videoRecorder.startRecording(
-                            activity,
-                            activeSurfaceMirrorer ?: fallbackSurfaceMirrorer,
-                            scope
+                        val started = videoRecorder.startRecording(
+                            activity = activity,
+                            surfaceMirrorer = activeSurfaceMirrorer ?: fallbackSurfaceMirrorer,
+                            scope = scope
                         )
-                        Toast.makeText(context, "Video recording started 🎥", Toast.LENGTH_SHORT).show()
+                        if (started) {
+                            isRecording = true
+                            Toast.makeText(context, "Video recording started 🎥", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "Unable to start video recording", Toast.LENGTH_SHORT).show()
+                        }
                     } else {
                         isRecording = false
                         scope.launch {
@@ -596,7 +606,7 @@ fun MRMainScreen(
                                     message = "Mixed Reality video clip saved to your Gallery."
                                 )
                             } else {
-                                Toast.makeText(context, "Recording finished", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Could not save video clip", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
