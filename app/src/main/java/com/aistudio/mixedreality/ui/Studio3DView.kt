@@ -66,6 +66,9 @@ fun Studio3DView(
     onRotationZChange: (Float) -> Unit = {},
     orientation: SpatialQuaternion? = null,
     onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
+    onRotateAxesDelta: ((Float, Float, Float) -> Unit)? = null,
+    resetGesturesTrigger: Int = 0,
+    onResetGestures: () -> Unit = {},
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
@@ -98,6 +101,12 @@ fun Studio3DView(
     val windowManager = if (needsViewNodeManager) rememberViewNodeManager() else null
     val scope = rememberCoroutineScope()
     var modelPosition by remember { mutableStateOf(Position(0f, 0f, 0f)) }
+
+    LaunchedEffect(resetGesturesTrigger) {
+        if (resetGesturesTrigger > 0) {
+            modelPosition = Position(0f, 0f, 0f)
+        }
+    }
 
     val pbrMaterial = remember(localMaterialLoader, color, metallic, roughness) {
         localMaterialLoader.createColorInstance(
@@ -183,37 +192,41 @@ fun Studio3DView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
+                onLongPress = {
+                    if (isModelVisible) {
+                        onResetGestures()
+                    }
+                },
                 onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (activeRotationAxis == RotationAxis.ALL && onOrientationChange != null && baseQuat != null) {
-                        var updated = baseQuat
-                        if (dx != 0f) updated = updated.rotateWorldY(dx * 0.45f)
-                        if (dy != 0f) updated = updated.rotateWorldX(-dy * 0.45f)
-                        onOrientationChange(updated)
-                    }
-                    applyRotationDelta(
-                        axis = activeRotationAxis,
+                    dispatchViewportRotation(
+                        activeAxis = activeRotationAxis,
                         dx = dx,
                         dy = dy,
                         isEdgeDrag = isEdgeDrag,
+                        viewportWidthPx = viewWidthPx,
+                        viewportHeightPx = viewHeightPx,
                         currentRotX = rotationX,
                         currentRotY = rotationY,
                         currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
                         onRotX = onRotationXChange,
                         onRotY = onRotationYChange,
-                        onRotZ = onRotationZChange,
-                        sensitivity = 0.45f
+                        onRotZ = onRotationZChange
                     )
                 },
                 onOneFingerRotateZ = { dAngle ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (onOrientationChange != null && baseQuat != null) {
-                        onOrientationChange(baseQuat.rotateWorldZ(-dAngle))
-                    }
-                    val newRotZ = ((rotationZ + dAngle) % 360f + 360f) % 360f
-                    onRotationZChange(newRotZ)
+                    dispatchViewportZRoll(
+                        deltaAngle = dAngle,
+                        currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
+                        onRotZ = onRotationZChange
+                    )
                 },
                 onTwoFingerZoom = { zoomMultiplier ->
                     val newScale = (scale * zoomMultiplier).coerceIn(0.1f, 2500.0f)

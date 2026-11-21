@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -141,7 +142,10 @@ fun ARMixedRealityView(
     onRotationZChange: (Float) -> Unit = {},
     orientation: SpatialQuaternion? = null,
     onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
+    onRotateAxesDelta: ((Float, Float, Float) -> Unit)? = null,
     clearTrigger: Int = 0,
+    resetGesturesTrigger: Int = 0,
+    onResetGestures: () -> Unit = {},
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
@@ -162,6 +166,8 @@ fun ARMixedRealityView(
     val currentOrientation by rememberUpdatedState(orientation)
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
+    var viewWidthPx by remember { mutableFloatStateOf(1080f) }
+    var viewHeightPx by remember { mutableFloatStateOf(1920f) }
 
     val trackingManager = rememberARTrackingManager(
         modeName = "AR",
@@ -182,6 +188,12 @@ fun ARMixedRealityView(
             trackingManager.clear()
             modelOffset = Position(0f, 0f, 0f)
             isAnchorLocked = false
+        }
+    }
+
+    LaunchedEffect(resetGesturesTrigger) {
+        if (resetGesturesTrigger > 0) {
+            modelOffset = Position(0f, 0f, 0f)
         }
     }
 
@@ -248,7 +260,10 @@ fun ARMixedRealityView(
             onRotationZChange = onRotationZChange,
             orientation = orientation,
             onOrientationChange = onOrientationChange,
+            onRotateAxesDelta = onRotateAxesDelta,
             clearTrigger = clearTrigger,
+            resetGesturesTrigger = resetGesturesTrigger,
+            onResetGestures = onResetGestures,
             isMoveMode = isMoveMode,
             onToggleMoveMode = onToggleMoveMode,
             activeRotationAxis = activeRotationAxis,
@@ -441,6 +456,10 @@ fun ARMixedRealityView(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onSizeChanged { size ->
+                if (size.width > 0) viewWidthPx = size.width.toFloat()
+                if (size.height > 0) viewHeightPx = size.height.toFloat()
+            }
             .spatialMRGestures(
                 scope = scope,
                 isMoveMode = isMoveMode,
@@ -457,38 +476,41 @@ fun ARMixedRealityView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
+                onLongPress = {
+                    if (isModelVisible) {
+                        onResetGestures()
+                    }
+                },
                 onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (activeRotationAxis == RotationAxis.ALL && onOrientationChange != null && baseQuat != null) {
-                        var updated = baseQuat
-                        if (dx != 0f) updated = updated.rotateWorldY(dx * 0.45f)
-                        if (dy != 0f) updated = updated.rotateWorldX(-dy * 0.45f)
-                        onOrientationChange(updated)
-                    }
-                    applyRotationDelta(
-                        axis = activeRotationAxis,
+                    dispatchViewportRotation(
+                        activeAxis = activeRotationAxis,
                         dx = dx,
                         dy = dy,
                         isEdgeDrag = isEdgeDrag,
+                        viewportWidthPx = viewWidthPx,
+                        viewportHeightPx = viewHeightPx,
                         currentRotX = rotationX,
                         currentRotY = rotationY,
                         currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
                         onRotX = onRotationXChange,
                         onRotY = onRotationYChange,
-                        onRotZ = onRotationZChange,
-                        sensitivity = 0.45f
+                        onRotZ = onRotationZChange
                     )
                 },
                 onOneFingerRotateZ = { dAngle ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (onOrientationChange != null && baseQuat != null) {
-                        onOrientationChange(baseQuat.rotateWorldZ(-dAngle))
-                    }
-                    val newRotZ =
-                        ((rotationZ + dAngle) % 360f + 360f) % 360f
-                    onRotationZChange(newRotZ)
+                    dispatchViewportZRoll(
+                        deltaAngle = dAngle,
+                        currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
+                        onRotZ = onRotationZChange
+                    )
                 },
                 onTwoFingerZoom = { zoomMultiplier ->
                     val newScale =

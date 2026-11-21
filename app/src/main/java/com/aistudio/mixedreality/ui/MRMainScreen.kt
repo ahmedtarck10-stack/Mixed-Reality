@@ -71,6 +71,7 @@ fun MRMainScreen(
     val context = LocalContext.current
     val activity = context as? Activity
     val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
 
     // Shared single Filament Engine & loaders across entire screen lifecycle
     // Prevents multi-engine EGL context crashes, redundant model reloads, and GPU memory exhaustion
@@ -179,14 +180,47 @@ fun MRMainScreen(
         }
     }
 
-    // Clear trigger counter for AR anchors
+    // Clear trigger counter for AR anchors & gesture reset counter for 1-finger long tap
     var clearTrigger by remember { mutableIntStateOf(0) }
+    var resetGesturesTrigger by remember { mutableIntStateOf(0) }
 
     // Full Screen Mode (Triple-Tap toggles upper part & lower part)
     var isFullScreen by remember { mutableStateOf(false) }
 
     // Move Mode (Double-Tap switches between 2-finger Move and 2-finger Scale)
     var isMoveMode by remember { mutableStateOf(false) }
+
+    val rotateAxesDelta: (Float, Float, Float) -> Unit = { dPitchDeg, dYawDeg, dRollDeg ->
+        if (dYawDeg != 0f) {
+            modelQuaternion = modelQuaternion.rotateWorldY(dYawDeg)
+            rotationY = ((rotationY + dYawDeg) % 360f + 360f) % 360f
+        }
+        if (dPitchDeg != 0f) {
+            modelQuaternion = modelQuaternion.rotateWorldX(dPitchDeg)
+            rotationX = ((rotationX + dPitchDeg) % 360f + 360f) % 360f
+        }
+        if (dRollDeg != 0f) {
+            modelQuaternion = modelQuaternion.rotateWorldZ(dRollDeg)
+            rotationZ = ((rotationZ - dRollDeg) % 360f + 360f) % 360f
+        }
+    }
+
+    val resetAllGestures: () -> Unit = {
+        isAutoRotating = false
+        rotationX = 0f
+        rotationY = 0f
+        rotationZ = 0f
+        modelQuaternion = SpatialQuaternion.IDENTITY
+        activeRotationAxis = RotationAxis.ALL
+        objectScaleFactor = 1.0f
+        arScaleFactor = 1.0f
+        isMoveMode = false
+        resetGesturesTrigger++
+        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        if (!isFullScreen) {
+            Toast.makeText(context, "All gestures reset to default ↺", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // Camera permission launcher
     var hasCameraPermission by remember {
@@ -366,6 +400,9 @@ fun MRMainScreen(
                     onRotationZChange = { rotationZ = it },
                     orientation = modelQuaternion,
                     onOrientationChange = { modelQuaternion = it },
+                    onRotateAxesDelta = rotateAxesDelta,
+                    resetGesturesTrigger = resetGesturesTrigger,
+                    onResetGestures = resetAllGestures,
                     isMoveMode = isMoveMode,
                     onToggleMoveMode = { isMoveMode = !isMoveMode },
                     activeRotationAxis = activeRotationAxis,
@@ -409,7 +446,10 @@ fun MRMainScreen(
                         onRotationZChange = { rotationZ = it },
                         orientation = modelQuaternion,
                         onOrientationChange = { modelQuaternion = it },
+                        onRotateAxesDelta = rotateAxesDelta,
                         clearTrigger = clearTrigger,
+                        resetGesturesTrigger = resetGesturesTrigger,
+                        onResetGestures = resetAllGestures,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
                         activeRotationAxis = activeRotationAxis,
@@ -458,6 +498,7 @@ fun MRMainScreen(
                         onRotationZChange = { rotationZ = it },
                         orientation = modelQuaternion,
                         onOrientationChange = { modelQuaternion = it },
+                        onRotateAxesDelta = rotateAxesDelta,
                         isRecording = isRecording,
                         engine = engine,
                         modelLoader = sharedModelLoader,
@@ -466,6 +507,8 @@ fun MRMainScreen(
                         onSurfaceMirrorerChanged = { activeSurfaceMirrorer = it },
                         isARCoreAvailable = isARCoreAvailable,
                         clearTrigger = clearTrigger,
+                        resetGesturesTrigger = resetGesturesTrigger,
+                        onResetGestures = resetAllGestures,
                         isMoveMode = isMoveMode,
                         onToggleMoveMode = { isMoveMode = !isMoveMode },
                         activeRotationAxis = activeRotationAxis,

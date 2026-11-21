@@ -10,7 +10,10 @@ import com.aistudio.mixedreality.ui.ZoomGestureAccumulator
 import com.aistudio.mixedreality.ui.ZoomScalePolicy
 import com.aistudio.mixedreality.ui.applyRotationDelta
 import com.aistudio.mixedreality.ui.calculateOneFingerZRollDelta
+import com.aistudio.mixedreality.ui.calculateResponsiveZRollDelta
+import com.aistudio.mixedreality.ui.computeRotationSensitivity
 import com.aistudio.mixedreality.ui.decideOneFingerStrokeAxis
+import com.aistudio.mixedreality.ui.evaluateOneFingerAxisSwitch
 import com.aistudio.mixedreality.ui.filterPoseWithLegacyDamping
 import com.aistudio.mixedreality.ui.isOuterZRingTouch
 import com.aistudio.mixedreality.ui.isRecoveryCandidateAcceptable
@@ -18,6 +21,7 @@ import com.aistudio.mixedreality.ui.isRecoveryTranslationContinuous
 import com.aistudio.mixedreality.ui.isVerifiedTrackingPose
 import com.aistudio.mixedreality.ui.placementTapDecision
 import com.aistudio.mixedreality.ui.shouldAttemptAnchorRecovery
+import com.aistudio.mixedreality.ui.shouldTriggerOneFingerLongPress
 import com.aistudio.mixedreality.util.ModelFormatConverter
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Config
@@ -351,11 +355,85 @@ class SpatialMathAndGesturesTest {
         assertEquals(OneFingerStrokeAxis.Y_YAW, decideOneFingerStrokeAxis(32f, 8f, thresholdPx = 16f))
         assertEquals(OneFingerStrokeAxis.X_PITCH, decideOneFingerStrokeAxis(6f, 34f, thresholdPx = 16f))
 
-        // Portrait 1080x2400 interior center stays in X/Y zone; outer ~16% rim activates Z Roll
+        // Portrait 1080x2400 interior center stays in X/Y zone; comfortable perimeter rim activates Z Roll
         assertFalse(isOuterZRingTouch(Offset(540f, 1200f), 1080f, 2400f))
         assertFalse(isOuterZRingTouch(Offset(250f, 1900f), 1080f, 2400f))
         assertTrue(isOuterZRingTouch(Offset(35f, 1200f), 1080f, 2400f))
         assertTrue(isOuterZRingTouch(Offset(540f, 60f), 1080f, 2400f))
+    }
+
+    @Test
+    fun dynamicAxisSteeringTransitionsSmoothlyWithoutDiagonalWobble() {
+        // Minor diagonal wobble preserves active Y_YAW isolation
+        assertEquals(
+            OneFingerStrokeAxis.Y_YAW,
+            evaluateOneFingerAxisSwitch(OneFingerStrokeAxis.Y_YAW, windowDx = 30f, windowDy = 12f)
+        )
+        // Deliberate vertical turn smoothly switches Y_YAW -> X_PITCH mid-stroke
+        assertEquals(
+            OneFingerStrokeAxis.X_PITCH,
+            evaluateOneFingerAxisSwitch(OneFingerStrokeAxis.Y_YAW, windowDx = 6f, windowDy = 45f)
+        )
+        // Deliberate horizontal turn smoothly switches X_PITCH -> Y_YAW mid-stroke
+        assertEquals(
+            OneFingerStrokeAxis.Y_YAW,
+            evaluateOneFingerAxisSwitch(OneFingerStrokeAxis.X_PITCH, windowDx = 48f, windowDy = 5f)
+        )
+        // Active Z_ROLL stays locked around perimeter
+        assertEquals(
+            OneFingerStrokeAxis.Z_ROLL,
+            evaluateOneFingerAxisSwitch(OneFingerStrokeAxis.Z_ROLL, windowDx = 80f, windowDy = 0f)
+        )
+    }
+
+    @Test
+    fun rotationSensitivityAndResponsiveZRollAreNormalizedAcrossScreens() {
+        val sens1080 = computeRotationSensitivity(1080f, 2400f)
+        val sens1440 = computeRotationSensitivity(1440f, 3120f)
+        val sensLandscape = computeRotationSensitivity(2400f, 1080f)
+        assertEquals(sens1080, sensLandscape, 0.001f)
+        assertTrue(sens1440 < sens1080)
+        assertEquals(0.30f, computeRotationSensitivity(0f, 0f), 0.001f)
+
+        // Top-rim horizontal sweep on tall portrait screen maintains strong, capped Z roll response
+        val center = Offset(540f, 1200f)
+        val topRimDelta = calculateResponsiveZRollDelta(
+            prev = Offset(490f, 120f),
+            curr = Offset(590f, 120f),
+            center = center,
+            viewportWidthPx = 1080f,
+            viewportHeightPx = 2400f
+        )
+        assertTrue("Top rim Z roll should be responsive (>10 deg), got $topRimDelta", topRimDelta > 10f && topRimDelta <= 24f)
+    }
+
+    @Test
+    fun oneFingerLongPressOnlyTriggersForStationarySingleFingerHold() {
+        assertTrue(
+            shouldTriggerOneFingerLongPress(
+                maxPointersSeen = 1,
+                isGestureDrag = false,
+                elapsedMs = 520L,
+                totalDistancePx = 8f,
+                touchSlopPx = 24f
+            )
+        )
+        assertFalse(
+            "Short tap must not trigger long-press reset",
+            shouldTriggerOneFingerLongPress(1, false, 300L, 4f, 24f)
+        )
+        assertFalse(
+            "Two-finger gesture must not trigger long-press reset",
+            shouldTriggerOneFingerLongPress(2, false, 700L, 4f, 24f)
+        )
+        assertFalse(
+            "Dragged stroke must not trigger long-press reset",
+            shouldTriggerOneFingerLongPress(1, true, 700L, 4f, 24f)
+        )
+        assertFalse(
+            "Excessive finger travel must not trigger long-press reset",
+            shouldTriggerOneFingerLongPress(1, false, 700L, 80f, 24f)
+        )
     }
 
     @Test

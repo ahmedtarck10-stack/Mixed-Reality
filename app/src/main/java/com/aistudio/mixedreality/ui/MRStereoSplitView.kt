@@ -84,6 +84,7 @@ fun MRStereoSplitView(
     onRotationZChange: (Float) -> Unit = {},
     orientation: SpatialQuaternion? = null,
     onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
+    onRotateAxesDelta: ((Float, Float, Float) -> Unit)? = null,
     isRecording: Boolean = false,
     engine: Engine,
     modelLoader: ModelLoader? = null,
@@ -93,6 +94,8 @@ fun MRStereoSplitView(
     onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {},
     isARCoreAvailable: Boolean = true,
     clearTrigger: Int = 0,
+    resetGesturesTrigger: Int = 0,
+    onResetGestures: () -> Unit = {},
     isMoveMode: Boolean = false,
     onToggleMoveMode: () -> Unit = {},
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
@@ -120,6 +123,7 @@ fun MRStereoSplitView(
         onRotationZChange = onRotationZChange,
         orientation = orientation,
         onOrientationChange = onOrientationChange,
+        onRotateAxesDelta = onRotateAxesDelta,
         onStopAutoRotate = onStopAutoRotate,
         onFallbackToObject = onFallbackToObject,
         engine = engine,
@@ -128,6 +132,8 @@ fun MRStereoSplitView(
         environmentLoader = environmentLoader,
         onSurfaceMirrorerChanged = onSurfaceMirrorerChanged,
         clearTrigger = clearTrigger,
+        resetGesturesTrigger = resetGesturesTrigger,
+        onResetGestures = onResetGestures,
         isMoveMode = isMoveMode,
         onToggleMoveMode = onToggleMoveMode,
         activeRotationAxis = activeRotationAxis,
@@ -157,6 +163,7 @@ private fun MRStereoARCoreView(
     onRotationZChange: (Float) -> Unit = {},
     orientation: SpatialQuaternion? = null,
     onOrientationChange: ((SpatialQuaternion) -> Unit)? = null,
+    onRotateAxesDelta: ((Float, Float, Float) -> Unit)? = null,
     onStopAutoRotate: () -> Unit,
     onFallbackToObject: () -> Unit = {},
     engine: Engine,
@@ -165,6 +172,8 @@ private fun MRStereoARCoreView(
     environmentLoader: EnvironmentLoader? = null,
     onSurfaceMirrorerChanged: (SurfaceMirrorer?) -> Unit = {},
     clearTrigger: Int,
+    resetGesturesTrigger: Int = 0,
+    onResetGestures: () -> Unit = {},
     isMoveMode: Boolean,
     onToggleMoveMode: () -> Unit,
     activeRotationAxis: RotationAxis = RotationAxis.ALL,
@@ -363,6 +372,12 @@ private fun MRStereoARCoreView(
     var leftEyeHeightPx by remember {
         mutableFloatStateOf(1080f)
     }
+    var rootWidthPx by remember {
+        mutableFloatStateOf(1920f)
+    }
+    var rootHeightPx by remember {
+        mutableFloatStateOf(1080f)
+    }
 
     var modelOffset by remember {
         mutableStateOf(Position(0f, 0f, 0f))
@@ -389,6 +404,12 @@ private fun MRStereoARCoreView(
             trackingManager.clear()
             modelOffset = Position(0f, 0f, 0f)
             isAnchorLocked = false
+        }
+    }
+
+    LaunchedEffect(resetGesturesTrigger) {
+        if (resetGesturesTrigger > 0) {
+            modelOffset = Position(0f, 0f, 0f)
         }
     }
 
@@ -441,6 +462,10 @@ private fun MRStereoARCoreView(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onSizeChanged { size ->
+                if (size.width > 0) rootWidthPx = size.width.toFloat()
+                if (size.height > 0) rootHeightPx = size.height.toFloat()
+            }
             .spatialMRGestures(
                 scope = scope,
                 isMoveMode = isMoveMode,
@@ -457,38 +482,41 @@ private fun MRStereoARCoreView(
                 onTripleTap = {
                     onToggleFullScreen()
                 },
+                onLongPress = {
+                    if (isModelVisible) {
+                        onResetGestures()
+                    }
+                },
                 onOneFingerRotate = { dx, dy, isEdgeDrag ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (activeRotationAxis == RotationAxis.ALL && onOrientationChange != null && baseQuat != null) {
-                        var updated = baseQuat
-                        if (dx != 0f) updated = updated.rotateWorldY(dx * 0.45f)
-                        if (dy != 0f) updated = updated.rotateWorldX(-dy * 0.45f)
-                        onOrientationChange(updated)
-                    }
-                    applyRotationDelta(
-                        axis = activeRotationAxis,
+                    dispatchViewportRotation(
+                        activeAxis = activeRotationAxis,
                         dx = dx,
                         dy = dy,
                         isEdgeDrag = isEdgeDrag,
+                        viewportWidthPx = rootWidthPx,
+                        viewportHeightPx = rootHeightPx,
                         currentRotX = rotationX,
                         currentRotY = rotationY,
                         currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
                         onRotX = onRotationXChange,
                         onRotY = onRotationYChange,
-                        onRotZ = onRotationZChange,
-                        sensitivity = 0.45f
+                        onRotZ = onRotationZChange
                     )
                 },
                 onOneFingerRotateZ = { dAngle ->
                     onStopAutoRotate()
-                    val baseQuat = currentOrientation
-                    if (onOrientationChange != null && baseQuat != null) {
-                        onOrientationChange(baseQuat.rotateWorldZ(-dAngle))
-                    }
-                    val newRotZ =
-                        ((rotationZ + dAngle) % 360f + 360f) % 360f
-                    onRotationZChange(newRotZ)
+                    dispatchViewportZRoll(
+                        deltaAngle = dAngle,
+                        currentRotZ = rotationZ,
+                        currentOrientation = currentOrientation,
+                        onRotateAxesDelta = onRotateAxesDelta,
+                        onOrientationChange = onOrientationChange,
+                        onRotZ = onRotationZChange
+                    )
                 },
                 onTwoFingerZoom = { zoomFactor ->
                     val newScale =
