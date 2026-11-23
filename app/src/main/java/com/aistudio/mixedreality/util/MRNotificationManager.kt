@@ -27,9 +27,38 @@ object MRNotificationManager {
     const val NOTIFICATION_ID_EVENT = 1002
 
     const val EXTRA_SHORTCUT_ACTION = "shortcut_action"
+    const val EXTRA_MODEL_NAME = "shortcut_model_name"
     const val ACTION_LAUNCH_AR = "launch_ar"
+    const val ACTION_LAUNCH_MR = "launch_mr"
+    const val ACTION_LAUNCH_OBJECT = "launch_object"
     const val ACTION_OPEN_PICKER = "open_picker"
     const val ACTION_CLOUD_LIBRARY = "cloud_library"
+    const val ACTION_SELECT_MODEL = "select_model"
+
+    private const val NOTIFICATION_ACCENT_COLOR = 0xFF00E5FF.toInt()
+
+    @Volatile
+    private var cachedAppLargeIcon: android.graphics.Bitmap? = null
+
+    private fun getAppLargeIconBitmap(context: Context): android.graphics.Bitmap? {
+        cachedAppLargeIcon?.takeIf { !it.isRecycled }?.let { return it }
+        return runCatching {
+            val drawable = ContextCompat.getDrawable(context, R.mipmap.ic_launcher_round)
+                ?: ContextCompat.getDrawable(context, R.mipmap.ic_launcher)
+                ?: return null
+            val sizePx = 128
+            val bitmap = android.graphics.Bitmap.createBitmap(
+                sizePx,
+                sizePx,
+                android.graphics.Bitmap.Config.ARGB_8888
+            )
+            val canvas = android.graphics.Canvas(bitmap)
+            drawable.setBounds(0, 0, sizePx, sizePx)
+            drawable.draw(canvas)
+            cachedAppLargeIcon = bitmap
+            bitmap
+        }.getOrNull()
+    }
 
     fun hasNotificationPermission(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
@@ -118,7 +147,9 @@ object MRNotificationManager {
         val openIntent = createMainPendingIntent(context, requestCode = 102, shortcutAction = ACTION_OPEN_PICKER)
 
         val notification = NotificationCompat.Builder(context, CHANNEL_SESSION_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_mr_headset)
+            .setLargeIcon(getAppLargeIconBitmap(context))
+            .setColor(NOTIFICATION_ACCENT_COLOR)
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
@@ -148,7 +179,9 @@ object MRNotificationManager {
 
         val contentIntent = createMainPendingIntent(context, requestCode = 103, shortcutAction = null)
         val notification = NotificationCompat.Builder(context, CHANNEL_EVENTS_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_mr_headset)
+            .setLargeIcon(getAppLargeIconBitmap(context))
+            .setColor(NOTIFICATION_ACCENT_COLOR)
             .setContentTitle(title)
             .setContentText(message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(message))

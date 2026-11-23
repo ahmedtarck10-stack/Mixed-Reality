@@ -213,13 +213,24 @@ object MediaManager {
             return null
         }
 
-        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val nowMs = System.currentTimeMillis()
+        val nowSec = nowMs / 1000L
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(nowMs))
         val displayName = "MR_Record_$timeStamp.mp4"
+        val title = displayName.substringBeforeLast('.')
+        val durationMs = extractVideoDurationMs(videoFile)
 
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Video.Media.TITLE, title)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.DATE_ADDED, nowSec)
+            put(MediaStore.Video.Media.DATE_MODIFIED, nowSec)
+            if (durationMs > 0L) {
+                put(MediaStore.Video.Media.DURATION, durationMs)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
                 put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/MixedReality")
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
@@ -235,26 +246,48 @@ object MediaManager {
                 videoFile.inputStream().use { inputStream ->
                     inputStream.copyTo(outputStream)
                 }
+                outputStream.flush()
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 values.clear()
                 values.put(MediaStore.Video.Media.IS_PENDING, 0)
                 resolver.update(uri, values, null, null)
+            } else {
+                // Legacy API 24-28: scan the resolved filesystem path (never raw content:// URI)
+                val dataPath = runCatching {
+                    resolver.query(uri, arrayOf(MediaStore.Video.Media.DATA), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                }.getOrNull()
+                if (!dataPath.isNullOrBlank()) {
+                    MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(dataPath),
+                        arrayOf("video/mp4"),
+                        null
+                    )
+                }
             }
-
-            MediaScannerConnection.scanFile(
-                context,
-                arrayOf(uri.toString()),
-                arrayOf("video/mp4"),
-                null
-            )
-            Log.d(TAG, "Saved video to gallery: $uri")
+            Log.d(TAG, "Saved playable video to gallery (${videoFile.length()} bytes, ${durationMs}ms): $uri")
             uri
         } catch (e: Exception) {
             Log.e(TAG, "Failed saving video to gallery", e)
             resolver.delete(uri, null, null)
             null
+        }
+    }
+
+    private fun extractVideoDurationMs(videoFile: File): Long {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoFile.absolutePath)
+            retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+        } catch (_: Throwable) {
+            0L
+        } finally {
+            runCatching { retriever.release() }
         }
     }
 }

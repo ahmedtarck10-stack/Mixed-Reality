@@ -23,6 +23,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -134,6 +135,64 @@ class VideoSessionRecorder(private val context: Context) {
                         }
                     }
                 }
+            }
+        }
+
+        /**
+         * Verifies that [file] is a finalized ISO BMFF / MP4 container containing both
+         * an 'ftyp' header box, non-empty 'mdat' media payload, and a 'moov' index atom.
+         * Without 'moov' (written only by MediaMuxer.stop()), Gallery players cannot open the video.
+         */
+        fun hasPlayableMp4Structure(file: File): Boolean {
+            if (!file.exists() || file.length() < 32L) return false
+            var hasFtyp = false
+            var hasMoov = false
+            var hasMdatData = false
+            return try {
+                RandomAccessFile(file, "r").use { raf ->
+                    val fileLen = raf.length()
+                    val header = ByteArray(8)
+                    val extSizeBytes = ByteArray(8)
+                    var offset = 0L
+                    var boxCount = 0
+                    while (offset + 8L <= fileLen && boxCount < 256) {
+                        raf.seek(offset)
+                        if (raf.read(header) != 8) break
+                        val boxSize32 = ((header[0].toLong() and 0xFFL) shl 24) or
+                            ((header[1].toLong() and 0xFFL) shl 16) or
+                            ((header[2].toLong() and 0xFFL) shl 8) or
+                            (header[3].toLong() and 0xFFL)
+                        val boxType = String(header, 4, 4, Charsets.US_ASCII)
+                        var headerLen = 8L
+                        var boxSize = when {
+                            boxSize32 == 0L -> fileLen - offset
+                            boxSize32 == 1L -> {
+                                if (offset + 16L > fileLen || raf.read(extSizeBytes) != 8) break
+                                headerLen = 16L
+                                ((extSizeBytes[0].toLong() and 0xFFL) shl 56) or
+                                    ((extSizeBytes[1].toLong() and 0xFFL) shl 48) or
+                                    ((extSizeBytes[2].toLong() and 0xFFL) shl 40) or
+                                    ((extSizeBytes[3].toLong() and 0xFFL) shl 32) or
+                                    ((extSizeBytes[4].toLong() and 0xFFL) shl 24) or
+                                    ((extSizeBytes[5].toLong() and 0xFFL) shl 16) or
+                                    ((extSizeBytes[6].toLong() and 0xFFL) shl 8) or
+                                    (extSizeBytes[7].toLong() and 0xFFL)
+                            }
+                            else -> boxSize32
+                        }
+                        if (boxSize < headerLen || offset + boxSize > fileLen) break
+                        when (boxType) {
+                            "ftyp" -> hasFtyp = true
+                            "moov" -> if (boxSize > headerLen + 8L) hasMoov = true
+                            "mdat" -> if (boxSize > headerLen + 16L) hasMdatData = true
+                        }
+                        offset += boxSize
+                        boxCount++
+                    }
+                }
+                hasFtyp && hasMoov && hasMdatData
+            } catch (_: Throwable) {
+                false
             }
         }
     }
@@ -300,6 +359,8 @@ class VideoSessionRecorder(private val context: Context) {
         private val inFlightCapture = AtomicBoolean(false)
         private val encoderStopping = AtomicBoolean(false)
         private val abortRequested = AtomicBoolean(false)
+        private val resourcesReleased = AtomicBoolean(false)
+        private val muxerStopped = AtomicBoolean(false)
         private val drainDoneLatch = CountDownLatch(1)
 
         @Volatile
@@ -417,13 +478,9 @@ class VideoSessionRecorder(private val context: Context) {
         }
 
         private fun lockBestCanvas(surface: Surface): android.graphics.Canvas {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                try {
-                    return surface.lockHardwareCanvas()
-                } catch (_: Throwable) {
-                    // Fallback to software surface lock
-                }
-            }
+            // Use standard CPU-backed Surface lock for MediaCodec.createInputSurface():
+            // HWUI lockHardwareCanvas conflicts with GRALLOC_USAGE_HW_VIDEO_ENCODER on several OEM GPUs
+            // and can emit blank or corrupted frames.
             return surface.lockCanvas(null)
         }
 
@@ -445,6 +502,12 @@ class VideoSessionRecorder(private val context: Context) {
                 null
             }
 
+            val rawInputCap = try {
+                codec.getInputBuffer(inputIndex)?.capacity()
+            } catch (_: Throwable) {
+                null
+            }
+
             if (image != null && image.planes.size >= 3) {
                 try {
                     val yPlane = image.planes[0]
@@ -462,7 +525,9 @@ class VideoSessionRecorder(private val context: Context) {
                         uvRowStride = uPlane.rowStride,
                         uvPixelStride = uPlane.pixelStride
                     )
-                    val bufferSize = width * height * 3 / 2
+                    val expectedStridedSize = (yPlane.rowStride * height) +
+                        (uPlane.rowStride * (height / 2)) * if (uPlane.pixelStride == 1) 2 else 1
+                    val bufferSize = rawInputCap ?: expectedStridedSize.coerceAtLeast(width * height * 3 / 2)
                     codec.queueInputBuffer(inputIndex, 0, bufferSize, ptsUs, 0)
                     submittedFrames.incrementAndGet()
                     return true
@@ -508,6 +573,7 @@ class VideoSessionRecorder(private val context: Context) {
 
         private fun drainEncoderLoop() {
             val bufferInfo = MediaCodec.BufferInfo()
+            var firstSrcPtsUs = -1L
             var lastMuxerPtsUs = -1L
             try {
                 while (!abortRequested.get()) {
@@ -539,10 +605,15 @@ class VideoSessionRecorder(private val context: Context) {
                                     muxer.start()
                                     muxerStarted = true
                                 }
-                                if (bufferInfo.presentationTimeUs <= lastMuxerPtsUs) {
-                                    bufferInfo.presentationTimeUs = lastMuxerPtsUs + 1_000L
+                                if (firstSrcPtsUs < 0L) {
+                                    firstSrcPtsUs = bufferInfo.presentationTimeUs
                                 }
-                                lastMuxerPtsUs = bufferInfo.presentationTimeUs
+                                var normalizedPtsUs = (bufferInfo.presentationTimeUs - firstSrcPtsUs).coerceAtLeast(0L)
+                                if (normalizedPtsUs <= lastMuxerPtsUs) {
+                                    normalizedPtsUs = lastMuxerPtsUs + 33_333L
+                                }
+                                lastMuxerPtsUs = normalizedPtsUs
+                                bufferInfo.presentationTimeUs = normalizedPtsUs
 
                                 encodedData.position(bufferInfo.offset)
                                 encodedData.limit(bufferInfo.offset + bufferInfo.size)
@@ -574,13 +645,13 @@ class VideoSessionRecorder(private val context: Context) {
                 Thread.sleep(10L)
             }
 
-            // Ensure short taps still yield >= 2 frames so MP4 track has positive duration
+            // Ensure short taps still yield >= 3 frames so MP4 track has positive playable duration
             val flushLatch = CountDownLatch(1)
             captureHandler.post {
                 try {
                     if (hasCapturedAnyFrame) {
-                        while (submittedFrames.get() < 2) {
-                            Thread.sleep(40L)
+                        while (submittedFrames.get() < 3) {
+                            Thread.sleep(36L)
                             submitCurrentBitmapFrame()
                         }
                     }
@@ -591,7 +662,7 @@ class VideoSessionRecorder(private val context: Context) {
                     } else {
                         val eosPts = max(
                             ((System.nanoTime() - recordingStartNs) / 1_000L).coerceAtLeast(0L),
-                            lastSubmittedPtsUs + 1_000L
+                            lastSubmittedPtsUs + 33_333L
                         )
                         queueYuvInputFrame(eosPts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     }
@@ -604,7 +675,11 @@ class VideoSessionRecorder(private val context: Context) {
             flushLatch.await(1_500L, TimeUnit.MILLISECONDS)
 
             drainDoneLatch.await(4_000L, TimeUnit.MILLISECONDS)
-            return muxerStarted && writtenSamples.get() > 0
+
+            // Finalize MediaCodec and MediaMuxer BEFORE copying the MP4 to MediaStore!
+            // MediaMuxer only flushes the 'moov' atom during muxer.stop(); copying earlier produces an unplayable MP4.
+            releaseResources()
+            return muxerStarted && writtenSamples.get() > 0 && hasPlayableMp4Structure(outputFile)
         }
 
         fun abort() {
@@ -622,12 +697,13 @@ class VideoSessionRecorder(private val context: Context) {
         }
 
         fun releaseResources() {
+            if (!resourcesReleased.compareAndSet(false, true)) return
             stopRequestedNs = if (stopRequestedNs == 0L) System.nanoTime() else stopRequestedNs
             encoderStopping.set(true)
             abortRequested.set(true)
             captureHandler.removeCallbacksAndMessages(null)
             try {
-                drainThread.join(1_500L)
+                drainThread.join(2_000L)
             } catch (_: Throwable) {}
             try {
                 codec.stop()
@@ -639,14 +715,18 @@ class VideoSessionRecorder(private val context: Context) {
                 inputSurface?.release()
             } catch (_: Throwable) {}
             inputSurface = null
-            try {
-                if (muxerStarted) {
-                    muxer.stop()
+            if (muxerStopped.compareAndSet(false, true)) {
+                try {
+                    if (muxerStarted) {
+                        muxer.stop()
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "MediaMuxer stop failed: ${t.message}")
                 }
-            } catch (_: Throwable) {}
-            try {
-                muxer.release()
-            } catch (_: Throwable) {}
+                try {
+                    muxer.release()
+                } catch (_: Throwable) {}
+            }
             try {
                 captureThread.quitSafely()
             } catch (_: Throwable) {}

@@ -66,6 +66,7 @@ fun MRMainScreen(
     incomingModelUri: Uri? = null,
     onModelHandled: () -> Unit = {},
     shortcutAction: String? = null,
+    shortcutModelName: String? = null,
     onShortcutHandled: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -299,9 +300,21 @@ fun MRMainScreen(
         }
     }
 
-    // Handle App Shortcuts, Quick Settings tile, and System Notification quick actions
-    LaunchedEffect(shortcutAction) {
-        val action = shortcutAction ?: return@LaunchedEffect
+    // Handle App Shortcuts, Quick Settings tile, System Notification, and Home Screen Widget actions
+    LaunchedEffect(shortcutAction, shortcutModelName) {
+        val action = shortcutAction
+        val targetModelName = shortcutModelName
+        if (action == null && targetModelName == null) return@LaunchedEffect
+
+        if (!targetModelName.isNullOrBlank()) {
+            ModelItem.entries.firstOrNull { it.name == targetModelName }?.let { chosen ->
+                selectedModel = chosen
+                customModelFile = null
+                modelStatsSummary = null
+                isModelVisible = true
+            }
+        }
+
         when (action) {
             MRNotificationManager.ACTION_CLOUD_LIBRARY -> {
                 showCloudLibrary = true
@@ -312,14 +325,26 @@ fun MRMainScreen(
                 }
                 selectedMode = ViewportMode.AR
             }
+            MRNotificationManager.ACTION_LAUNCH_MR -> {
+                if (!hasCameraPermission) {
+                    permissionLauncher.launch(Manifest.permission.CAMERA)
+                }
+                selectedMode = ViewportMode.MR
+            }
+            MRNotificationManager.ACTION_LAUNCH_OBJECT -> {
+                selectedMode = ViewportMode.OBJECT
+            }
             MRNotificationManager.ACTION_OPEN_PICKER -> {
                 filePickerLauncher.launch(arrayOf("*/*", "application/octet-stream", "model/*", "model/vnd.usdz+zip", "model/obj"))
+            }
+            MRNotificationManager.ACTION_SELECT_MODEL -> {
+                selectedMode = ViewportMode.OBJECT
             }
         }
         onShortcutHandled()
     }
 
-    // Keep persistent notification in Android's top pull-down shade / control center synced
+    // Keep persistent notification and Home Screen App Widgets synced with live 3D/AR/MR state
     LaunchedEffect(
         hasNotificationPermission,
         selectedMode,
@@ -329,6 +354,15 @@ fun MRMainScreen(
         modelStatsSummary,
         isRecording
     ) {
+        com.aistudio.mixedreality.widget.MixedRealityWidgetUpdater.syncAndRefresh(
+            context = context,
+            selectedModel = selectedModel,
+            activeMode = selectedMode,
+            customModelName = if (isModelVisible) customModelFile?.name else null,
+            customStatsSummary = if (isModelVisible) modelStatsSummary else null,
+            isModelVisible = isModelVisible,
+            isRecording = isRecording
+        )
         if (hasNotificationPermission) {
             val activeModelName = when {
                 !isModelVisible -> "Empty Scene"

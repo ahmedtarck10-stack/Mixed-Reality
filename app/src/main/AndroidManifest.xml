@@ -153,7 +153,7 @@
         <!-- Quick Settings Tile Service -->
         <service
             android:name=".service.MRQuickTileService"
-            android:icon="@mipmap/ic_launcher"
+            android:icon="@drawable/ic_stat_mr_headset"
             android:label="@string/quick_settings_tile_label"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">
@@ -161,6 +161,34 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+
+        <!-- Home Screen Interactive App Widget (4x2 Spatial Studio Control Deck) -->
+        <receiver
+            android:name=".widget.MixedRealityStudioWidgetProvider"
+            android:label="@string/widget_studio_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.aistudio.mixedreality.widget.ACTION_PREV_MODEL" />
+                <action android:name="com.aistudio.mixedreality.widget.ACTION_NEXT_MODEL" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mr_studio_widget_info" />
+        </receiver>
+
+        <!-- Home Screen Interactive App Widget (2x2 Quick Portal Tile) -->
+        <receiver
+            android:name=".widget.MixedRealityCompactWidgetProvider"
+            android:label="@string/widget_compact_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mr_compact_widget_info" />
+        </receiver>
     </application>
 
 </manifest>

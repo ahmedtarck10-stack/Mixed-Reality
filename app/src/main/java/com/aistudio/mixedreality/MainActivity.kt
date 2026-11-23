@@ -31,6 +31,7 @@ import com.aistudio.mixedreality.ui.theme.MixedRealityTheme
 class MainActivity : ComponentActivity() {
     private var incomingModelUri by mutableStateOf<Uri?>(null)
     private var shortcutAction by mutableStateOf<String?>(null)
+    private var shortcutModelName by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,6 +42,9 @@ class MainActivity : ComponentActivity() {
 
         incomingModelUri = extractModelUri(intent)
         shortcutAction = intent?.getStringExtra("shortcut_action")
+        shortcutModelName = intent?.getStringExtra(
+            com.aistudio.mixedreality.util.MRNotificationManager.EXTRA_MODEL_NAME
+        )
         com.aistudio.mixedreality.util.MRNotificationManager.ensureChannels(this)
 
         setContent {
@@ -68,7 +72,11 @@ class MainActivity : ComponentActivity() {
                                 incomingModelUri = incomingModelUri,
                                 onModelHandled = { incomingModelUri = null },
                                 shortcutAction = shortcutAction,
-                                onShortcutHandled = { shortcutAction = null }
+                                shortcutModelName = shortcutModelName,
+                                onShortcutHandled = {
+                                    shortcutAction = null
+                                    shortcutModelName = null
+                                }
                             )
 
                             if (showSplash) {
@@ -94,6 +102,11 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         extractModelUri(intent)?.let { uri ->
             incomingModelUri = uri
+        }
+        intent.getStringExtra(
+            com.aistudio.mixedreality.util.MRNotificationManager.EXTRA_MODEL_NAME
+        )?.let { modelName ->
+            shortcutModelName = modelName
         }
         intent.getStringExtra("shortcut_action")?.let { action ->
             shortcutAction = action

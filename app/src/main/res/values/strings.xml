@@ -17,4 +17,17 @@
     <string name="notification_channel_events_desc">Notifications for loaded 3D models, optimization status, photos, and recorded videos.</string>
     <string name="notification_action_ar">AR View</string>
     <string name="notification_action_open">Open 3D</string>
+    <string name="widget_studio_label">Mixed Reality Studio (4×2)</string>
+    <string name="widget_studio_description">Interactive 3D model switcher with instant 1-tap Object, AR, MR Stereo, and file picker launch.</string>
+    <string name="widget_studio_subtitle">3D • AR • Stereo MR</string>
+    <string name="widget_compact_label">MR Quick Portal (2×2)</string>
+    <string name="widget_compact_description">Compact spatial portal for quick model switching, AR launch, and opening 3D files.</string>
+    <string name="widget_compact_short_title">MR Studio</string>
+    <string name="widget_mode_object">3D STUDIO</string>
+    <string name="widget_action_3d">3D</string>
+    <string name="widget_action_ar">AR</string>
+    <string name="widget_action_mr">MR</string>
+    <string name="widget_action_open">Open</string>
+    <string name="widget_prev_model_cd">Previous 3D model preset</string>
+    <string name="widget_next_model_cd">Next 3D model preset</string>
 </resources>

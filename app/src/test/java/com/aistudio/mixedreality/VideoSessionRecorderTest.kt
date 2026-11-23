@@ -126,4 +126,61 @@ class VideoSessionRecorderTest {
         assertTrue("NV12 U0 should be red U (<110), got $interleavedU0", interleavedU0 < 110)
         assertTrue("NV12 V0 should be red V (>220), got $interleavedV0", interleavedV0 > 220)
     }
+
+    @Test
+    fun mp4StructureValidatorAcceptsFinalizedMoovAndRejectsIncompleteFile() {
+        val tempDir = kotlin.io.path.createTempDirectory("mp4_struct_test").toFile()
+        try {
+            fun makeBox(type: String, payloadSize: Int): ByteArray {
+                val total = 8 + payloadSize
+                return ByteBuffer.allocate(total).apply {
+                    putInt(total)
+                    put(type.toByteArray(Charsets.US_ASCII))
+                    repeat(payloadSize) { put(0x11.toByte()) }
+                }.array()
+            }
+
+            // Missing 'moov' atom (simulates pre-muxer.stop() copy that broke Gallery playback)
+            val incompleteMp4 = java.io.File(tempDir, "no_moov.mp4").apply {
+                writeBytes(makeBox("ftyp", 16) + makeBox("mdat", 128))
+            }
+            org.junit.Assert.assertFalse(
+                "MP4 missing 'moov' atom must be rejected",
+                VideoSessionRecorder.hasPlayableMp4Structure(incompleteMp4)
+            )
+
+            // Valid finalized MP4 with ftyp + mdat + moov
+            val validMp4 = java.io.File(tempDir, "valid.mp4").apply {
+                writeBytes(makeBox("ftyp", 16) + makeBox("mdat", 128) + makeBox("moov", 48))
+            }
+            assertTrue(
+                "Finalized MP4 with ftyp, mdat, and moov must be accepted",
+                VideoSessionRecorder.hasPlayableMp4Structure(validMp4)
+            )
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun widgetStateStoreCyclesPresetsAndFormatsSnapshotCleanly() {
+        val entries = com.aistudio.mixedreality.ui.ModelItem.entries
+        val first = entries.first()
+        val last = entries.last()
+
+        assertEquals(last, com.aistudio.mixedreality.widget.WidgetStateStore.cycleModel(first, -1))
+        assertEquals(first, com.aistudio.mixedreality.widget.WidgetStateStore.cycleModel(last, +1))
+        assertEquals(entries[1], com.aistudio.mixedreality.widget.WidgetStateStore.cycleModel(first, +1))
+
+        val customSnap = com.aistudio.mixedreality.widget.WidgetSnapshot(
+            selectedModel = first,
+            activeMode = com.aistudio.mixedreality.ui.ViewportMode.AR,
+            customModelName = "Statue.glb",
+            customStatsSummary = "1.2M verts • 800K tris"
+        )
+        assertEquals("Statue.glb", customSnap.displayTitle)
+        assertEquals("1.2M verts • 800K tris", customSnap.displayMeta)
+        assertEquals("AR VIEW", customSnap.modeBadgeLabel)
+        assertEquals("AR", customSnap.compactModeLabel)
+    }
 }
