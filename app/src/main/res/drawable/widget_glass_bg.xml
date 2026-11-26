@@ -1,14 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="rectangle">
-    <gradient
-        android:angle="135"
-        android:startColor="#FF090D16"
-        android:centerColor="#FF111A2B"
-        android:endColor="#FF0D1524"
-        android:type="linear" />
-    <corners android:radius="24dp" />
-    <stroke
-        android:width="1.2dp"
-        android:color="#4D00E5FF" />
-</shape>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Specular liquid-glass outer highlight rim -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:centerColor="#24FFFFFF"
+                android:endColor="#4DFFFFFF"
+                android:startColor="#80FFFFFF"
+                android:type="linear" />
+            <corners android:radius="26dp" />
+        </shape>
+    </item>
+    <!-- Translucent black liquid-glass body (أسود) -->
+    <item
+        android:bottom="1.2dp"
+        android:left="1.2dp"
+        android:right="1.2dp"
+        android:top="1.2dp">
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:centerColor="#F209090B"
+                android:endColor="#F7020203"
+                android:startColor="#EB141418"
+                android:type="linear" />
+            <corners android:radius="24.8dp" />
+        </shape>
+    </item>
+</layer-list>

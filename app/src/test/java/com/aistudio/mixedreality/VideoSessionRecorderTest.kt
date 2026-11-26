@@ -182,5 +182,21 @@ class VideoSessionRecorderTest {
         assertEquals("1.2M verts • 800K tris", customSnap.displayMeta)
         assertEquals("AR VIEW", customSnap.modeBadgeLabel)
         assertEquals("AR", customSnap.compactModeLabel)
+
+        val mrSnap = com.aistudio.mixedreality.widget.WidgetSnapshot(
+            selectedModel = entries[1],
+            activeMode = com.aistudio.mixedreality.ui.ViewportMode.MR
+        )
+        assertEquals("MR STEREO", mrSnap.modeBadgeLabel)
+        assertEquals("MR", mrSnap.compactModeLabel)
+
+        assertEquals(
+            com.aistudio.mixedreality.ui.ModelItem.TOY_CAR,
+            com.aistudio.mixedreality.widget.WidgetStateStore.resolveModelByName("TOY_CAR")
+        )
+        assertEquals(
+            null,
+            com.aistudio.mixedreality.widget.WidgetStateStore.resolveModelByName("INVALID_MODEL")
+        )
     }
 }

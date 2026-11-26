@@ -171,6 +171,7 @@
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
                 <action android:name="com.aistudio.mixedreality.widget.ACTION_PREV_MODEL" />
                 <action android:name="com.aistudio.mixedreality.widget.ACTION_NEXT_MODEL" />
+                <action android:name="com.aistudio.mixedreality.widget.ACTION_SELECT_PRESET" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
@@ -188,6 +189,45 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/mr_compact_widget_info" />
+        </receiver>
+
+        <!-- Home Screen Interactive App Widget (4x1 Floating Liquid Glass Capsule Bar) -->
+        <receiver
+            android:name=".widget.MixedRealityCapsuleBarWidgetProvider"
+            android:label="@string/widget_capsule_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mr_capsule_widget_info" />
+        </receiver>
+
+        <!-- Home Screen Interactive App Widget (4x3 3D Model Showcase & Cloud Deck) -->
+        <receiver
+            android:name=".widget.MixedRealityModelDeckWidgetProvider"
+            android:label="@string/widget_deck_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mr_model_deck_widget_info" />
+        </receiver>
+
+        <!-- Home Screen Interactive App Widget (2x1 Liquid Glass Mini Pill) -->
+        <receiver
+            android:name=".widget.MixedRealityMiniOrbWidgetProvider"
+            android:label="@string/widget_mini_orb_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/mr_mini_orb_widget_info" />
         </receiver>
     </application>
 

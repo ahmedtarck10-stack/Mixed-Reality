@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:description="@string/widget_mini_orb_description"
+    android:initialLayout="@layout/widget_mini_orb_mixed_reality"
+    android:minHeight="52dp"
+    android:minResizeHeight="48dp"
+    android:minResizeWidth="110dp"
+    android:minWidth="110dp"
+    android:previewImage="@mipmap/ic_launcher_round"
+    android:previewLayout="@layout/widget_mini_orb_mixed_reality"
+    android:resizeMode="horizontal"
+    android:targetCellHeight="1"
+    android:targetCellWidth="2"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen"
+    tools:targetApi="s" />

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Full capsule specular rim matching TopModeSegmentedPill / BottomControlBar -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:centerColor="#2BFFFFFF"
+                android:endColor="#4DFFFFFF"
+                android:startColor="#80FFFFFF"
+                android:type="linear" />
+            <corners android:radius="100dp" />
+        </shape>
+    </item>
+    <item
+        android:bottom="1.2dp"
+        android:left="1.2dp"
+        android:right="1.2dp"
+        android:top="1.2dp">
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="270"
+                android:centerColor="#F209090B"
+                android:endColor="#F7020203"
+                android:startColor="#EB141418"
+                android:type="linear" />
+            <corners android:radius="100dp" />
+        </shape>
+    </item>
+</layer-list>

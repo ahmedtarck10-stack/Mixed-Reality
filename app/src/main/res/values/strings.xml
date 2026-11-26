@@ -30,4 +30,12 @@
     <string name="widget_action_open">Open</string>
     <string name="widget_prev_model_cd">Previous 3D model preset</string>
     <string name="widget_next_model_cd">Next 3D model preset</string>
+    <string name="widget_capsule_label">Liquid Glass Bar (4×1)</string>
+    <string name="widget_capsule_description">Floating Liquid Glass capsule bar matching the app control strip for instant MR, AR, Object, and file launch.</string>
+    <string name="widget_deck_label">3D Model &amp; Cloud Deck (4×3)</string>
+    <string name="widget_deck_description">Full Liquid Glass 3D showcase deck with instant preset chips, cloud library shortcut, and spatial mode dock.</string>
+    <string name="widget_deck_header_title">Spatial Studio Deck</string>
+    <string name="widget_action_cloud">Cloud</string>
+    <string name="widget_mini_orb_label">Liquid Glass Mini Pill (2×1)</string>
+    <string name="widget_mini_orb_description">Compact frosted glass pill with live model switcher and 1-tap glowing AR orb launch.</string>
 </resources>

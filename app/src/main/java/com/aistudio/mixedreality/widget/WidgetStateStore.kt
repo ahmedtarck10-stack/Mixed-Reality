@@ -122,6 +122,24 @@ object WidgetStateStore {
         return entries[nextIdx]
     }
 
+    fun resolveModelByName(name: String?): ModelItem? {
+        if (name.isNullOrBlank()) return null
+        return ModelItem.entries.firstOrNull { it.name == name }
+    }
+
+    fun selectPreset(context: Context, model: ModelItem): WidgetSnapshot {
+        val current = load(context)
+        return saveFromApp(
+            context = context,
+            selectedModel = model,
+            activeMode = current.activeMode,
+            customModelName = null,
+            customStatsSummary = null,
+            isModelVisible = true,
+            isRecording = current.isRecording
+        )
+    }
+
     fun stepPreset(context: Context, delta: Int): WidgetSnapshot {
         val current = load(context)
         val nextModel = cycleModel(current.selectedModel, delta)

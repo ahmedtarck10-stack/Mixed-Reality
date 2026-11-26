@@ -7,7 +7,7 @@
     android:orientation="vertical"
     android:padding="12dp">
 
-    <!-- Header Strip: App Branding + Live Active Mode Chip -->
+    <!-- Header Strip: App Emblem + Unified MR | AR | Object Segmented Glass Pill -->
     <LinearLayout
         android:id="@+id/widget_studio_header"
         android:layout_width="match_parent"
@@ -23,49 +23,65 @@
             android:scaleType="fitCenter"
             android:src="@mipmap/ic_launcher_round" />
 
-        <LinearLayout
+        <TextView
+            android:id="@+id/widget_brand_title"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="9dp"
+            android:layout_marginStart="8dp"
             android:layout_weight="1"
-            android:orientation="vertical">
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="@string/app_name"
+            android:textColor="#FFFFFFFF"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <!-- Top Segmented Pill matching MRMainScreen TopModeSegmentedPill -->
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="30dp"
+            android:background="@drawable/widget_segmented_shell_bg"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="2.5dp">
 
             <TextView
-                android:id="@+id/widget_brand_title"
+                android:id="@+id/widget_studio_tab_mr"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="@string/app_name"
-                android:textColor="#FFF8FAFC"
-                android:textSize="13sp"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:paddingHorizontal="9dp"
+                android:text="MR"
+                android:textColor="#B3CAD5E2"
+                android:textSize="10.5sp"
                 android:textStyle="bold" />
 
             <TextView
-                android:id="@+id/widget_brand_subtitle"
+                android:id="@+id/widget_studio_tab_ar"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="@string/widget_studio_subtitle"
-                android:textColor="#FF94A3B8"
-                android:textSize="10sp" />
-        </LinearLayout>
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:paddingHorizontal="9dp"
+                android:text="AR"
+                android:textColor="#B3CAD5E2"
+                android:textSize="10.5sp"
+                android:textStyle="bold" />
 
-        <TextView
-            android:id="@+id/widget_studio_mode_badge"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="@drawable/widget_badge_glow_bg"
-            android:paddingHorizontal="9dp"
-            android:paddingVertical="3dp"
-            android:text="@string/widget_mode_object"
-            android:textColor="#FF00E5FF"
-            android:textSize="10sp"
-            android:textStyle="bold" />
+            <TextView
+                android:id="@+id/widget_studio_tab_object"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:background="@drawable/widget_pill_selected_bg"
+                android:gravity="center"
+                android:paddingHorizontal="9dp"
+                android:text="Object"
+                android:textColor="#FFFFFFFF"
+                android:textSize="10.5sp"
+                android:textStyle="bold" />
+        </LinearLayout>
     </LinearLayout>
 
-    <!-- Interactive Center Model Carousel Card -->
+    <!-- Frosted Inner Glass Model Carousel -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
@@ -75,15 +91,15 @@
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingHorizontal="8dp"
-        android:paddingVertical="6dp">
+        android:paddingVertical="5dp">
 
         <ImageView
             android:id="@+id/widget_btn_prev_model"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
             android:background="@drawable/widget_circle_btn_bg"
             android:contentDescription="@string/widget_prev_model_cd"
-            android:padding="9dp"
+            android:padding="8dp"
             android:scaleType="fitCenter"
             android:src="@drawable/ic_widget_chevron_left" />
 
@@ -105,7 +121,7 @@
                 android:maxLines="1"
                 android:text="Vision Headset"
                 android:textColor="#FFFFFFFF"
-                android:textSize="14sp"
+                android:textSize="13.5sp"
                 android:textStyle="bold" />
 
             <TextView
@@ -116,43 +132,47 @@
                 android:ellipsize="end"
                 android:gravity="center"
                 android:maxLines="1"
-                android:text="1 / 5 • Tap to inspect in 3D"
-                android:textColor="#FF67E8F9"
+                android:text="1 / 5 • Mixed Reality Spatial Visor"
+                android:textColor="#B3CAD5E2"
                 android:textSize="10.5sp" />
         </LinearLayout>
 
         <ImageView
             android:id="@+id/widget_btn_next_model"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
             android:background="@drawable/widget_circle_btn_bg"
             android:contentDescription="@string/widget_next_model_cd"
-            android:padding="9dp"
+            android:padding="8dp"
             android:scaleType="fitCenter"
             android:src="@drawable/ic_widget_chevron_right" />
     </LinearLayout>
 
-    <!-- Bottom Interactive Quick Launch Action Dock -->
+    <!-- Unified Bottom Action Capsule matching BottomControlBar -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="38dp"
+        android:layout_height="40dp"
         android:layout_marginTop="8dp"
-        android:orientation="horizontal">
+        android:background="@drawable/widget_segmented_shell_bg"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="6dp"
+        android:paddingVertical="3dp">
 
         <LinearLayout
             android:id="@+id/widget_action_object"
             android:layout_width="0dp"
             android:layout_height="match_parent"
-            android:layout_marginEnd="5dp"
+            android:layout_marginEnd="4dp"
             android:layout_weight="1"
-            android:background="@drawable/widget_pill_cyan_bg"
+            android:background="@drawable/widget_pill_dark_bg"
             android:gravity="center"
             android:orientation="horizontal"
-            android:paddingHorizontal="6dp">
+            android:paddingHorizontal="4dp">
 
             <ImageView
-                android:layout_width="15dp"
-                android:layout_height="15dp"
+                android:layout_width="13dp"
+                android:layout_height="13dp"
                 android:contentDescription="@string/widget_action_3d"
                 android:src="@drawable/ic_widget_cube" />
 
@@ -162,38 +182,28 @@
                 android:layout_marginStart="4dp"
                 android:ellipsize="end"
                 android:maxLines="1"
-                android:text="@string/widget_action_3d"
-                android:textColor="#FFE0F7FA"
-                android:textSize="11sp"
+                android:text="3D"
+                android:textColor="#FFFFFFFF"
+                android:textSize="10.5sp"
                 android:textStyle="bold" />
         </LinearLayout>
 
+        <!-- Glowing Red Central Orb echoing BottomControlBar REC orb -->
         <LinearLayout
             android:id="@+id/widget_action_ar"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_marginEnd="5dp"
-            android:layout_weight="1"
-            android:background="@drawable/widget_pill_dark_bg"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_marginHorizontal="3dp"
+            android:background="@drawable/widget_orb_rec_bg"
             android:gravity="center"
-            android:orientation="horizontal"
-            android:paddingHorizontal="6dp">
-
-            <ImageView
-                android:layout_width="15dp"
-                android:layout_height="15dp"
-                android:contentDescription="@string/widget_action_ar"
-                android:src="@drawable/ic_widget_ar" />
+            android:orientation="vertical">
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="4dp"
-                android:ellipsize="end"
-                android:maxLines="1"
-                android:text="@string/widget_action_ar"
-                android:textColor="#FFE2E8F0"
-                android:textSize="11sp"
+                android:text="AR"
+                android:textColor="#FFFFFFFF"
+                android:textSize="9.5sp"
                 android:textStyle="bold" />
         </LinearLayout>
 
@@ -201,16 +211,16 @@
             android:id="@+id/widget_action_mr"
             android:layout_width="0dp"
             android:layout_height="match_parent"
-            android:layout_marginEnd="5dp"
+            android:layout_marginHorizontal="4dp"
             android:layout_weight="1"
-            android:background="@drawable/widget_pill_purple_bg"
+            android:background="@drawable/widget_pill_dark_bg"
             android:gravity="center"
             android:orientation="horizontal"
-            android:paddingHorizontal="6dp">
+            android:paddingHorizontal="4dp">
 
             <ImageView
-                android:layout_width="15dp"
-                android:layout_height="15dp"
+                android:layout_width="13dp"
+                android:layout_height="13dp"
                 android:contentDescription="@string/widget_action_mr"
                 android:src="@drawable/ic_widget_mr" />
 
@@ -220,9 +230,9 @@
                 android:layout_marginStart="4dp"
                 android:ellipsize="end"
                 android:maxLines="1"
-                android:text="@string/widget_action_mr"
-                android:textColor="#FFEDE7F6"
-                android:textSize="11sp"
+                android:text="MR"
+                android:textColor="#FFFFFFFF"
+                android:textSize="10.5sp"
                 android:textStyle="bold" />
         </LinearLayout>
 
@@ -234,11 +244,11 @@
             android:background="@drawable/widget_pill_dark_bg"
             android:gravity="center"
             android:orientation="horizontal"
-            android:paddingHorizontal="6dp">
+            android:paddingHorizontal="4dp">
 
             <ImageView
-                android:layout_width="15dp"
-                android:layout_height="15dp"
+                android:layout_width="13dp"
+                android:layout_height="13dp"
                 android:contentDescription="@string/widget_action_open"
                 android:src="@drawable/ic_widget_open" />
 
@@ -248,9 +258,9 @@
                 android:layout_marginStart="4dp"
                 android:ellipsize="end"
                 android:maxLines="1"
-                android:text="@string/widget_action_open"
-                android:textColor="#FFE2E8F0"
-                android:textSize="11sp"
+                android:text="Open"
+                android:textColor="#FFFFFFFF"
+                android:textSize="10.5sp"
                 android:textStyle="bold" />
         </LinearLayout>
     </LinearLayout>
